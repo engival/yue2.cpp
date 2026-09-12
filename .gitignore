@@ -1,0 +1,12 @@
+build*/
+out/
+tests/out/
+*.gguf
+*.wav
+*.flac
+*.npy
+*.safetensors
+__pycache__/
+venv*/
+.venv/
+*.log

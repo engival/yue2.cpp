@@ -1,0 +1,9 @@
+# Converters + goldens + tokenizer check (convert/*.py). CPU only -- never
+# install a GPU/ROCm/CUDA build of torch for this, see SPEC.md section 6.
+gguf>=0.19.0
+safetensors
+torch
+numpy
+soundfile
+huggingface_hub
+transformers

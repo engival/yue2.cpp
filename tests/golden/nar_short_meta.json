@@ -1,0 +1,35 @@
+{
+  "prefix_len": 256,
+  "codec_len": 128,
+  "ar_length": 385,
+  "nar_length": 130,
+  "seed": 1,
+  "steps": 32,
+  "torch_version": "2.12.0+rocm7.2",
+  "wall_seconds": {
+    "load": 1.5938285933807492,
+    "s2_solve": 6.384132423438132,
+    "s32_solve": 57.02219161391258,
+    "total": 69.46200218982995
+  },
+  "source_sha256": "1d55c42c1a9875c34f5d736e15078449992b044e807ce2a138e6cf289a1e59e9",
+  "multichunk": {
+    "chunk_ranges": [
+      [
+        0,
+        470
+      ],
+      [
+        470,
+        512
+      ]
+    ],
+    "ar_lengths": [
+      727,
+      299
+    ],
+    "context": 1200,
+    "steps": 2,
+    "seed": 1
+  }
+}

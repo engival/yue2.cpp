@@ -1,0 +1,11 @@
+{
+  "file": "noise_seed831001_16x64.npy",
+  "sha256": "d68db01c11db2ec02867a53b053994e448eae192afa65fe32c778ed508aefb26",
+  "bytes": 4224,
+  "dtype": "<f4",
+  "shape": [16, 64],
+  "seed": 831001,
+  "generator": "std::mt19937_64(seed) + Box-Muller, src/common/noise.hpp",
+  "command": "build_single/yue2 noise --seed 831001 --frames 16 -o tests/golden/noise_seed831001_16x64.npy",
+  "note": "Seed compatibility with torch is not a goal (SPEC_SINGLE.md 2.4). The requirement is that this seed produces these bytes on every machine: mt19937_64 is bit-specified by the standard and no <random> distribution is used. The only platform dependency left is libm's sqrt/log/cos/sin."
+}
