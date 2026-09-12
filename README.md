@@ -25,8 +25,11 @@ Status:
 
 Notes and measurements in [docs/](docs/); per-stage status in `src/STATUS*.md`.
 
-Weights are not included; run `convert/convert_vae.py` against your own copy of
-`m-a-p/YuE2-Vae` (CC BY-NC 4.0). Code is MIT — see NOTICE.md for lineage.
+Weights are not included. The converters in `convert/` build the three GGUFs
+from your own copies of [`m-a-p/YuE2-3B`](https://huggingface.co/m-a-p/YuE2-3B)
+(AR + NAR, one checkpoint) and [`m-a-p/YuE2-Vae`](https://huggingface.co/m-a-p/YuE2-Vae)
+(the decoder), both CC BY-NC 4.0 — see the Quick start. Code is MIT; NOTICE.md
+has the lineage.
 
 ## Quick start
 
