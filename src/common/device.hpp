@@ -13,8 +13,9 @@
 // even for an F32 x F32 matmul. Disabling both selects the genuinely-F32 matmul
 // pipelines. Must happen before the backend is initialised, and ggml-vulkan
 // reads these once per device init — one process cannot have it both ways, which
-// is why `yue2 song` runs the VAE as a child (SPEC_SINGLE.md §2.2). A value
-// already in the environment wins (overwrite = 0).
+// is why the exact-F32 decode is the standalone `yue2 vae` route and `yue2 song`
+// decodes at the NAR's precision (SPEC_SINGLE.md §2.2). A value already in the
+// environment wins (overwrite = 0).
 // See docs/vulkan_burst_investigation.md.
 inline void vulkan_want_exact_f32()
 {

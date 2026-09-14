@@ -594,6 +594,18 @@ static std::string parse_request(const std::string & path, Request & req)
 		return strf("%s: expected a JSON object", path.c_str());
 	}
 
+	// A request cannot pick the VAE's matmul precision: `yue2 song`/`yue2 batch`
+	// decode it in the process that ran the NAR, and ggml-vulkan fixes operand
+	// staging at device init (SPEC_SINGLE.md §2.2). This runs before any model
+	// loads.
+	if (root.contains("vk_f16_matmul"))
+	{
+		return strf("%s: \"vk_f16_matmul\": song/batch decode the VAE in-process at the "
+		            "NAR's Vulkan precision; for the exact-F32 decode run the stage on its "
+		            "own: yue2 vae -m yue2-vae-f32.gguf -i ARTIFACTS/latent.npy -o OUT.flac",
+		            path.c_str());
+	}
+
 	if (root.contains("style") && root["style"].is_string())
 	{
 		req.style = root["style"].get<std::string>();

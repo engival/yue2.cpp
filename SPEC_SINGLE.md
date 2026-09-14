@@ -34,7 +34,7 @@ in between keeps working, and so the existing goldens keep meaning something.
   the matching `run_*` so README, STATUS files and tests stay valid. Build dir
   for your work: `build_single/`.
 
-### 2.2 The Vulkan exactness trap (this is why the VAE is a child process)
+### 2.2 The Vulkan exactness trap (one process, one precision)
 
 `yue2-vae` needs true-F32 matmuls: it sets `GGML_VK_DISABLE_F16=1` and
 `GGML_VK_DISABLE_COOPMAT=1` before backend init (see
@@ -44,16 +44,31 @@ device init** (`ggml-vulkan.cpp` ~L6584/L7513) and the only per-op precision hin
 it honors is `GGML_PREC_F32` for flash-attention (~L11221), not for `mul_mat`.
 So one Vulkan context cannot serve both.
 
-Decision: `song` runs the AR and NAR in-process with fp16 enabled, and runs the
-VAE by `fork()` + `execv("/proc/self/exe", {"yue2","vae", ...})` with the exact
-env the VAE needs, waiting for the child. The VAE loads in ~1 s, so residency
-buys nothing there anyway. Latent goes through `DIR/latent.npy` (which the
-artifacts must contain regardless). If the fast NAR path is off
-(`--nar-f32`), still use the child; one code path.
+Original decision (superseded): `song` forked itself and re-executed
+`{"yue2","vae",...}` so the VAE could have the exact env.
 
-A per-op ggml patch (honor `GGML_PREC_F32` in Vulkan mul_mat pipeline
-selection) would remove the child. It is a submodule change: **out of scope**,
-note it in the status file.
+**Decision, 2026-09-13 — the fork is gone.** A listening test settled the
+question the fork was protecting: the fp16-staged decode is 58.5 dB from the
+exact one over a whole song (~40 dB at the worst burst), the residual is
+broadband and uncorrelated with the music, and no listener separated the two
+(`docs/vulkan_burst_investigation.md`, addendum). On the AMD the exact path is
+not even faster (9.5 s vs 9.2 s). So:
+
+- `song` and `batch` run AR → NAR → VAE in **one** process, at **one** Vulkan
+  precision: fp16-staged by default, exact throughout under `--nar-f32` (which
+  is a per-process switch and always was — it shifts AR sampling too, so it
+  yields a *different song*, not a more precise one).
+- Exact-F32 decoding stays available as the standalone `yue2 vae`, which keeps
+  its own default (exact unless `--vk-f16-matmul`). That is the route the
+  goldens, `tests/regress.sh` and any numeric check take.
+- **Mismatched modes abort, they do not downgrade.** `song`/`batch` reject
+  `--vk-f16-matmul` / `--no-vk-f16-matmul` (the `vae`/`nar` flag) and the
+  `request.json` key `vk_f16_matmul` — exit 1 before any model loads, with an
+  error naming `yue2 vae`. Any other precision spelling is an unknown argument.
+
+A per-op ggml patch (honor `GGML_PREC_F32` in Vulkan mul_mat pipeline selection)
+would let one process hold both precisions and make the rule unnecessary. It is
+a submodule change: still out of scope, see `docs/ROADMAP.md`.
 
 ### 2.3 Model residency and handoff in `song`
 
@@ -71,8 +86,8 @@ note it in the status file.
   `--ar-prefill F16.gguf` and load both. Report the number either way.
 - Prefix/semantic tokens: in memory (vectors), also written to the artifacts dir.
 - Noise → NAR: in memory, also written (`nar_noise.npy`).
-- Latent → VAE child: file (§2.2).
-- Free the NAR and AR contexts before launching the VAE child.
+- Latent → VAE: `DIR/latent.npy`, which the artifacts must contain regardless.
+- Free the NAR and AR contexts before the VAE stage.
 
 ### 2.4 Noise (own RNG — seed compatibility with torch is NOT a goal)
 
@@ -131,7 +146,7 @@ noise alike.
   existence; `YUE2_WARN_FLAGS` clean.
 - No torch. No submodule edits.
 - Report in `src/STATUS_SINGLE.md` (≤ 300 words + tables + exact commands).
-  Update `README.md` (build, `yue2 song`, the child-process note). Do not commit.
+  Update `README.md` (build, `yue2 song`, the one-process precision note). Do not commit.
 
 ## 4. Acceptance
 

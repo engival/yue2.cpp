@@ -137,3 +137,29 @@ would be for `GGML_PREC_F32` to also select f32 operand staging.
 
 Probing marks intermediates as graph outputs, which disables op fusion; on this
 graph that was verified not to change the result.
+
+## Addendum, 2026-09-13 — the listening verdict
+
+The numbers above are real, but they are not audible. An A/B of the same latent
+decoded both ways (`yue2 vae` exact vs `yue2 vae --vk-f16-matmul`, 58.5 dB over
+a whole song, ~40 dB at the worst burst):
+
+- The residual is **broadband** and **uncorrelated with the music** — not a
+  tonal artefact, not tracking the melody. The impression it leaves on its own
+  is "GSM-like": a thin codec hiss, not a defect in the material.
+- The bursts are not dropouts or clicks. Windowed side by side, the two
+  waveforms are equivalent; the burst is where the residual is loudest, not
+  where the signal is wrong.
+- No listener separated the two renders.
+
+Cost tells the same story from the other side: on the AMD 7900 XTX the exact
+path is not even the slower one (9.5 s vs 9.2 s for a full song), so there is
+nothing to buy back either way.
+
+**Decision.** Exact-F32 is a **numeric reference**, not a render default. It
+backs the goldens, `tests/regress.sh` and any SNR comparison, and it is reached
+through the standalone `yue2 vae`, which keeps exact as *its* default. `yue2
+song` and `yue2 batch` decode in-process at the NAR's precision — one process,
+one Vulkan precision — and refuse, with a non-zero exit before any model loads,
+any flag or `request.json` key that asks them for the other one. See
+SPEC_SINGLE.md §2.2.

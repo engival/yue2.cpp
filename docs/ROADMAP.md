@@ -18,6 +18,11 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   step allocates nothing. Token-for-token identical to stage 5 (over 600 000
   differential cases including one-ulp tie injection + full songs under
   `--verify-sampler` + a byte-identical seeded song). Numbers in [src/STATUS_SAMPLER.md](../src/STATUS_SAMPLER.md).
+- The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
+  Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
+  exact) indistinguishable, and on the AMD the exact path is not faster — so
+  exact-F32 is a numeric reference reached through the standalone `yue2 vae`,
+  and asking `song`/`batch` for it is an error, not a downgrade. SPEC_SINGLE §2.2.
 - Accuracy: VAE 117 dB vs torch CPU; AR prefix + greedy bit-identical; NAR fast
   path 29 dB (AMD) / 33 dB (Arc) from the f32 reference — same class as torch's
   own bf16 (35 dB), inaudible in A/B.
@@ -26,8 +31,9 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
 
 1. **ggml-vulkan: per-op F32 precision for `mul_mat`.** Honour `GGML_PREC_F32`
    in the Vulkan mul_mat pipeline selection the way flash-attention already does.
-   Removes the VAE child process, lets `--nar-f32` stop shifting AR sampling,
-   and is a legitimate upstream PR. Needs both shader variants compiled per
+   Would let one process hold both precisions: the exact-F32 VAE could then be a
+   `song`/`batch` option instead of a standalone-only route, and `--nar-f32`
+   would stop shifting AR sampling. A legitimate upstream PR. Needs both shader variants compiled per
    device (`ggml-vulkan.cpp` ~L6584/L7513 read the env once).
 2. **ggml-vulkan: Intel Battlemage flash-attention tuning.** ggml's
    `get_fa_tuning_params_scalar` disables subgroups and halves `block_rows` for

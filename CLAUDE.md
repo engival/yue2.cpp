@@ -42,7 +42,9 @@ manual; this file is where things are and the rules that were learned the hard w
 
 - ggml-vulkan stages **both** F32 operands as fp16 when the device has fp16;
   `GGML_PREC_F32` is honoured only by flash-attention. Env vars are read once per
-  device init → per-process. That's why `yue2 song` forks itself for the VAE.
+  device init → per-process. So a run has exactly one precision: `yue2 song` /
+  `yue2 batch` decode the VAE at the NAR's, and the exact-F32 decode is the
+  standalone `yue2 vae` (SPEC_SINGLE §2.2 — it used to be a forked child).
 - F32 K/V makes attention an F32×F32 matmul (slowest path); F16 K/V (`--kv-f16`)
   puts it on coopmat. Flash-attention wins on RADV, loses on the Arc (ggml's FA
   tuning is for Xe1).

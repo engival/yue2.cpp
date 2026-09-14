@@ -15,14 +15,11 @@
 
 #include "npy.hpp"
 
-#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -37,8 +34,7 @@ const int LATENT_DIM   = 64;
 // The artifacts directory a run without --artifacts makes for itself. die()
 // goes through exit(), which runs atexit handlers, so a failure anywhere in the
 // run still takes the directory with it instead of leaving several GB of debris
-// in /tmp for a batch driver to accumulate. The forked VAE child leaves through
-// execv() or _exit(), neither of which runs atexit, so it never removes it.
+// in /tmp for a batch driver to accumulate.
 std::vector<std::string> g_temp_artifacts;
 
 void remove_temp_artifacts()
@@ -91,8 +87,8 @@ void usage_batch(const char * argv0)
 	        argv0);
 }
 
-// Directory holding this executable, via /proc/self/exe — the same path the
-// VAE child is started from.
+// This executable's own path, via /proc/self/exe — where resolve_gguf() looks
+// for the default GGUFs.
 std::string exe_path()
 {
 	char    buf[4096];
@@ -175,66 +171,16 @@ void pick_nar_flags(const BatchParams & p, int64_t prefix_len, int64_t frames,
 	       nar.vk_f16_matmul ? " --vk-f16-matmul" : "");
 }
 
-// The VAE needs true-F32 matmuls and the NAR's fast path needs the opposite;
-// ggml-vulkan reads that switch once per device init, so the VAE runs as a
-// child of this process rather than in it (SPEC_SINGLE.md §2.2). It loads in
-// ~1 s, so residency would buy nothing anyway.
-double run_vae_child(const BatchParams & p, const std::string & out,
-	const std::string & latent_path, std::string & err)
+// `song` and `batch` run every stage in one process, and ggml-vulkan fixes
+// matmul operand staging at Vulkan device init — so the VAE decodes at whatever
+// precision the rest of the run is using and cannot be asked for another
+// (SPEC_SINGLE.md §2.2). Refuse the flags that ask for one, in the parser,
+// before a single model is loaded.
+[[noreturn]] void die_vae_precision(const std::string & flag)
 {
-	const std::string exe = exe_path();
-	const std::string gpu = std::to_string(p.gpu);
-	err.clear();
-
-	std::vector<std::string> args = { "yue2", "vae",
-		"-m", p.vae_model, "-i", latent_path, "-o", out,
-		"--device", p.device, "--gpu", gpu };
-
-	std::vector<char *> argv;
-	for (std::string & a : args)
-	{
-		argv.push_back(&a[0]);
-	}
-	argv.push_back(nullptr);
-
-	printf("vae:     %s vae (child process)\n", exe.c_str());
-	fflush(stdout);
-
-	const double t0  = now_seconds();
-	const pid_t  pid = fork();
-	if (pid < 0)
-	{
-		die("fork for the VAE child failed: %s", strerror(errno));
-	}
-	if (pid == 0)
-	{
-		// The child sets GGML_VK_DISABLE_F16 / _COOPMAT itself, exactly as a
-		// hand-run `yue2 vae` does — which is what the equivalence check needs.
-		execv(exe.c_str(), argv.data());
-		fprintf(stderr, "error: cannot exec %s: %s\n", exe.c_str(), strerror(errno));
-		_exit(127);
-	}
-
-	int status = 0;
-	if (waitpid(pid, &status, 0) != pid)
-	{
-		die("waitpid on the VAE child failed: %s", strerror(errno));
-	}
-	char note[128];
-	if (WIFSIGNALED(status))
-	{
-		snprintf(note, sizeof(note), "the VAE child was killed by signal %d (%s)",
-		         WTERMSIG(status), strsignal(WTERMSIG(status)));
-		err = note;
-	} else if (!WIFEXITED(status)) {
-		snprintf(note, sizeof(note), "the VAE child did not exit normally (wait status 0x%x)",
-		         (unsigned) status);
-		err = note;
-	} else if (WEXITSTATUS(status) != 0) {
-		snprintf(note, sizeof(note), "the VAE child exited %d", WEXITSTATUS(status));
-		err = note;
-	}
-	return now_seconds() - t0;
+	die("%s: song/batch decode the VAE in-process at the NAR's Vulkan precision; "
+	    "for the exact-F32 decode run the stage on its own: "
+	    "yue2 vae -m yue2-vae-f32.gguf -i ARTIFACTS/latent.npy -o OUT.flac", flag.c_str());
 }
 
 json json_timing(const GenStats & st)
@@ -374,6 +320,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
+		} else if (a == "--vk-f16-matmul" || a == "--no-vk-f16-matmul") {
+			die_vae_precision(a);
 		} else if (a == "-h" || a == "--help") {
 			usage(argv0);
 			exit(0);
@@ -442,6 +390,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
+		} else if (a == "--vk-f16-matmul" || a == "--no-vk-f16-matmul") {
+			die_vae_precision(a);
 		} else if (a == "-h" || a == "--help") {
 			usage_batch(argv0);
 			exit(0);
@@ -475,18 +425,10 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 	ggml_time_init();
 	const double t_batch0 = now_seconds();
 
-	// The VAE stage re-executes this binary (§2.2), so check now rather than
-	// three minutes from now that it is still on disk: a rebuild mid-run leaves
-	// /proc/self/exe reading "<path> (deleted)" and execv would fail at the end.
-	if (!std::filesystem::exists(exe_path()))
-	{
-		die("this executable is no longer on disk (%s); the VAE stage re-executes it "
-		    "— rerun the rebuilt binary", exe_path().c_str());
-	}
-
 	// ggml-vulkan reads the exactness switch once per device init, and the AR
 	// inits the device first — so --nar-f32 has to be set here, not inside
-	// run_nar, or the NAR would silently keep the fp16-staged pipelines.
+	// run_nar, or the NAR would silently keep the fp16-staged pipelines. It
+	// covers the whole run, VAE included: one process, one precision.
 	if (given.nar_f32 && given.device == "vulkan")
 	{
 		vulkan_want_exact_f32();
@@ -497,7 +439,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 	p.nar_model   = resolve_gguf(p.nar_model, "yue2-nar-f16.gguf");
 	p.vae_model   = resolve_gguf(p.vae_model, "yue2-vae-f32.gguf");
 
-	// The latent always goes to the artifacts directory: the VAE child reads it
+	// The latent always goes to the artifacts directory: the VAE stage reads it
 	// from there, so a job without `artifacts` still needs one and cleans it up.
 	std::vector<bool> temp_dir(jobs.size(), false);
 	std::error_code   ec;
@@ -639,23 +581,25 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		run_nar(nar);
 		const double nar_seconds = now_seconds() - t_nar0;
 
-		// ---- VAE (child) ---------------------------------------------------
+		// ---- VAE -----------------------------------------------------------
+		// In this process, on the device the NAR just used, at the same matmul
+		// precision: the fp16-staged decode is 58.5 dB from the exact-F32 one
+		// and a listening test could not separate them, while the exact path
+		// needs a Vulkan device init the NAR cannot share
+		// (docs/vulkan_burst_investigation.md). `yue2 vae` remains the exact
+		// reference decoder.
+		VaeParams vae;
+		vae.model         = p.vae_model;
+		vae.input         = nar.output;
+		vae.output        = job.out;
+		vae.device        = p.device;
+		vae.gpu           = p.gpu;
+		vae.threads       = p.threads;
+		vae.vk_f16_matmul = nar.vk_f16_matmul;
 
-		std::string  vae_err;
-		const double vae_seconds = run_vae_child(p, job.out, nar.output, vae_err);
-		if (!vae_err.empty())
-		{
-			if (!p.continue_on_error)
-			{
-				die("%s%s", tag.c_str(), vae_err.c_str());
-			}
-			fprintf(stderr, "error: %s%s\n", tag.c_str(), vae_err.c_str());
-			entry["status"] = "error";
-			entry["error"]  = vae_err;
-			summary.push_back(entry);
-			failed++;
-			continue;
-		}
+		const double t_vae0 = now_seconds();
+		run_vae(vae);
+		const double vae_seconds = now_seconds() - t_vae0;
 
 		// ---- artifacts -----------------------------------------------------
 

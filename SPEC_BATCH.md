@@ -15,7 +15,7 @@ keep passing.
 | AR load | 1.1 | |
 | abc + semantic decode | 51.8 | **one token per `llama_decode`, ~106 tok/s: launch/latency-bound, GPU mostly idle** |
 | NAR load + prefill + ODE | 87.7 | compute-bound (attention) |
-| VAE child | 13.4 | compute-bound |
+| VAE | 13.4 | compute-bound (measured when it still ran as a child on the exact-F32 path; in-process fp16-staged since 2026-09-13, SPEC_SINGLE §2.2) |
 
 Model loading is 4.5 s of 155 (residency mode: rejected, `docs/ROADMAP.md`).
 The AR decode is a third of the run and does not saturate the card: weights are
@@ -312,7 +312,7 @@ Rules carried over from `generate()`, each of which was a bug once:
 run_ar_batch(all jobs)           → vector<ArResult>, artifacts written per job
 free the llama context and model  (exactly as run_ar does; the NAR reloads the AR weights itself, §STATUS_SINGLE dev. 12)
 for each job in order:
-	noise → run_nar → run_vae_child → config.json / result.json    (today's run_song body, per job)
+	noise → run_nar → run_vae → config.json / result.json    (today's run_song body, per job)
 ```
 
 The AR frees before the first NAR so peak VRAM is `max(AR batch, one NAR)`, not
@@ -331,10 +331,11 @@ records how it was made (§6 explains why that matters).
 Default: identical to today. Any `die()` ends the process, exit 1, the
 finished jobs' outputs are on disk, unfinished ones are not (temp artifacts
 removed by the `atexit` handler). `--continue-on-error` is implemented at job
-boundaries only: request validation errors, and NAR/VAE stage failures for one
-job (the VAE child already reports through its exit code; the NAR would need
-its `die()`s to become a return — **do not do that in this stage**; treat NAR
-failure as fatal even under `--continue-on-error` and say so in STATUS).
+boundaries only: request validation errors. The NAR and the VAE report failure
+by `die()`, so both are fatal even under `--continue-on-error` — the VAE was the
+exception while it ran as a child process and its exit code could be read; since
+the fork was removed (2026-09-13, SPEC_SINGLE §2.2) it behaves like the NAR.
+Turning either stage's `die()`s into returns is a separate piece of work.
 Inside the shared AR decode loop, a failure in one sequence is a process-level
 bug (malformed sampled token, decode error) and stays fatal.
 

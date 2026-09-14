@@ -229,3 +229,50 @@ Robustness only; no numbers moved.
 Re-run after: noise golden byte-identical (`d68db01c…`), VAE 48-frame 121.95 dB,
 and one `yue2 song` on the Arc (155.3 s) whose `latent.npy` and FLAC are
 **identical** to `tests/out/single_song_arc/`.
+
+## Addendum 2026-09-13 — the VAE fork is gone
+
+`song` and `batch` decode the VAE **in this process**, on the device and at the
+precision the NAR just ran at (fp16-staged by default). The listening test in
+`docs/vulkan_burst_investigation.md` (addendum) settled that the exact-F32
+decode is a numeric reference, not a render default; exact decoding now lives
+only in the standalone `yue2 vae`, whose own default is unchanged.
+
+Superseding the table above: deviation 5 is withdrawn (nothing re-executes
+`/proc/self/exe` any more — it is only how `resolve_gguf` finds the GGUFs next
+to the binary), and deviation 12 now reads as "the per-op ggml patch would let
+`song` offer the exact VAE again", not "would remove the child". Deviation 3
+still stands and gets stronger: `--nar-f32` is per-process and now covers the
+VAE too.
+
+New rule — **mismatched precision aborts, it never downgrades.** `song`/`batch`
+reject `--vk-f16-matmul` / `--no-vk-f16-matmul` and the `request.json` key
+`vk_f16_matmul`, exit 1 before any model loads, with an error naming `yue2 vae`.
+
+Consequence for `batch`: a VAE failure is now fatal even under
+`--continue-on-error`, exactly like the NAR, because `run_vae` reports by
+`die()` rather than an exit code (SPEC_BATCH §4.6, updated).
+
+| check, Arc B70 (`--gpu 1`), 191.5 s song | result |
+|---|---|
+| `yue2 song` end to end | 195.1 s (abc 8.5, semantic 46.9, NAR 120.4, VAE 17.8) |
+| song FLAC vs standalone `yue2 vae --vk-f16-matmul` on the same `latent.npy` | **byte-identical** |
+| standalone `yue2 vae` exact vs `--vk-f16-matmul` | 67.08 dB, max abs 3.49e-03 |
+| VAE stage, exact vs fp16-staged | 16.2 s vs 17.1 s (exact ~6 % faster on this card) |
+| `yue2 noise --seed 831001 --frames 16` vs golden | byte-identical |
+
+| check, `--device cpu` | result |
+|---|---|
+| `yue2 batch --max-abc 32 --max-semantic 160` end to end | 128.2 s (abc 2.6, semantic 10.6, NAR 110.0, VAE 4.5) |
+| that FLAC vs standalone `yue2 vae --device cpu` on its `latent.npy` | **byte-identical** |
+
+CPU numerics are unchanged by the fork removal: there is no fp16 operand
+staging on the CPU backend, so the in-process decode is the same arithmetic the
+child was doing.
+
+`tests/regress.sh` still scores the standalone exact decoder and is unaffected.
+It grew `YUE2_REGRESS_DEVICE` / `YUE2_REGRESS_GPU` (defaults `vulkan` / `0`, the
+old hard-coded pair) and now exits 1 with a message instead of 0 when the song
+set is missing — an empty run used to read as "everything passed". Against a
+CPU-exact reference render of one 191.5 s latent: `--gpu 1` **109.42 dB**,
+`--device cpu` **128.57 dB**.

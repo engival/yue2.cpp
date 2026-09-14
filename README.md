@@ -39,8 +39,9 @@ driver + `glslc`, and python3. All paths below are relative to the repo root.
 **Tested on** one box only: Slackware64-current (Linux), an AMD Radeon RX 7900
 XTX (RADV) and an Intel Arc Pro B70 (ANV), both through ggml's Vulkan backend.
 **Not tested:** NVIDIA, Windows, macOS, or any backend other than Vulkan. The
-code has no platform-specific parts beyond `/proc/self/exe` for the VAE child
-process, so other Vulkan setups may well work; reports either way are welcome.
+code has no platform-specific parts beyond `/proc/self/exe` (used to find the
+GGUFs next to the binary), so other Vulkan setups may well work; reports either
+way are welcome.
 
 **1. Build.** `GGML_VULKAN=ON` is the only option that matters (it is also the
 default); llama.cpp's examples/tests/tools/server are forced off here.
@@ -144,15 +145,27 @@ reference pipeline did (`plan.json`, `prefix.npy`, `semantic.npy`, `nar_noise.np
 `latent.npy`, `config.json`, `result.json`, …); without it a temporary directory
 is used and removed.
 
-**The VAE runs as a child process of the same binary**, re-executed through
-`/proc/self/exe`. It needs `GGML_VK_DISABLE_F16`/`_COOPMAT` set for true-F32
-matmuls while the NAR's fast path needs them unset, and ggml-vulkan reads both
-once per device init — so one Vulkan context cannot serve both. The VAE loads in
-~0.2 s, so residency would buy nothing. The latent crosses as `DIR/latent.npy`;
-everything else is handed over in memory.
+**Every stage runs in one process, at one Vulkan precision.** ggml-vulkan fixes
+matmul operand staging at device init (`GGML_VK_DISABLE_F16`/`_COOPMAT`, read
+once), so the VAE decodes at whatever precision the NAR is using — fp16-staged
+by default. That decode is 58.5 dB from the exact-F32 one (~40 dB at the worst
+burst) and a listening test could not separate the two, so the exact path is a
+numeric reference, not a render default. To get it, run the stage on its own
+against the latent the render left behind:
+
+```bash
+build/yue2 vae -m yue2-vae-f32.gguf -i DIR/latent.npy -o exact.flac --device vulkan --gpu 0
+```
+
+`song` and `batch` refuse `--vk-f16-matmul` (and the matching `request.json`
+key) rather than silently downgrading — the error names that command. `--nar-f32` is the one switch that does move the whole process,
+VAE included, onto the exact pipelines.
 
 Measured on the Intel Arc B70, 156 s of audio: 155 s end to end (abc 15 s,
-semantic 37 s, NAR 88 s, VAE 14 s), ~8.7 GB peak VRAM. Details, the per-stage
+semantic 37 s, NAR 88 s, VAE 14 s), ~8.7 GB peak VRAM — the VAE figure is from
+the exact-F32 child. The two precisions cost about the same: on this card exact
+is ~6 % faster (16.2 s vs 17.1 s fp16-staged, 191 s song), on the AMD the
+fp16-staged path is the quicker one (9.2 s vs 9.5 s). Details, the per-stage
 goldens and the Q8_0/F16 prefix measurement are in
 [src/STATUS_SINGLE.md](src/STATUS_SINGLE.md).
 
