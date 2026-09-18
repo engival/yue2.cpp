@@ -70,7 +70,7 @@ void usage(const char * argv0)
 	fprintf(stderr,
 	        "usage: %s --request R.json --out X.flac [--artifacts DIR] [--seed N]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
-	        "        [--device cpu|vulkan] [--gpu N] [--nar-f32] [--noise FILE] [--steps 32]\n", argv0);
+	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n", argv0);
 }
 
 void usage_batch(const char * argv0)
@@ -78,7 +78,7 @@ void usage_batch(const char * argv0)
 	fprintf(stderr,
 	        "usage: %s --jobs jobs.json [--parallel N] [--summary FILE]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf] [--seed N]\n"
-	        "        [--device cpu|vulkan] [--gpu N] [--nar-f32] [--steps 32]\n"
+	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 32]\n"
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
 	        "        [--continue-on-error]\n"
 	        "\n"
@@ -311,6 +311,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			p.noise_path = need(argc, argv, i);
 		} else if (a == "--device") {
 			p.device = need(argc, argv, i);
+		} else if (a == "--cpu") {
+			p.device = "cpu";
 		} else if (a == "--gpu") {
 			p.gpu = atoi(need(argc, argv, i));
 		} else if (a == "--steps") {
@@ -361,6 +363,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			p.vae_model = need(argc, argv, i);
 		} else if (a == "--device") {
 			p.device = need(argc, argv, i);
+		} else if (a == "--cpu") {
+			p.device = "cpu";
 		} else if (a == "--gpu") {
 			p.gpu = atoi(need(argc, argv, i));
 		} else if (a == "--steps") {

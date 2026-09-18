@@ -783,13 +783,19 @@ static std::string detokenize(const llama_vocab * vocab, const std::vector<llama
 }
 
 
+// `vocab_only` loads the tokenizer and no weights, on no device (--prefix-only).
 static llama_model * load_model(const std::string & path, const std::string & device, int gpu,
-	std::string & backend_name, ggml_backend_dev_t * devices)
+	std::string & backend_name, ggml_backend_dev_t * devices, bool vocab_only = false)
 {
 	llama_model_params mparams = llama_model_default_params();
 	backend_name = "CPU";
-	if (device == "cpu")
+	if (vocab_only)
 	{
+		mparams.vocab_only   = true;
+		mparams.devices      = devices;
+		mparams.n_gpu_layers = 0;
+		backend_name         = "none (tokenizer only)";
+	} else if (device == "cpu") {
 		// An empty device list keeps llama on the CPU backend and skips Vulkan
 		// instance creation entirely.
 		mparams.devices      = devices;
@@ -1387,10 +1393,11 @@ static void usage(const char * argv0)
 	fprintf(stderr,
 	        "usage: %s -m MODEL.gguf --request song.json --artifacts DIR\n"
 	        "       %s -m MODEL.gguf --requests jobs.json [--parallel N]\n"
-	        "        [--seed N] [--cot full|melody|off] [--device cpu|vulkan] [--gpu N]\n"
+	        "        [--seed N] [--cot full|melody|off] [--gpu N] [--cpu]\n"
 	        "        [--threads N] [--dump-logits FILE.npy] [--greedy]\n"
 	        "        [--max-abc N] [--max-semantic N] [--continue-on-error]\n"
-	        "        [--verify-sampler]\n", argv0, argv0);
+	        "        [--verify-sampler]\n"
+	        "        [--prefix-only]   the request carries its \"abc\": write prefix.npy, decode nothing\n", argv0, argv0);
 }
 
 } // namespace
@@ -1517,6 +1524,8 @@ ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
 			p.dump_logits = need(argc, argv, i);
 		} else if (a == "--device") {
 			p.device = need(argc, argv, i);
+		} else if (a == "--cpu") {
+			p.device = "cpu";
 		} else if (a == "--gpu") {
 			p.gpu = atoi(need(argc, argv, i));
 		} else if (a == "--threads") {
@@ -1534,6 +1543,8 @@ ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
 			p.continue_on_error = true;
 		} else if (a == "--verify-sampler") {
 			p.verify_sampler = true;
+		} else if (a == "--prefix-only") {
+			p.prefix_only = true;
 		} else if (a == "--max-abc") {
 			p.max_abc = parse_positive_arg("--max-abc", need(argc, argv, i));
 		} else if (a == "--max-semantic") {
@@ -1640,7 +1651,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 
 	ggml_backend_dev_t devices[2] = {nullptr, nullptr};
 	std::string        backend_name;
-	llama_model *      model = load_model(p.model, p.device, p.gpu, backend_name, devices);
+	llama_model *      model = load_model(p.model, p.device, p.gpu, backend_name, devices, p.prefix_only);
 
 	const llama_vocab * vocab   = llama_model_get_vocab(model);
 	const int           n_vocab = llama_vocab_n_tokens(vocab);
@@ -1737,6 +1748,40 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			want = (uint32_t) CONTEXT;
 		}
 		n_ctx_want = std::max(n_ctx_want, want);
+	}
+
+	// ---- --prefix-only -----------------------------------------------------
+	// The NAR's view of a request: [EOD] text <abc> abc </abc><music>. Complete
+	// before any decode when the score is given, so a finished song's codes can
+	// be re-rendered under other request text (same score, other style).
+	if (p.prefix_only)
+	{
+		for (size_t i = 0; i < jobs.size(); i++)
+		{
+			const JobState & js = states[i];
+			if (!js.ok)
+			{
+				continue;
+			}
+			if (js.do_abc)
+			{
+				die("%s--prefix-only needs the score in the request's \"abc\" (or cot off); "
+				    "generating one is a decode", js.tag.c_str());
+			}
+			std::error_code ec;
+			std::filesystem::create_directories(jobs[i].artifacts, ec);
+			if (ec)
+			{
+				die("cannot create %s: %s", jobs[i].artifacts.c_str(), ec.message().c_str());
+			}
+			save_i32_or_die(jobs[i].artifacts + "/prefix.npy",
+			                std::vector<int32_t>(js.prefix_sem.begin(), js.prefix_sem.end()));
+			printf("%swrote:   %s/prefix.npy [%zu] (text %zu, abc %zu ids)\n", js.tag.c_str(),
+			       jobs[i].artifacts.c_str(), js.prefix_sem.size(), js.prefix_abc.size() - 2, js.abc_ids.size());
+		}
+		llama_model_free(model);
+		llama_backend_free();
+		return rejected == 0 ? 0 : 1;
 	}
 
 	// ---- context -----------------------------------------------------------
@@ -1861,6 +1906,7 @@ int run_ar(const ArParams & p, ArResult * out)
 	bp.max_semantic      = p.max_semantic;
 	bp.continue_on_error = p.continue_on_error;
 	bp.verify_sampler    = p.verify_sampler;
+	bp.prefix_only       = p.prefix_only;
 
 	std::vector<ArJob> jobs;
 	if (p.requests.empty())

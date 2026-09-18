@@ -24,6 +24,7 @@ struct ArParams
 	int         max_semantic = 0;
 	bool        continue_on_error = false;
 	bool        verify_sampler    = false;   // run the frozen stage-5 sampler beside the new one
+	bool        prefix_only       = false;   // tokenize request + given abc, write prefix.npy, decode nothing
 };
 
 // One song in a batch: exactly the per-song options `yue2 song` takes, minus
@@ -52,6 +53,7 @@ struct ArBatchParams
 	int         max_semantic = 0;
 	bool        continue_on_error = false;
 	bool        verify_sampler    = false;   // SPEC_SAMPLER.md §4
+	bool        prefix_only       = false;
 };
 
 // protocol.SongResult timing, as plan.json / result.json record it.

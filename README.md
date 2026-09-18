@@ -119,6 +119,22 @@ roughly twice as fast per GPU stage (NAR 52 s vs 92 s, VAE 7.5 s vs 15 s). The
 **first** Vulkan run spends ~16 min compiling RADV pipelines; later runs start in
 under a second.
 
+**Re-skin a song you like.** With `--artifacts DIR` a render leaves its score in
+`DIR/score.abc`. Put that text in a new request's `"abc"` and the AR skips
+writing a score and sings the given one (ignored with `cot: "off"`):
+
+```json
+{ "style": "orchestral rock, distorted guitars, gravelly male vocal", "lyrics": "…same lyrics…", "abc": "…score.abc…" }
+```
+
+The score carries the tune, the timing and much of the vocal delivery; the
+style decides the voice and the band. In our tests the re-skinned song came out
+within 0.3 % of the original's length with the same melody and phrasing in
+another genre, and ~25 % faster (no score phase). Nothing after the AR can do
+this: the NAR follows the semantic tokens and ignores both its noise seed and a
+changed style text, audibly. `yue2 ar --prefix-only` writes just `prefix.npy`
+for a request that carries its `"abc"` (tokenizer only, no GPU).
+
 Several songs at once: [`yue2 batch`](#render-several-songs-yue2-batch). Running
 the stages separately: [`yue2-ar`](#generate-the-symbolic-plan--semantic-tokens-yue2-ar),
 [`yue2-nar`](#flow-match-the-semantic-tokens-into-a-latent-yue2-nar),
@@ -238,7 +254,9 @@ convenience, not a contract.
 build/yue2-vae -m yue2-vae-f32.gguf -i latent.npy -o song.wav --device vulkan --gpu 0
 ```
 
-(or `build/yue2 vae …` — same flags.) An `-o` ending in `.flac` is written as
+(or `build/yue2 vae …` — same flags.) Every stage runs on Vulkan device `--gpu N`
+(default 0) and never falls back to the CPU: `--cpu` (= `--device cpu`) is the
+only way onto it, and a missing Vulkan device is an error. An `-o` ending in `.flac` is written as
 24-bit FLAC through libFLAC instead of float WAV; its integer samples are
 identical to what `soundfile`'s `PCM_24` wrote for the reference pipeline.
 

@@ -471,7 +471,7 @@ static void usage(const char * argv0)
 {
 	fprintf(stderr,
 		"usage: %s -m vae.gguf -i latent.npy -o out.wav|out.flac\n"
-		"           [--device cpu|vulkan] [--gpu N] [--threads N]\n"
+		"           [--gpu N] [--cpu] [--threads N]\n"
 		"           [--core-frames 256] [--halo-frames 16] [--im2col f32|f16]\n"
 		"           [--frames N] [--npy out.npy] [--full] [--vk-f16-matmul]\n"
 		"           [--probe] [--probe-dir DIR]   # debug: dump intermediates\n", argv0);
@@ -496,6 +496,8 @@ VaeParams parse_vae_args(const char * argv0, int argc, char ** argv)
 			p.npy_out = need(argc, argv, i);
 		} else if (a == "--device") {
 			p.device = need(argc, argv, i);
+		} else if (a == "--cpu") {
+			p.device = "cpu";
 		} else if (a == "--gpu") {
 			p.gpu = atoi(need(argc, argv, i));
 		} else if (a == "--threads" || a == "-t") {

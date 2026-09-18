@@ -12,7 +12,7 @@ struct VaeParams
 	std::string input;
 	std::string output;
 	std::string npy_out;
-	std::string device    = "cpu";
+	std::string device    = "vulkan";   // the CPU is never a default or a fallback: --cpu asks for it
 	int       gpu         = 0;
 	int       threads     = 0;
 	int       core_frames = 256;

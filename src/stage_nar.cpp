@@ -539,7 +539,7 @@ static void usage(const char * argv0)
 		"           (--artifacts DIR | --prefix prefix.npy --codec semantic.npy)\n"
 		"           (--noise noise.npy | --seed N) -o latent.npy\n"
 		"           [--steps 32] [--context 24576] [--query-chunk 1024] [--prefill-block 512]\n"
-		"           [--device cpu|vulkan] [--gpu N] [--threads N]\n"
+		"           [--gpu N] [--cpu] [--threads N]\n"
 		"           [--frames N] [--flash-attn] [--kv-f16] [--dump-dir DIR] [--dump-kv-all]\n"
 		"           [--weights f16|f32] [--vk-f16-matmul]\n", argv0);
 }
@@ -674,6 +674,8 @@ NarParams parse_nar_args(const char * argv0, int argc, char ** argv)
 			p.dump_dir = need(argc, argv, i);
 		} else if (a == "--device") {
 			p.device = need(argc, argv, i);
+		} else if (a == "--cpu") {
+			p.device = "cpu";
 		} else if (a == "--gpu") {
 			p.gpu = atoi(need(argc, argv, i));
 		} else if (a == "--threads" || a == "-t") {
