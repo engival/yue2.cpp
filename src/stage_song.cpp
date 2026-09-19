@@ -210,6 +210,7 @@ json json_template(const TemplateStats & t)
 	out["given_tokens"]   = t.given_tokens;
 	out["sampled_tokens"] = t.sampled_tokens;
 	out["offlength_bars"] = t.offlength_bars;
+	out["continued_tokens"] = t.continued_tokens;
 	return out;
 }
 

@@ -1,0 +1,158 @@
+X:1
+T:
+M:4/4
+L:1/32
+Q:1/4=120
+V: Vocal clef=treble name="Vocal Melody" snm="Vocal"
+V: Ins clef=treble name="Ins Melody" snm="Inst."
+K:Em
+% intro
+V: Vocal
+z24z4"Em"z4|"Em"z32|"B"z32|"Em"z32|
+V: Ins
+Z|e4B4g4B4f4B4e4B4|^d4B4f4B4e4B4d4B4|e4B4g4B4f4B4e4B4|
+V: Vocal
+"B"z32|"Em"z32|"B"z32|"Cmaj7"z32|
+V: Ins
+^d4B4f4B4e8d8|e8g8f8e8|^d8f8e8d8|e8g8f8e8|
+V: Vocal
+"B"z32|"Em"z32|"B"z32|"Cmaj7"z32|
+V: Ins
+^d8f8g8f8|e8g8f8e8|^d8f8e8d8|e16f16|
+V: Vocal
+"B"z32|
+V: Ins
+g16a16|
+% verse
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=2
+V: Ins
+%%yue2-gen bars=2
+% chorus
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+% verse
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=2
+V: Ins
+%%yue2-gen bars=2
+% interlude
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+% verse
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+% chorus
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+% interlude
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+% verse
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=2
+V: Ins
+%%yue2-gen bars=2
+% outro
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=4
+V: Ins
+%%yue2-gen bars=4
+V: Vocal
+%%yue2-gen bars=2
+V: Ins
+%%yue2-gen bars=2

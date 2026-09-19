@@ -158,6 +158,10 @@ In practice it then quotes that verse, and the intro sounds like an interlude;
 `yue2` warns when a template carries a primer. The chord symbols on the intro's
 resting vocal line already give the hole the tune's harmony bar by bar, which
 turns out to be the tether that matters.
+A template whose last line is `%%yue2-continue` is an opening rather than a
+form: the lines above it are fed as the score's beginning and the model writes
+the rest freely, as it would with no score at all. The opening need not be
+well-formed; the result shows what the model makes of it.
 `score.abc` and the rest of the artifacts hold the finished score with no
 directives and no primer; `request.json` records the score the holes produced as
 a plain `"abc"`, so the artifacts directory is a request that reproduces the

@@ -154,7 +154,7 @@ static const int TEMPLATE_REST_TOKENS = 6;
 // pieces the abc phase counted. The context guard carries this much slack.
 static const int TEMPLATE_SEAM_MARGIN = 64;
 
-enum TplKind { TPL_GIVEN, TPL_PRIMER, TPL_HOLE };
+enum TplKind { TPL_GIVEN, TPL_PRIMER, TPL_HOLE, TPL_CONTINUE };
 
 // The `M:` and `L:` a bar's length is measured against, with ABC's defaults.
 struct Meter
@@ -540,6 +540,16 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 		const size_t tail = line.find_last_not_of(" \t\r");
 		const std::string trimmed = head == std::string::npos
 		                            ? std::string() : line.substr(head, tail - head + 1);
+		// Past %%yue2-continue the score is the model's: nothing may follow it but
+		// blank lines (§2).
+		if (!segs.empty() && segs.back().kind == TPL_CONTINUE)
+		{
+			if (!trimmed.empty())
+			{
+				return strf("line %zu: %%%%yue2-continue must be the template's last line", lineno);
+			}
+			continue;
+		}
 		if (!starts_with(trimmed, "%%yue2-"))
 		{
 			// A primer is context, not score: it may not decide a hole's meter or
@@ -583,6 +593,17 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 				return strf("line %zu: %%%%yue2-primer-end without a primer block", lineno);
 			}
 			in_primer = false;
+			continue;
+		}
+		if (trimmed == "%%yue2-continue")
+		{
+			if (in_primer)
+			{
+				return strf("line %zu: %%%%yue2-continue inside a primer block", lineno);
+			}
+			TplSeg seg;
+			seg.kind = TPL_CONTINUE;
+			segs.push_back(seg);
 			continue;
 		}
 		if (!starts_with(trimmed, "%%yue2-gen"))
@@ -1458,6 +1479,7 @@ struct Seq
 	// The template walk (SPEC_TEMPLATE §3), untouched by a job without one.
 	size_t                   seg       = 0;  // the segment being fed or sampled
 	bool                     in_hole   = false;
+	bool                     tpl_cont  = false;   // past %%yue2-continue: sampling freely to ABC_END
 	bool                     tpl_full  = false;   // the job's sampled-token cap is spent
 	int                      attempt   = 0;  // 1..TEMPLATE_ATTEMPTS within the hole
 	llama_pos                hole_pos  = 0;  // where the hole's tokens start
@@ -1528,6 +1550,9 @@ struct Runner
 	void        rollback_hole(Seq & q);
 	void        rest_fill(Seq & q);
 	void        template_done(Seq & q);
+	void        start_continue(Seq & q);
+	void        continue_token(Seq & q, llama_token token);
+	void        finish_continue(Seq & q, const char * stopped_by);
 
 	void        finish_job(Seq & q);
 	void        progress();
@@ -1591,6 +1616,11 @@ void Runner::apply(Seq & q, llama_token token)
 	if (q.in_hole)
 	{
 		template_token(q, token);
+		return;
+	}
+	if (q.tpl_cont)
+	{
+		continue_token(q, token);
 		return;
 	}
 
@@ -1777,6 +1807,11 @@ void Runner::template_step(Seq & q)
 		if (seg.kind == TPL_HOLE)
 		{
 			open_hole(q);
+			return;
+		}
+		if (seg.kind == TPL_CONTINUE)
+		{
+			start_continue(q);
 			return;
 		}
 		q.seg++;
@@ -1986,6 +2021,87 @@ void Runner::rest_fill(Seq & q)
 	template_step(q);
 }
 
+// %%yue2-continue: the template's last segment. What was given so far is the
+// score's beginning and the model writes the rest as a plain score phase would
+// — no line checks, ABC_END allowed — so a caller can hand in the opening of a
+// score, well-formed or not, and read what the model makes of it (§3).
+void Runner::start_continue(Seq & q)
+{
+	// As open_hole: the head of the last hole's closing token is score text the
+	// cache has not seen yet.
+	if (!q.carry.empty())
+	{
+		const std::string text = q.carry;
+		q.carry.clear();
+		give(q, text, true, "hole tail");
+	}
+
+	// q.seg stays on the continue segment: abc_fits / sem_fits read the suffix
+	// sums at q.seg + 1, which is the end of the template (nothing left to feed).
+	q.tpl_cont = true;
+	q.hole_ids.clear();
+	if (q.tpl_full || q.step >= s_abc.max_tokens)
+	{
+		finish_continue(q, "the job's sampled-token cap is spent");
+		return;
+	}
+	continue_token(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+}
+
+void Runner::continue_token(Seq & q, llama_token token)
+{
+	JobState & js = (*states)[q.job];
+
+	if (token == ABC_END)
+	{
+		finish_continue(q, nullptr);
+		return;
+	}
+	js.tpl.sampled_tokens++;
+	q.step++;
+	q.hole_ids.push_back(token);
+	q.history.push_back(token);
+
+	if (q.step >= s_abc.max_tokens)
+	{
+		finish_continue(q, "the job's sampled-token cap is spent");
+		return;
+	}
+	if (!abc_fits(q, q.hole_ids.size() + 1))
+	{
+		finish_continue(q, "the slot is out of context");
+		return;
+	}
+	if (!sem_fits(q, q.hole_ids.size() + 1))
+	{
+		finish_continue(q, "the semantic phase would have no room");
+		return;
+	}
+	q.next = token;
+}
+
+// The free tail is over: it becomes the end of the emitted score and the job
+// goes on exactly as a template that ran out of segments (template_done).
+void Runner::finish_continue(Seq & q, const char * stopped_by)
+{
+	JobState & js = (*states)[q.job];
+
+	const std::string text = q.hole_ids.empty() ? std::string() : detokenize(vocab, q.hole_ids);
+	js.tpl_text            += text;
+	js.emitted             += q.hole_ids.size();
+	js.tpl.continued_tokens = (int) q.hole_ids.size();
+	if (stopped_by != nullptr)
+	{
+		js.st_abc.truncated = true;
+		printf("%sabc: continue: stopped after %zu tokens, %s\n", js.tag.c_str(),
+		       q.hole_ids.size(), stopped_by);
+	}
+	q.hole_ids.clear();
+	q.tpl_cont = false;
+	q.seg++;
+	template_done(q);
+}
+
 // The abc phase of a template job ends when the template runs out. The emitted
 // score is re-tokenized in one go — BPE merges across the segment seams differ
 // from the per-segment ids — and prefilled into a *cleared* slot, exactly as an
@@ -2022,9 +2138,9 @@ void Runner::template_done(Seq & q)
 	printf("%sabc:      %d tokens in %.2f s = %.2f tok/s%s\n", js.tag.c_str(),
 	       st.output_tokens, st.seconds, st.output_tps, st.truncated ? " (TRUNCATED)" : "");
 	printf("%sabc: template: %d holes, %d sampled tokens, %d retries, %d rest-filled, "
-	       "%d given + %d primer tokens, %d off-length bars\n", js.tag.c_str(),
+	       "%d given + %d primer tokens, %d off-length bars, %d continued\n", js.tag.c_str(),
 	       js.tpl.holes, js.tpl.sampled_tokens, js.tpl.retries, js.tpl.rest_filled,
-	       js.tpl.given_tokens, js.tpl.primer_tokens, js.tpl.offlength_bars);
+	       js.tpl.given_tokens, js.tpl.primer_tokens, js.tpl.offlength_bars, js.tpl.continued_tokens);
 
 	js.prefix_sem = js.prefix_abc;
 	js.prefix_sem.insert(js.prefix_sem.end(), js.abc_ids.begin(), js.abc_ids.end());
@@ -2076,6 +2192,7 @@ void Runner::enter(Seq & q, int job)
 	q.t_phase0 = now_seconds();
 	q.seg      = 0;
 	q.in_hole  = false;
+	q.tpl_cont = false;
 	q.tpl_full = false;
 	q.hole_ids.clear();
 	q.carry.clear();
@@ -2725,6 +2842,14 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			for (size_t k = 0; k < js.segs.size(); k++)
 			{
 				const TplSeg & seg = js.segs[k];
+				if (seg.kind == TPL_CONTINUE)
+				{
+					// The free tail may run to the phase's own cap, as a plain
+					// score would; the guards in continue_token stop it earlier
+					// if the slot is smaller than that.
+					tpl_lines += (size_t) s_abc.max_tokens;
+					continue;
+				}
 				if (seg.kind != TPL_HOLE)
 				{
 					const size_t n = tokenize(vocab, seg.text, "template segment").size();

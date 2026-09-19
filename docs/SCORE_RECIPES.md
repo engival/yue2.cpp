@@ -5,7 +5,8 @@ A render started with `--artifacts DIR` leaves the model's score in
 page is a how-to for the edits you can make to that score and feed back through
 `"abc"` or `"abc_template"`, so the same song comes back in another key, another
 style, or with a different accompaniment. The request fields themselves are in
-the [README](../README.md#quick-start).
+the [README](../README.md#quick-start). One real score in every form below is in
+[examples/](examples/).
 
 ## 1. What a score looks like
 
@@ -133,6 +134,21 @@ awk '/^V:/ { voice = $2 }
 The artifacts of a template render hold the finished score with the holes
 filled (`score.abc`) and the template as sent (`template.abc`), and their
 `request.json` carries the finished score as a plain `"abc"`.
+
+**The Vocal line the same way.** Replace each Vocal body line with
+`%%yue2-gen bars=N`, N counted from the line it replaces (a hole's default count
+comes from the line above it, which for a Vocal hole is the previous system's
+Ins line, and section tails are often shorter). The model then writes melody
+and chord symbols over the kept accompaniment. A Vocal hole is written before
+the Ins line under it is fed, so the harmony it picks is its own.
+
+**Keep a section, rewrite the rest.** Hole both voices everywhere except the
+sections to keep, `% intro` say. The kept opening then steers what follows.
+
+**An opening, not a form.** Give the beginning of a score and end the template
+with `%%yue2-continue`: the model writes the rest freely, without the section
+labels and bar counts of the source. The opening may be incomplete, one voice
+only for instance; the render shows what the model makes of it.
 
 The template format also has a primer block (`%%yue2-primer-begin` …
 `%%yue2-primer-end`): lines fed as context at that point and dropped from the

@@ -30,6 +30,7 @@ occupies a whole line, is never fed to the model and never reaches `score.abc`:
 | `%%yue2-gen` | a hole: the model writes this one line. Optional ` bars=N` (whitespace required, 1 ≤ N ≤ 9999); default N = the bar count of the nearest body line above it (§4) |
 | `%%yue2-primer-begin` | start of a primer block |
 | `%%yue2-primer-end` | end of it |
+| `%%yue2-continue` | last line only: the lines above are the score's beginning and the model writes the rest freely, as a plain score phase would (§3). Anything but blank lines after it is a request error |
 
 Leading whitespace before a directive is allowed, as is a trailing `\r`. Any other
 `%%yue2-…` line is a request error rather than a comment. A primer block's lines
@@ -47,6 +48,16 @@ the C++ does not know what a verse is. A template with a primer block gets one
 melody instead of introducing it, and the chord symbols on the resting vocal line
 above a hole already supply the tune's harmony, so the primer is kept as
 specified but not recommended.
+
+**Continue.** `%%yue2-continue` as the last line ends the given part of the score
+and hands the rest to the model: from there it samples as the plain score phase
+does, one token at a time with `ABC_END` allowed, no line checks and no bar
+counting, until it ends the score or the phase's `--max-abc` cap, the slot or the
+semantic phase's room stops it (then `truncated`, and the stop is printed). What it
+wrote is appended to the emitted score and the job finishes exactly as a template
+that ran out of segments. The given part need not be well-formed — an opening with
+only one voice, say — that is the point: the caller reads what the model makes of
+it. Context is sized as if the tail could run to the abc cap.
 
 A template with no directives at all is legal and must behave exactly like `"abc"`
 with the same text (§6, test 1).
@@ -147,7 +158,7 @@ Put the counter in its own small function with a table of cases in the test (§6
   is the request echo and carries `"abc_template"` because it is a byte copy.
 - `result.json` and the `yue2 batch --summary` entry gain, for template jobs only:
   `template: { holes, retries, rest_filled, primer_tokens, given_tokens,
-  sampled_tokens, offlength_bars }`. `yue2 ar` writes no result JSON and prints the
+  sampled_tokens, offlength_bars, continued_tokens }`. `yue2 ar` writes no result JSON and prints the
   same counters instead.
 
 ## 6. Acceptance
