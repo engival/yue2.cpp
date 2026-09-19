@@ -154,6 +154,10 @@ A line that comes out wrong is rolled back and drawn again up to four times,
 then filled with rests (`ZN|`). Lines between `%%yue2-primer-begin` and
 `%%yue2-primer-end` are fed as context and then dropped from the score: the
 model is causal, so that is how an intro gets to see the verse it introduces.
+In practice it then quotes that verse, and the intro sounds like an interlude;
+`yue2` warns when a template carries a primer. The chord symbols on the intro's
+resting vocal line already give the hole the tune's harmony bar by bar, which
+turns out to be the tether that matters.
 `score.abc` and the rest of the artifacts hold the finished score with no
 directives and no primer; `request.json` records the score the holes produced as
 a plain `"abc"`, so the artifacts directory is a request that reproduces the
@@ -161,6 +165,10 @@ song, and the template as given is kept beside it as `template.abc`.
 `result.json` gains a `template` block counting the holes, retries and
 rest-fills. `"abc_template"` is mutually exclusive with `"abc"` and needs `cot`
 `full` or `melody`.
+
+Transposing a score, moving the singer's register, stripping the chords, resting
+out or re-writing the accompaniment, reading a seed's score before rendering it:
+[docs/SCORE_RECIPES.md](docs/SCORE_RECIPES.md), with `scripts/abc_transpose.lua`.
 
 Several songs at once: [`yue2 batch`](#render-several-songs-yue2-batch). Running
 the stages separately: [`yue2-ar`](#generate-the-symbolic-plan--semantic-tokens-yue2-ar),

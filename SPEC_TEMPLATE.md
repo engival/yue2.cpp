@@ -42,7 +42,11 @@ lets the caller show the model a verse before it writes the intro (the model is
 causal; the intro otherwise never sees the tune it introduces). The block holds
 given lines only — a `%%yue2-gen` inside it is a request error. Unterminated or
 nested blocks are request errors. What goes in the block is the caller's business;
-the C++ does not know what a verse is.
+the C++ does not know what a verse is. A template with a primer block gets one
+`warning:` line on stderr at job setup: in practice the model quotes the primed
+melody instead of introducing it, and the chord symbols on the resting vocal line
+above a hole already supply the tune's harmony, so the primer is kept as
+specified but not recommended.
 
 A template with no directives at all is legal and must behave exactly like `"abc"`
 with the same text (§6, test 1).

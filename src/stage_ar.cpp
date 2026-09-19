@@ -2758,6 +2758,19 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 				js.tail_given[k - 1] += js.tail_given[k];
 				js.tail_holes[k - 1] += js.tail_holes[k];
 			}
+			// A primer works as specified and is kept for that; it just rarely
+			// does what it was built for. A hole under a resting vocal line still
+			// sees that line's chord symbols, so an intro hole already knows the
+			// tune's harmony bar by bar. What a primer adds is the melody, and the
+			// model quotes it rather than introducing it.
+			if (tpl_fed > tpl_emit)
+			{
+				fprintf(stderr, "%swarning: the template has a primer block. Shown a section's "
+				        "melody ahead of a hole, the model tends to quote it, so an intro primed "
+				        "with the verse sounds like an interlude. The chord symbols kept on the "
+				        "intro's resting vocal line already tie it to the tune; try without.\n",
+				        js.tag.c_str());
+			}
 		}
 
 		// External ABC: tokenize it here so the semantic prefix matches torch.

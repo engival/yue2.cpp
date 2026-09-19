@@ -13,6 +13,9 @@ manual; this file is where things are and the rules that were learned the hard w
   the SPEC, exact commands. `STATUS_NAR_PERF.md` has the per-op profiles.
 - `docs/vulkan_burst_investigation.md` — why F32 on ggml-vulkan needs
   `GGML_VK_DISABLE_F16` + `GGML_VK_DISABLE_COOPMAT` (fp16 staging of F32 matmul).
+- `docs/SCORE_RECIPES.md` — how-to for editing a `score.abc` and feeding it back
+  (`"abc"` / `"abc_template"`); `scripts/abc_transpose.lua` (plain Lua) is the
+  one script it needs. Patterns only: no opinions, findings or private paths.
 - `docs/ROADMAP.md` — what's next and why. The public tree carries no local
   paths, private scripts or addresses (the checklist lives outside this repo);
   keep it that way.
