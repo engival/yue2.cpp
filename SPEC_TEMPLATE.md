@@ -31,6 +31,7 @@ occupies a whole line, is never fed to the model and never reaches `score.abc`:
 | `%%yue2-primer-begin` | start of a primer block |
 | `%%yue2-primer-end` | end of it |
 | `%%yue2-continue` | last line only: the lines above are the score's beginning and the model writes the rest freely, as a plain score phase would (§3). Anything but blank lines after it is a request error |
+| `%%yue2-chords` | a chord line: a body line of rests carrying chord symbols, written *after* the model has seen the other voice's line of the same system, then placed here (§3). Optional ` bars=N` as for a hole; default N = the bar count of the body line two lines below |
 
 Leading whitespace before a directive is allowed, as is a trailing `\r`. Any other
 `%%yue2-…` line is a request error rather than a comment. A primer block's lines
@@ -58,6 +59,43 @@ wrote is appended to the emitted score and the job finishes exactly as a templat
 that ran out of segments. The given part need not be well-formed — an opening with
 only one voice, say — that is the point: the caller reads what the model makes of
 it. Context is sized as if the tail could run to the abc cap.
+
+**Chords.** The score is written top to bottom, so a system's first voice never
+sees the second. `%%yue2-chords` lets the first voice's line be written *after*
+the second's, for the case where the caller gives an accompaniment and wants
+the harmony above it filled in: an intro handed over as Ins lines only, say.
+Placement is fixed. The line above the directive must be a given voice header
+(`V: Vocal`), and the two lines below it a given voice header and a given body
+line (`V: Ins` and its music); anything else there — another directive, a
+section label, end of template — is a request error, as is a chords directive
+inside a primer block or after `%%yue2-continue`.
+
+```
+V: Vocal
+%%yue2-chords
+V: Ins
+Z|e4B4g4B4f4B4e4B4|^d4B4f4B4e4B4d4B4|e4B4g4B4f4B4e4B4|
+```
+
+Decode, with `A` the header above and `B` the two lines below:
+
+1. Checkpoint the slot before `A` is fed (`A` is peeled off the given segment
+   it ends, so the checkpoint is a segment boundary).
+2. Feed `B`, then `A`, then an opening double quote, all as given text.
+3. Sample to `\n` exactly as a hole does (ABC_END masked, same budget, measured
+   against `B`'s body line).
+4. The line is the quote plus what was sampled. Accept when its bar count is N,
+   it holds at least one chord symbol, and with the chord symbols removed it
+   holds no note (`A`–`G`, `a`–`g`): rests, bar lines and lengths only. Else roll
+   back to the quote and sample again, up to 4 attempts, RNG not restored, then
+   rest-fill `Z|` / `ZN|` with no chord symbol. Prints as a hole does.
+5. Roll back to the checkpoint and feed in template order: `A`, the line, `B`.
+   Go on with the next segment.
+
+The emitted score has the line under `A`, where the directive stood; nothing
+of the out-of-order feed survives in the KV cache or the score. Context sizing
+counts a chords directive as a hole. In the result JSON it counts in `holes`,
+`retries` and `rest_filled`, and `chord_lines` says how many there were.
 
 A template with no directives at all is legal and must behave exactly like `"abc"`
 with the same text (§6, test 1).
@@ -158,7 +196,7 @@ Put the counter in its own small function with a table of cases in the test (§6
   is the request echo and carries `"abc_template"` because it is a byte copy.
 - `result.json` and the `yue2 batch --summary` entry gain, for template jobs only:
   `template: { holes, retries, rest_filled, primer_tokens, given_tokens,
-  sampled_tokens, offlength_bars, continued_tokens }`. `yue2 ar` writes no result JSON and prints the
+  sampled_tokens, offlength_bars, continued_tokens, chord_lines }`. `yue2 ar` writes no result JSON and prints the
   same counters instead.
 
 ## 6. Acceptance

@@ -211,6 +211,7 @@ json json_template(const TemplateStats & t)
 	out["sampled_tokens"] = t.sampled_tokens;
 	out["offlength_bars"] = t.offlength_bars;
 	out["continued_tokens"] = t.continued_tokens;
+	out["chord_lines"]      = t.chord_lines;
 	return out;
 }
 

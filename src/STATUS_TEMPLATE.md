@@ -226,3 +226,85 @@ byte-identity claim. What is left:
 - Not built, not asked for: editing a given line, holes spanning more than one
   line, and any notion of what a verse is — a primer block is whatever the
   caller puts between the markers.
+
+## 5. `%%yue2-chords`
+
+SPEC_TEMPLATE §2 "Chords" and §3 step 1–5: a directive that has the model write
+a `V:` line *after* it has read the other voice's line of the same system, so a
+given accompaniment can be handed its harmony. Built in `build_template/`
+(`cmake -B build_template -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+-DYUE2_BUILD_TESTS=ON`, `nice -n 10 cmake --build build_template -j8`), run on
+Vulkan device 1 (Arc B70) only.
+
+| piece | what it is |
+|---|---|
+| `TPL_CHORDS` | a segment carrying `head` (the `V:` header above, peeled off the given segment it ended), `text` (the two lines below: the other voice's header and its body line) and a hole's `bars` / `above` / `meter` |
+| `parse_bars_arg()` | the ` bars=N` grammar of `%%yue2-gen`, factored out so both directives share it — same error strings, same `strtol` range check |
+| `trim_line()` | the line-trimming the parser did inline, factored out for the two look-ahead lines |
+| `GiveKind` | `give()`'s `bool emit` became `GIVE_SCORE` / `GIVE_PRIMER` / `GIVE_SCRATCH`; the third is the out-of-order feed, which counts for nothing because it is rolled back |
+| `Runner::open_chords()` | checkpoints (`chk_pos` / `chk_hist` / `chk_step`), feeds `B`, `A`, `"` as scratch, then opens a hole on the quote |
+| `Runner::finish_chords()` | the one exit, from acceptance or rest-fill: `llama_memory_seq_rm` back to the checkpoint, then `A` + line + `B` fed as one given stretch, so cache, `history` and score all read in template order |
+
+Validation of the sampled line adds two tests to the hole's bar count: it must
+carry a chord symbol, and `strip_line()` of it must hold no `A`–`G` / `a`–`g`
+— rests, bar lines and lengths only. Retries, the rest-fill (`Z|` / `ZN|`, no
+chord symbol) and the printed lines are the hole's, unchanged. Counters: a
+chords directive is a hole in `holes` / `retries` / `rest_filled`, and the new
+`chord_lines` says how many of them there were — in `TemplateStats`,
+`result.json`, the batch summary and the `yue2 ar` line.
+
+### 5.1 Tests
+
+Requests were built from a private render's `request.json` with
+`jq --rawfile abc T '. + {abc_template: $abc} | del(.abc)'`; all runs
+`--gpu 1 --seed 1 -m yue2-ar-q8_0.gguf`, artifacts under `tests/out/chords/`
+(gitignored).
+
+| # | command | result |
+|---|---|---|
+| 1 | `build_template/yue2 ar --request tests/out/chords/chords.json --artifacts tests/out/chords/t1 --max-semantic 32 --gpu 1 --seed 1` (`docs/examples/song_intro_chords.tpl.abc`) | **PASS** — 4 chord lines at the directive positions, above their `V: Ins` lines, right bar counts, 2 retries (one line came back 1 bar twice), 0 rest-fills; the `%%yue2-continue` tail (2064 tokens) is written *with* chord symbols throughout; no directive text in `score.abc` or `plan.json` |
+| 2 | same, `tests/out/chords/mixed.json` → `t2` (the same intro, then two given verse systems with `%%yue2-gen` Ins holes) | **PASS** — 6 holes / 4 chord lines; the four chord lines are byte-identical to test 1's, the two ordinary holes wrote 4-bar Ins lines |
+| 3 | `docs/examples/song_new_ins.tpl.abc` and `song_continue.tpl.abc` through `build/yue2 ar` (pre-change) and `build_template/yue2 ar`, same seed | **PASS** — `abc_tokens.npy`, `score.abc` and `semantic.npy` byte-identical for both templates |
+| 4 | six malformed templates (`tests/out/chords/e_*.json`) | **PASS** — all six a clean request error before the model loads, exit 1: section label above (`% intro`), directive as the last line, `%%yue2-gen` where the header must be, inside a primer block, after `%%yue2-continue`, and a comment line where the body must be |
+| 5 | `--verify-sampler` on test 1's request | **PASS** — 2198 sampling steps matched the frozen stage-5 sampler; the score came out byte-identical to test 1 |
+| 6 | `build_template/yue2-bars` | **PASS** — 71 cases, 0 failures (the `parse_bars_arg` / `trim_line` refactor) |
+| 7 | forced rest-fill: test 1's template with `bars=99` on every directive | **PASS** — 4 chord lines × 4 attempts, 12 retries, 4 rest-fills, `Z99|` written above each Ins line in template order, the given system after them intact, exit 0 |
+| 8 | one full render, `build_template/yue2 song --gpu 1 --ar … --nar … --vae … --request tests/out/chords/mixed.json --seed 1 --out … --artifacts tests/out/chords/t_song` | **PASS** — 42.3 s of audio in 32.4 s (abc 1.6 s, semantic 8.0 s, nar 17.5 s, vae 4.1 s); `result.json` carries `"chord_lines": 4` beside `"holes": 6` |
+
+`tests/regress.sh` was **not** run: it scores the standalone `yue2-vae` against
+a private render set, defaults to device 0, and touches no AR code — nothing in
+this change can reach it. The AR-side regression is test 3 plus test 5.
+
+### 5.2 The four lines test 1 wrote
+
+Each written line is the `V: Vocal` line; the `V: Ins` line under it is the
+given one it was written from (`docs/examples/song_intro_chords.tpl.abc`, `K:Em`,
+`M:4/4`, `L:1/32`).
+
+```
+"Em"z32|"Em"z32|"B/D#"z32|"Em"z32|
+Z|e4B4g4B4f4B4e4B4|^d4B4f4B4e4B4d4B4|e4B4g4B4f4B4e4B4|
+
+"Em"z32|"Em"z32|"Em"z32|"Em"z32|
+^d4B4f4B4e8d8|e8g8f8e8|^d8f8e8d8|e8g8f8e8|
+
+"Em"z16"B"z16|"Em"z32|"Em"z32|"Em"z32|
+^d8f8g8f8|e8g8f8e8|^d8f8e8d8|e16f16|
+
+"Em"z16"B"z16|
+g16a16|
+```
+
+The first line is the one the reference experiment (a plain server at temp 0)
+also wrote, `B/D#` and all. The third system is where the model wanted one bar
+instead of four twice over before landing it — the reference rest-filled that
+one.
+
+### 5.3 Deviations
+
+| # | SPEC | what was built, and why |
+|---|---|---|
+| 1 | §3 step 5 "feed `A`, the accepted line, `B`" | The three are fed as **one** `give()`, not three: the emitted score is re-tokenized in one go at the end, so one feed is the closer match to it (fewer BPE seams) and costs one `llama_decode` instead of three. The consequence is that the written line's tokens land in `given_tokens` rather than in a counter of their own — `chord_lines` and `sampled_tokens` are what count the writing. |
+| 2 | §2 "the two lines below it a given voice header and a given body line" | Not checked: that the header below names a *different* voice than the one above. The parser knows `V:`, not which voices a score has, and a template that puts the same voice on both lines is the caller's business — the model still reads a system. |
+| 3 | §3 step 3 "same budget" | The budget scales from `B`'s body line (`above` = that line), which is what §2 makes the default bar count too. |
+| 4 | context sizing | A chords segment's own lines are counted **once**, like a given segment, plus a hole's expected line: the out-of-order feed holds `B` + `A` + `"` at the same moment the line is being written and is undone before those lines are fed in order, so the peak is a hole's peak. `sem_fits` adds this segment's given tokens back explicitly, since they are not in `emitted` until the line is accepted. |

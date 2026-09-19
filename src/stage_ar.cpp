@@ -154,7 +154,12 @@ static const int TEMPLATE_REST_TOKENS = 6;
 // pieces the abc phase counted. The context guard carries this much slack.
 static const int TEMPLATE_SEAM_MARGIN = 64;
 
-enum TplKind { TPL_GIVEN, TPL_PRIMER, TPL_HOLE, TPL_CONTINUE };
+enum TplKind { TPL_GIVEN, TPL_PRIMER, TPL_HOLE, TPL_CONTINUE, TPL_CHORDS };
+
+// What a forced stretch of score counts for: score text (fed and emitted), a
+// primer (fed only), or the out-of-order feed of a `%%yue2-chords` directive,
+// which is rolled back before anything is emitted.
+enum GiveKind { GIVE_SCORE, GIVE_PRIMER, GIVE_SCRATCH };
 
 // The `M:` and `L:` a bar's length is measured against, with ABC's defaults.
 struct Meter
@@ -169,9 +174,11 @@ struct TplSeg
 {
 	TplKind     kind = TPL_GIVEN;
 	std::string text;            // given / primer: whole lines, newlines kept
-	int         bars = 0;        // hole: the bar count its line must have
-	std::string above;           // hole: the body line its token budget scales from
-	Meter       meter;           // hole: the meter in force where it sits
+	                             // chords: the two lines below it (`B`), newlines kept
+	std::string head;            // chords: the voice header line above it (`A`)
+	int         bars = 0;        // hole / chords: the bar count its line must have
+	std::string above;           // hole / chords: the body line the budget scales from
+	Meter       meter;           // hole / chords: the meter in force where it sits
 };
 
 struct BarCount
@@ -513,6 +520,65 @@ static bool starts_with(const std::string & s, const char * prefix)
 	return s.size() >= n && s.compare(0, n, prefix) == 0;
 }
 
+// `%%yue2-gen` and `%%yue2-chords` take nothing, or `bars=N` with real
+// whitespace between the two — `%%yue2-genbars=3` is a typo, not a directive
+// with an argument. `bars` comes back 0 when the directive carries no argument
+// (the caller's default applies); the return is "" or the reason it is not one.
+static std::string parse_bars_arg(const std::string & trimmed, const char * name, size_t lineno,
+	int & bars)
+{
+	bars = 0;
+
+	const std::string args = trimmed.substr(strlen(name));
+	if (!args.empty() && args.find_first_of(" \t") != 0)
+	{
+		return strf("line %zu: unknown directive \"%s\"", lineno, trimmed.c_str());
+	}
+	const size_t arg = args.find_first_not_of(" \t");
+	if (arg == std::string::npos)
+	{
+		return "";
+	}
+	const std::string value = args.substr(arg);
+	if (!starts_with(value, "bars="))
+	{
+		return strf("line %zu: %s takes nothing but bars=N (got \"%s\")",
+		            lineno, name, value.c_str());
+	}
+	// strtol, not sscanf: %d on an overflowing literal is undefined.
+	errno = 0;
+	const char * digits = value.c_str() + strlen("bars=");
+	char *       endp   = nullptr;
+	const long   n      = strtol(digits, &endp, 10);
+	if (errno != 0 || endp == digits || *endp != '\0')
+	{
+		return strf("line %zu: %s takes nothing but bars=N (got \"%s\")",
+		            lineno, name, value.c_str());
+	}
+	if (n < 1 || n > TEMPLATE_MAX_BARS)
+	{
+		return strf("line %zu: bars=%ld — a hole holds between 1 and %d bars",
+		            lineno, n, TEMPLATE_MAX_BARS);
+	}
+	bars = (int) n;
+	return "";
+}
+
+// A line as the *tests* see it. What is fed to the model is always the line
+// exactly as the template wrote it, `\r` and all.
+static std::string trim_line(const std::string & line)
+{
+	const size_t head = line.find_first_not_of(" \t");
+	const size_t tail = line.find_last_not_of(" \t\r");
+	return head == std::string::npos ? std::string() : line.substr(head, tail - head + 1);
+}
+
+// A `V:` voice header, the only line a `%%yue2-chords` directive may sit between.
+static bool is_voice_line(const std::string & trimmed)
+{
+	return starts_with(trimmed, "V:");
+}
+
 // Splits a template into the ordered segments the abc phase walks. Returns "" or
 // the reason the template is not usable; every request error of SPEC_TEMPLATE §2
 // is reported here, before anything loads.
@@ -534,12 +600,7 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 		i = nl == std::string::npos ? text.size() : nl + 1;
 		lineno++;
 
-		// Only the *tests* see a trimmed line; what is fed to the model is the
-		// line exactly as the template wrote it, `\r` and all.
-		const size_t head = line.find_first_not_of(" \t");
-		const size_t tail = line.find_last_not_of(" \t\r");
-		const std::string trimmed = head == std::string::npos
-		                            ? std::string() : line.substr(head, tail - head + 1);
+		const std::string trimmed = trim_line(line);
 		// Past %%yue2-continue the score is the model's: nothing may follow it but
 		// blank lines (§2).
 		if (!segs.empty() && segs.back().kind == TPL_CONTINUE)
@@ -606,6 +667,99 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 			segs.push_back(seg);
 			continue;
 		}
+		if (starts_with(trimmed, "%%yue2-chords"))
+		{
+			if (in_primer)
+			{
+				return strf("line %zu: %%%%yue2-chords inside a primer block — a primer "
+				            "holds given lines only", lineno);
+			}
+
+			TplSeg seg;
+			seg.kind  = TPL_CHORDS;
+			seg.meter = meter;
+			const std::string err = parse_bars_arg(trimmed, "%%yue2-chords", lineno, seg.bars);
+			if (!err.empty())
+			{
+				return err;
+			}
+
+			// `A`, the voice header above it, is peeled off the given segment it
+			// ends: the decode checkpoints there, and that has to be a segment
+			// boundary (SPEC_TEMPLATE §2).
+			if (segs.empty() || segs.back().kind != TPL_GIVEN)
+			{
+				return strf("line %zu: %%%%yue2-chords must sit directly under a given "
+				            "V: voice header", lineno);
+			}
+			std::string & prev  = segs.back().text;
+			size_t        start = 0;
+			if (prev.size() >= 2)
+			{
+				const size_t cut = prev.rfind('\n', prev.size() - 2);
+				start = cut == std::string::npos ? 0 : cut + 1;
+			}
+			seg.head = prev.substr(start);
+			if (!is_voice_line(trim_line(seg.head)))
+			{
+				return strf("line %zu: %%%%yue2-chords must sit directly under a given "
+				            "V: voice header (the line above it is \"%s\")",
+				            lineno, trim_line(seg.head).c_str());
+			}
+			prev.erase(start);
+			if (prev.empty())
+			{
+				segs.pop_back();
+			}
+
+			// `B`, the other voice's header and its body line, immediately below.
+			std::string body;
+			for (int k = 0; k < 2; k++)
+			{
+				if (i >= text.size())
+				{
+					return strf("line %zu: %%%%yue2-chords needs the other voice's V: "
+					            "header and its body line below it", lineno);
+				}
+				const size_t      bnl   = text.find('\n', i);
+				const size_t      bstop = bnl == std::string::npos ? text.size() : bnl;
+				const std::string bwhole = text.substr(i, (bnl == std::string::npos
+				                                           ? text.size() : bnl + 1) - i);
+				const std::string bline = trim_line(text.substr(i, bstop - i));
+				i = bnl == std::string::npos ? text.size() : bnl + 1;
+				lineno++;
+				if (starts_with(bline, "%%yue2-"))
+				{
+					return strf("line %zu: %%%%yue2-chords needs the other voice's V: "
+					            "header and its body line below it, not \"%s\"",
+					            lineno, bline.c_str());
+				}
+				if (k == 0 ? !is_voice_line(bline) : !is_body_line(bline))
+				{
+					return strf("line %zu: %%%%yue2-chords needs the other voice's V: "
+					            "header and its body line below it (got \"%s\")",
+					            lineno, bline.c_str());
+				}
+				seg.text += bwhole;
+				if (k == 1)
+				{
+					body = bline;
+				}
+			}
+			seg.above = body;
+			above     = body;
+			if (seg.bars == 0)
+			{
+				seg.bars = count_bars(body, meter).bars;
+				if (seg.bars < 1)
+				{
+					return strf("line %zu: the body line below holds no bars; give "
+					            "%%%%yue2-chords an explicit bars=N", lineno);
+				}
+			}
+			segs.push_back(seg);
+			continue;
+		}
 		if (!starts_with(trimmed, "%%yue2-gen"))
 		{
 			return strf("line %zu: unknown directive \"%s\"", lineno, trimmed.c_str());
@@ -621,15 +775,12 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 		seg.above = above;
 		seg.meter = meter;
 
-		// `%%yue2-gen` alone, or `%%yue2-gen bars=N` with real whitespace between
-		// the two — `%%yue2-genbars=3` is a typo, not a directive with an argument.
-		const std::string args = trimmed.substr(strlen("%%yue2-gen"));
-		if (!args.empty() && args.find_first_of(" \t") != 0)
+		const std::string err = parse_bars_arg(trimmed, "%%yue2-gen", lineno, seg.bars);
+		if (!err.empty())
 		{
-			return strf("line %zu: unknown directive \"%s\"", lineno, trimmed.c_str());
+			return err;
 		}
-		const size_t arg = args.find_first_not_of(" \t");
-		if (arg == std::string::npos)
+		if (seg.bars == 0)
 		{
 			if (above.empty())
 			{
@@ -643,29 +794,6 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 				return strf("line %zu: the body line above holds no bars; give %%%%yue2-gen "
 				            "an explicit bars=N", lineno);
 			}
-		} else {
-			const std::string value = args.substr(arg);
-			if (!starts_with(value, "bars="))
-			{
-				return strf("line %zu: %%%%yue2-gen takes nothing but bars=N (got \"%s\")",
-				            lineno, value.c_str());
-			}
-			// strtol, not sscanf: %d on an overflowing literal is undefined.
-			errno = 0;
-			const char * digits = value.c_str() + strlen("bars=");
-			char *       endp   = nullptr;
-			const long   bars   = strtol(digits, &endp, 10);
-			if (errno != 0 || endp == digits || *endp != '\0')
-			{
-				return strf("line %zu: %%%%yue2-gen takes nothing but bars=N (got \"%s\")",
-				            lineno, value.c_str());
-			}
-			if (bars < 1 || bars > TEMPLATE_MAX_BARS)
-			{
-				return strf("line %zu: bars=%ld — a hole holds between 1 and %d bars",
-				            lineno, bars, TEMPLATE_MAX_BARS);
-			}
-			seg.bars = (int) bars;
 		}
 		segs.push_back(seg);
 	}
@@ -1488,6 +1616,12 @@ struct Seq
 	llama_token              hole_prev = 0;  // the token before it, re-decoded on a rollback
 	std::vector<llama_token> hole_ids;       // sampled and decoded inside the hole
 	std::string              carry;          // the closing token's text, fed with the next segment
+
+	// %%yue2-chords: where the slot stood before the out-of-order feed, so the
+	// whole of it can be undone and the three lines fed in template order (§3).
+	llama_pos                chk_pos   = 0;
+	size_t                   chk_hist  = 0;
+	int                      chk_step  = 0;
 };
 
 // The shared decode loop: one llama_decode per step carrying one token for each
@@ -1540,11 +1674,13 @@ struct Runner
 
 	// The template walk. give() feeds one forced stretch of score; the rest is
 	// the hole state machine. SPEC_TEMPLATE §3.
-	void        give(Seq & q, const std::string & text, bool emit, const char * what);
+	void        give(Seq & q, const std::string & text, GiveKind kind, const char * what);
 	bool        abc_fits(const Seq & q, size_t extra) const;
 	bool        sem_fits(const Seq & q, size_t extra) const;
 	void        template_step(Seq & q);
 	void        open_hole(Seq & q);
+	void        open_chords(Seq & q);
+	void        finish_chords(Seq & q, const std::string & line);
 	void        template_token(Seq & q, llama_token token);
 	void        fail_hole(Seq & q, const std::string & why);
 	void        rollback_hole(Seq & q);
@@ -1740,10 +1876,12 @@ void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expec
 }
 
 // One forced stretch of score: tokenized, decoded, and pushed into `history` so
-// the repetition-penalty window sees it as if the model had written it. `emit`
+// the repetition-penalty window sees it as if the model had written it. The kind
 // separates a given line (which reaches score.abc) from a primer line (which
-// does not) — the text itself is appended by the caller that knows which.
-void Runner::give(Seq & q, const std::string & text, bool emit, const char * what)
+// does not) and from the out-of-order feed of a chords directive (which is
+// rolled back, so it counts for nothing) — the text itself is appended by the
+// caller that knows which.
+void Runner::give(Seq & q, const std::string & text, GiveKind kind, const char * what)
 {
 	JobState &                     js  = (*states)[q.job];
 	const std::vector<llama_token> ids = tokenize(vocab, text, what);
@@ -1760,11 +1898,11 @@ void Runner::give(Seq & q, const std::string & text, bool emit, const char * wha
 	}
 
 	q.history.insert(q.history.end(), ids.begin(), ids.end());
-	if (emit)
+	if (kind == GIVE_SCORE)
 	{
 		js.tpl.given_tokens += (int) ids.size();
 		js.emitted          += ids.size();
-	} else {
+	} else if (kind == GIVE_PRIMER) {
 		js.tpl.primer_tokens += (int) ids.size();
 	}
 	feed_tokens(q, ids, (size_t) q.pos + ids.size(), what);
@@ -1788,7 +1926,11 @@ bool Runner::abc_fits(const Seq & q, size_t extra) const
 bool Runner::sem_fits(const Seq & q, size_t extra) const
 {
 	const JobState & js   = (*states)[q.job];
-	const size_t     need = js.prefix_abc.size() + js.emitted + extra +
+	// A chords directive's own three lines are not in `emitted` yet: they reach
+	// the score only once the line is written and they are fed in order.
+	const size_t     own  = q.seg < js.segs.size() && js.segs[q.seg].kind == TPL_CHORDS
+	                        ? (size_t) (js.tail_given[q.seg] - js.tail_given[q.seg + 1]) : 0;
+	const size_t     need = js.prefix_abc.size() + js.emitted + extra + own +
 	                        (size_t) js.tail_given[q.seg + 1] +
 	                        (size_t) TEMPLATE_REST_TOKENS * js.tail_holes[q.seg + 1] +
 	                        2 + (size_t) s_sem.max_tokens + (size_t) TEMPLATE_SEAM_MARGIN;
@@ -1814,6 +1956,11 @@ void Runner::template_step(Seq & q)
 			start_continue(q);
 			return;
 		}
+		if (seg.kind == TPL_CHORDS)
+		{
+			open_chords(q);
+			return;
+		}
 		q.seg++;
 		const bool        emit = seg.kind == TPL_GIVEN;
 		const std::string text = q.carry + seg.text;
@@ -1822,7 +1969,7 @@ void Runner::template_step(Seq & q)
 		{
 			js.tpl_text += seg.text;
 		}
-		give(q, text, emit, emit ? "given segment" : "primer segment");
+		give(q, text, emit ? GIVE_SCORE : GIVE_PRIMER, emit ? "given segment" : "primer segment");
 	}
 	template_done(q);
 }
@@ -1838,7 +1985,7 @@ void Runner::open_hole(Seq & q)
 	{
 		const std::string text = q.carry;
 		q.carry.clear();
-		give(q, text, true, "hole tail");
+		give(q, text, GIVE_SCORE, "hole tail");
 	}
 
 	q.in_hole   = true;
@@ -1856,6 +2003,77 @@ void Runner::open_hole(Seq & q)
 		return;
 	}
 	template_token(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+}
+
+// %%yue2-chords: the line the model writes here sits *above* the one it is
+// written from. The slot is checkpointed, the two lines below the directive are
+// fed, then the voice header above it and an opening double quote; from there
+// the line is sampled exactly as a hole's is. Whatever it comes to, accepted or
+// rest-filled, the out-of-order feed is undone and the three lines are fed in
+// template order — finish_chords (SPEC_TEMPLATE §3).
+void Runner::open_chords(Seq & q)
+{
+	JobState &     js  = (*states)[q.job];
+	const TplSeg & seg = js.segs[q.seg];
+
+	// As open_hole: the head of the last hole's closing token is score text the
+	// cache has not seen yet. It goes in before the checkpoint.
+	if (!q.carry.empty())
+	{
+		const std::string text = q.carry;
+		q.carry.clear();
+		give(q, text, GIVE_SCORE, "hole tail");
+	}
+
+	q.chk_pos  = q.pos;
+	q.chk_hist = q.history.size();
+	q.chk_step = q.step;
+	js.tpl.holes++;
+	js.tpl.chord_lines++;
+
+	if (q.tpl_full)
+	{
+		rest_fill(q);
+		return;
+	}
+
+	give(q, seg.text, GIVE_SCRATCH, "chords lookahead");
+	give(q, seg.head, GIVE_SCRATCH, "chords voice");
+	give(q, "\"", GIVE_SCRATCH, "chords quote");
+
+	q.in_hole   = true;
+	q.attempt   = 1;
+	q.hole_pos  = q.pos;
+	q.hole_hist = q.history.size();
+	q.hole_step = q.step;
+	q.hole_prev = q.last_fed;
+	q.hole_ids.clear();
+
+	template_token(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+}
+
+// The end of a chords directive, from either side: the accepted line or the
+// rest-fill. Everything the out-of-order feed put in the slot goes back, and the
+// header, the line and the two lines below it are fed in the order the score
+// holds them — so the cache and `history` end up as if the model had written the
+// line where it stands. `step` is the caller's business: an accepted line spent
+// its draws, a rest-fill spent none.
+void Runner::finish_chords(Seq & q, const std::string & line)
+{
+	JobState &        js   = (*states)[q.job];
+	const TplSeg &    seg  = js.segs[q.seg];
+	const std::string text = seg.head + line + seg.text;
+
+	llama_memory_seq_rm(mem, q.slot, q.chk_pos, -1);
+	q.pos = q.chk_pos;
+	q.history.resize(q.chk_hist);
+	q.hole_ids.clear();
+	q.in_hole = false;
+	q.seg++;
+
+	js.tpl_text += text;
+	give(q, text, GIVE_SCORE, "chords segment");
+	template_step(q);
 }
 
 // One token sampled inside a hole. The hole closes on the first `\n`; the token
@@ -1929,8 +2147,11 @@ void Runner::template_token(Seq & q, llama_token token)
 
 	q.hole_ids.pop_back();
 	const std::string prev = q.hole_ids.empty() ? std::string() : detokenize(vocab, q.hole_ids);
-	const std::string line = full.substr(0, nl + 1);
-	const std::string body = line.substr(0, nl);
+	// A chords line is sampled from an opening double quote that was fed, not
+	// drawn: the quote is part of the line, not of what the cache has to undo.
+	const std::string head = seg.kind == TPL_CHORDS ? std::string("\"") : std::string();
+	const std::string line = head + full.substr(0, nl + 1);
+	const std::string body = line.substr(0, line.size() - 1);
 
 	if (!is_body_line(body))
 	{
@@ -1941,6 +2162,26 @@ void Runner::template_token(Seq & q, llama_token token)
 	if (bc.bars != seg.bars)
 	{
 		fail_hole(q, strf("got %d bars", bc.bars));
+		return;
+	}
+	if (seg.kind == TPL_CHORDS)
+	{
+		// Rests carrying harmony, nothing else: at least one chord symbol, and
+		// no note left once the chord symbols are out of the way (§2).
+		if (body.find('"') == std::string::npos ||
+		    body.find('"', body.find('"') + 1) == std::string::npos)
+		{
+			fail_hole(q, "wrote no chord symbol");
+			return;
+		}
+		const std::string bare = strip_line(body);
+		if (bare.find_first_of("ABCDEFGabcdefg") != std::string::npos)
+		{
+			fail_hole(q, "wrote notes, not a line of rests with chord symbols");
+			return;
+		}
+		js.tpl.offlength_bars += bc.offlength;
+		finish_chords(q, line);
 		return;
 	}
 
@@ -2005,6 +2246,17 @@ void Runner::rest_fill(Seq & q)
 		js.st_abc.truncated = true;
 	}
 
+	const std::string fill = seg.bars == 1 ? std::string("Z|\n") : strf("Z%d|\n", seg.bars);
+	if (seg.kind == TPL_CHORDS)
+	{
+		// The whole out-of-order feed goes back, not just the attempt, and the
+		// rests go in where the directive stood — with no chord symbol: four
+		// attempts at the harmony is where the model's opinion of it ends (§2).
+		q.step = q.chk_step;
+		finish_chords(q, fill);
+		return;
+	}
+
 	// Nothing to undo when the hole failed on its very first token, or when the
 	// sampled-token cap closed it before it opened — but `step` is restored
 	// either way, since a rest-fill spends none of the phase's draws.
@@ -2013,11 +2265,10 @@ void Runner::rest_fill(Seq & q)
 		rollback_hole(q);
 	}
 	q.step = q.hole_step;
-	const std::string fill = seg.bars == 1 ? std::string("Z|\n") : strf("Z%d|\n", seg.bars);
 	js.tpl_text += fill;
 	q.in_hole    = false;
 	q.seg++;
-	give(q, fill, true, "rest fill");
+	give(q, fill, GIVE_SCORE, "rest fill");
 	template_step(q);
 }
 
@@ -2033,7 +2284,7 @@ void Runner::start_continue(Seq & q)
 	{
 		const std::string text = q.carry;
 		q.carry.clear();
-		give(q, text, true, "hole tail");
+		give(q, text, GIVE_SCORE, "hole tail");
 	}
 
 	// q.seg stays on the continue segment: abc_fits / sem_fits read the suffix
@@ -2138,9 +2389,11 @@ void Runner::template_done(Seq & q)
 	printf("%sabc:      %d tokens in %.2f s = %.2f tok/s%s\n", js.tag.c_str(),
 	       st.output_tokens, st.seconds, st.output_tps, st.truncated ? " (TRUNCATED)" : "");
 	printf("%sabc: template: %d holes, %d sampled tokens, %d retries, %d rest-filled, "
-	       "%d given + %d primer tokens, %d off-length bars, %d continued\n", js.tag.c_str(),
+	       "%d given + %d primer tokens, %d off-length bars, %d continued, %d chord lines\n",
+	       js.tag.c_str(),
 	       js.tpl.holes, js.tpl.sampled_tokens, js.tpl.retries, js.tpl.rest_filled,
-	       js.tpl.given_tokens, js.tpl.primer_tokens, js.tpl.offlength_bars, js.tpl.continued_tokens);
+	       js.tpl.given_tokens, js.tpl.primer_tokens, js.tpl.offlength_bars,
+	       js.tpl.continued_tokens, js.tpl.chord_lines);
 
 	js.prefix_sem = js.prefix_abc;
 	js.prefix_sem.insert(js.prefix_sem.end(), js.abc_ids.begin(), js.abc_ids.end());
@@ -2850,7 +3103,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 					tpl_lines += (size_t) s_abc.max_tokens;
 					continue;
 				}
-				if (seg.kind != TPL_HOLE)
+				if (seg.kind != TPL_HOLE && seg.kind != TPL_CHORDS)
 				{
 					const size_t n = tokenize(vocab, seg.text, "template segment").size();
 					tpl_fed += n;
@@ -2868,6 +3121,21 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 				                     ? 0 : tokenize(vocab, seg.above, "template line").size();
 				js.budget[k] = (int) std::min<size_t>(std::max<size_t>(64, 8 * above),
 				                                      (size_t) s_abc.max_tokens);
+				if (seg.kind == TPL_CHORDS)
+				{
+					// Its three given lines are fed twice — once out of order to
+					// write the line from, once in template order — but never at
+					// the same time: the first feed is rolled back. So they are
+					// counted once, like any given segment, and the peak is the
+					// same as a hole's.
+					const size_t n = tokenize(vocab, seg.head, "template segment").size() +
+					                 tokenize(vocab, seg.text, "template segment").size();
+					tpl_fed          += n;
+					tpl_emit         += n;
+					js.tail_fed[k]    = (int) n;
+					js.tail_given[k]  = (int) n;
+					max_feed = std::max(max_feed, n + (size_t) js.budget[k]);
+				}
 				// The budget is what a hole may *spend*; what it is expected to
 				// *keep* is a line about as long as the one above it. Sizing the
 				// context on the budgets would ask for an order of magnitude more

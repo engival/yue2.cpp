@@ -150,6 +150,33 @@ with `%%yue2-continue`: the model writes the rest freely, without the section
 labels and bar counts of the source. The opening may be incomplete, one voice
 only for instance; the render shows what the model makes of it.
 
+**Harmony for a given accompaniment.** A score written top to bottom gives a
+section's Vocal line no view of the Ins line under it, and an opening handed
+over without chord symbols is continued without them (the model treats the
+score as the chordless dialect from then on). `%%yue2-chords` in place of a
+Vocal body line has the model read the Ins line below first, write a line of
+rests with a chord symbol per bar, and put it back above the Ins line. An intro
+given as Ins lines only becomes a proper opening this way, and what follows,
+holes or a free continuation, is written with chords:
+
+```
+% intro
+V: Vocal
+%%yue2-chords
+V: Ins
+Z|e4B4g4B4f4B4e4B4|^d4B4f4B4e4B4d4B4|e4B4g4B4f4B4e4B4|
+V: Vocal
+%%yue2-chords
+V: Ins
+^d4B4f4B4e8d8|e8g8f8e8|^d8f8e8d8|e8g8f8e8|
+%%yue2-continue
+```
+
+The directive must sit between a `V:` line and the other voice's `V:` line
+plus body line, one system at a time. The chords it picks follow the key
+field and the figure: the same intro figure moved to another key gets another
+progression.
+
 The template format also has a primer block (`%%yue2-primer-begin` …
 `%%yue2-primer-end`): lines fed as context at that point and dropped from the
 score. `yue2` prints a warning when a template carries one; see the README.

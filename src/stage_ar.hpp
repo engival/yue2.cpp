@@ -81,6 +81,7 @@ struct TemplateStats
 	int sampled_tokens = 0;   // every draw, including the ones that were rolled back
 	int offlength_bars = 0;   // written bars that do not hold M:/L: note units
 	int continued_tokens = 0; // written freely after %%yue2-continue, up to ABC_END
+	int chord_lines    = 0;   // of the holes, the ones a %%yue2-chords directive opened
 };
 
 // What `yue2 song` needs from the AR stage without re-reading the artifacts.

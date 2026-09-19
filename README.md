@@ -162,6 +162,11 @@ A template whose last line is `%%yue2-continue` is an opening rather than a
 form: the lines above it are fed as the score's beginning and the model writes
 the rest freely, as it would with no score at all. The opening need not be
 well-formed; the result shows what the model makes of it.
+`%%yue2-chords` in place of a Vocal body line asks for the harmony of a given
+accompaniment: the model is shown the Ins line under it first, writes a line of
+rests carrying chord symbols, and that line is put back above the Ins line, as
+if it had been written in order. An intro handed over as Ins lines only gets
+its chords that way, and everything after it is then written with chords too.
 `score.abc` and the rest of the artifacts hold the finished score with no
 directives and no primer; `request.json` records the score the holes produced as
 a plain `"abc"`, so the artifacts directory is a request that reproduces the

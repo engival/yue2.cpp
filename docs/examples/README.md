@@ -15,7 +15,8 @@ same lyrics the original was rendered with.
 | `song_new_vocal.tpl.abc` | `abc_template` | every Vocal body line replaced by `%%yue2-gen bars=N` (N counted from the line it replaces); the model writes melody and chords over the kept accompaniment |
 | `song_rewrite_keep_intro.tpl.abc` | `abc_template` | both voices are holes except in `% intro`; the model rewrites the song from the kept opening |
 | `song_new_ins_primer.tpl.abc` | `abc_template` | `song_new_ins.tpl.abc` with the first verse's Vocal lines in a primer block before the intro (`yue2` warns about this one) |
-| `song_continue.tpl.abc` | `abc_template` | the header, the intro's Ins lines with no Vocal lines under them, then `%%yue2-continue`; the model writes the rest of the score freely |
+| `song_continue.tpl.abc` | `abc_template` | the header, the intro's Ins lines with no Vocal lines under them, then `%%yue2-continue`; the model writes the rest of the score freely (and, given no chord symbols, without any) |
+| `song_intro_chords.tpl.abc` | `abc_template` | the same intro Ins lines, each under a `V: Vocal` / `%%yue2-chords` pair, then `%%yue2-continue`; the model writes the intro's chord lines after seeing each Ins line, then the rest with chords |
 
 The awk that made the `no_ins` and `new_vocal` files, with the bar count a
 `ZN|` multi-rest stands for:
