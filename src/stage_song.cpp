@@ -199,6 +199,20 @@ json json_timing(const GenStats & st)
 	return out;
 }
 
+// What the score template's holes cost, for a job that had one. SPEC_TEMPLATE §5.
+json json_template(const TemplateStats & t)
+{
+	json out = json::object();
+	out["holes"]          = t.holes;
+	out["retries"]        = t.retries;
+	out["rest_filled"]    = t.rest_filled;
+	out["primer_tokens"]  = t.primer_tokens;
+	out["given_tokens"]   = t.given_tokens;
+	out["sampled_tokens"] = t.sampled_tokens;
+	out["offlength_bars"] = t.offlength_bars;
+	return out;
+}
+
 // config.json, minus the fields that only meant something under torch (see
 // src/STATUS_SINGLE.md for the list of drops).
 void write_config(const std::string & dir, const BatchParams & p, const ArResult & ar)
@@ -278,6 +292,10 @@ void write_result(const std::string & dir, const ArResult & ar, const std::strin
 	json out = json::object();
 	out["status"]        = "complete";
 	out["truncated"]     = truncated;
+	if (ar.is_template)
+	{
+		out["template"] = json_template(ar.tpl);
+	}
 	out["sample_rate"]   = SAMPLE_RATE;
 	out["audio_seconds"] = (double) (DOWNSAMPLING * frames - 64) / SAMPLE_RATE;
 	out["timing"]        = timing;
@@ -624,6 +642,10 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		entry["status"]        = "ok";
 		entry["audio_seconds"] = (double) (DOWNSAMPLING * frames - 64) / SAMPLE_RATE;
 		entry["e2e_seconds"]   = e2e_seconds;
+		if (ar[k].is_template)
+		{
+			entry["template"] = json_template(ar[k].tpl);
+		}
 		summary.push_back(entry);
 	}
 

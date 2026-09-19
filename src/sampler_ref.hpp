@@ -8,6 +8,11 @@
 // DO NOT EDIT. Its only value is being the code that shipped; a "fix" here
 // silently weakens every equivalence claim in src/STATUS_SAMPLER.md.
 //
+// One additive exception since it was frozen: the defaulted `mask_end`
+// argument, which stage 7 needs so that `--verify-sampler` can compare the two
+// samplers inside a score template's hole (SPEC_TEMPLATE.md §3). At its default
+// `false` every line below runs exactly as it shipped.
+//
 // Included from stage_ar.cpp *inside* its anonymous namespace, after the
 // protocol constants and `Sampling` — it uses both and deliberately owns no
 // copy of them, so the two implementations can never drift apart on the
@@ -16,7 +21,7 @@
 
 static llama_token sample_step_ref(const float * logits, int n_vocab, const Sampling & s,
 	const std::vector<llama_token> & history, int step,
-	bool phase_abc, bool legacy_off, std::mt19937_64 & rng)
+	bool phase_abc, bool legacy_off, std::mt19937_64 & rng, bool mask_end = false)
 {
 	const float ninf = -std::numeric_limits<float>::infinity();
 	const int   end  = phase_abc ? ABC_END : MUSIC_END;
@@ -42,7 +47,7 @@ static llama_token sample_step_ref(const float * logits, int n_vocab, const Samp
 	}
 	scores[end] = logits[end];
 
-	if (step < s.min_tokens)
+	if (step < s.min_tokens || mask_end)
 	{
 		scores[end] = ninf;
 	}

@@ -95,7 +95,7 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc` and `cfg_scale` are optional. Lyrics carry `[Section]` tags on their own
+`abc`, `abc_template` and `cfg_scale` are optional. Lyrics carry `[Section]` tags on their own
 lines:
 
 ```json
@@ -134,6 +134,33 @@ another genre, and ~25 % faster (no score phase). Nothing after the AR can do
 this: the NAR follows the semantic tokens and ignores both its noise seed and a
 changed style text, audibly. `yue2 ar --prefix-only` writes just `prefix.npy`
 for a request that carries its `"abc"` (tokenizer only, no GPU).
+
+**Let the model write part of a score.** `"abc_template"` is the middle between
+no score and a whole one: score text in which a `%%yue2-gen` line is a hole the
+model fills. Everything else is fed to it verbatim, so a written line is
+conditioned on every line above it — which is what makes the accompaniment
+answer the vocal it sits under instead of being improvised over bars of rests:
+
+```
+V: Vocal
+"C"c8e8g8e8|"G"d8B8G16|"Am"c8e8a8e8|"G"G32|
+V: Ins
+%%yue2-gen
+```
+
+A hole must be written as a body line with the right number of bars — by
+default the bar count of the nearest body line above it, or `%%yue2-gen bars=N`.
+A line that comes out wrong is rolled back and drawn again up to four times,
+then filled with rests (`ZN|`). Lines between `%%yue2-primer-begin` and
+`%%yue2-primer-end` are fed as context and then dropped from the score: the
+model is causal, so that is how an intro gets to see the verse it introduces.
+`score.abc` and the rest of the artifacts hold the finished score with no
+directives and no primer; `request.json` records the score the holes produced as
+a plain `"abc"`, so the artifacts directory is a request that reproduces the
+song, and the template as given is kept beside it as `template.abc`.
+`result.json` gains a `template` block counting the holes, retries and
+rest-fills. `"abc_template"` is mutually exclusive with `"abc"` and needs `cot`
+`full` or `melody`.
 
 Several songs at once: [`yue2 batch`](#render-several-songs-yue2-batch). Running
 the stages separately: [`yue2-ar`](#generate-the-symbolic-plan--semantic-tokens-yue2-ar),

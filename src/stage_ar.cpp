@@ -95,6 +95,8 @@ struct Request
 	uint64_t    seed       = 831001;
 	bool        has_abc    = false;
 	std::string abc;
+	bool        has_tpl    = false;   // "abc_template": SPEC_TEMPLATE.md
+	std::string abc_template;
 	bool        has_cfg    = false;
 	double      cfg_scale  = 1.0;
 	std::string id         = "song";
@@ -126,6 +128,532 @@ static std::string strf(const char * fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	return buf;
+}
+
+// -------------------------------------------------------- score templates ---
+
+// SPEC_TEMPLATE.md. A template is score text in which a `%%yue2-gen` line is a
+// hole the model writes, and `%%yue2-primer-begin` / `%%yue2-primer-end` bracket
+// lines that are fed as context and then dropped from the emitted score.
+//
+// Everything in this section is pure text work — no llama, no Request — so the
+// bar counter the holes are validated against can be table-tested on its own
+// (tests/bars.cpp).
+
+// Attempts at one hole before it is filled with rests.
+static const int TEMPLATE_ATTEMPTS = 4;
+
+// The largest `bars=N` a hole may ask for.
+static const int TEMPLATE_MAX_BARS = 9999;
+
+// What a `ZN|\n` rest-fill costs, for the context arithmetic below.
+static const int TEMPLATE_REST_TOKENS = 6;
+
+// The emitted score is re-tokenized in one go at the end, so BPE merges across
+// the segment seams make it a few tokens shorter or longer than the sum of the
+// pieces the abc phase counted. The context guard carries this much slack.
+static const int TEMPLATE_SEAM_MARGIN = 64;
+
+enum TplKind { TPL_GIVEN, TPL_PRIMER, TPL_HOLE };
+
+// The `M:` and `L:` a bar's length is measured against, with ABC's defaults.
+struct Meter
+{
+	int m_num = 4;
+	int m_den = 4;
+	int l_num = 1;
+	int l_den = 8;
+};
+
+struct TplSeg
+{
+	TplKind     kind = TPL_GIVEN;
+	std::string text;            // given / primer: whole lines, newlines kept
+	int         bars = 0;        // hole: the bar count its line must have
+	std::string above;           // hole: the body line its token budget scales from
+	Meter       meter;           // hole: the meter in force where it sits
+};
+
+struct BarCount
+{
+	int bars      = 0;   // bars holding at least one note or rest
+	int offlength = 0;   // of those, how many do not hold M:/L: note units
+};
+
+static long long gcd_ll(long long a, long long b)
+{
+	while (b != 0)
+	{
+		const long long t = a % b;
+		a = b;
+		b = t;
+	}
+	return a < 0 ? -a : a;
+}
+
+static void add_frac(long long & num, long long & den, long long n, long long d)
+{
+	num = num * d + n * den;
+	den = den * d;
+	const long long g = gcd_ll(num, den);
+	if (g > 1)
+	{
+		num /= g;
+		den /= g;
+	}
+}
+
+static bool is_note_letter(char c)
+{
+	return (c >= 'a' && c <= 'g') || (c >= 'A' && c <= 'G');
+}
+
+// A body line is a line that carries music: not a comment, and not a `K:`-style
+// field — which is also what rules out `w:` lyrics and the `V:` voice switches.
+static bool is_body_line(const std::string & line)
+{
+	const size_t i = line.find_first_not_of(" \t\r");
+	if (i == std::string::npos || line[i] == '%')
+	{
+		return false;
+	}
+	return !(i + 1 < line.size() && isalpha((unsigned char) line[i]) && line[i + 1] == ':');
+}
+
+// Removes what the bar counter must not see: `"..."` chord symbols, `!...!`
+// decorations and `[K:...]` inline fields — the letter-colon test is what keeps
+// a `[CEG]` chord. An unquoted `%` ends the line: the rest is a comment.
+//
+// Both delimiters are only honoured when they close. An unpaired `"` or `!`
+// used to swallow everything after it, which silently turned a bar into none.
+// A decoration is a short word, so `!` closes before the next space or bar line
+// or it is not a decoration at all.
+static std::string strip_line(const std::string & line)
+{
+	std::string out;
+	for (size_t i = 0; i < line.size(); i++)
+	{
+		const char c = line[i];
+		if (c == '%')
+		{
+			break;
+		}
+		if (c == '"')
+		{
+			const size_t end = line.find('"', i + 1);
+			if (end != std::string::npos)
+			{
+				i = end;
+				continue;
+			}
+		} else if (c == '!') {
+			const size_t end = line.find_first_of("! |", i + 1);
+			if (end != std::string::npos && line[end] == '!')
+			{
+				i = end;
+				continue;
+			}
+		} else if (c == '[' && i + 2 < line.size() &&
+		           isalpha((unsigned char) line[i + 1]) && line[i + 2] == ':') {
+			const size_t end = line.find(']', i + 1);
+			if (end != std::string::npos)
+			{
+				i = end;
+				continue;
+			}
+		}
+		out.push_back(c);
+	}
+	return out;
+}
+
+// The length of the bar line at `i`, or 0. `|`, `||`, `|]`, `[|`, `|:`, `:|` and
+// `::` each count as one bar line (SPEC_TEMPLATE §4).
+static size_t bar_line_at(const std::string & s, size_t i)
+{
+	const char c = s[i];
+	const char d = i + 1 < s.size() ? s[i + 1] : '\0';
+	if (c == '|')
+	{
+		return d == '|' || d == ']' || d == ':' ? 2 : 1;
+	}
+	if ((c == '[' || c == ':') && d == '|')
+	{
+		return 2;
+	}
+	return c == ':' && d == ':' ? 2 : 0;
+}
+
+// ABC note length after the pitch: `2`, `/2`, `/`, `//`, `3/2`.
+static void parse_length(const std::string & s, size_t & i, long long & num, long long & den)
+{
+	num = 1;
+	den = 1;
+	long long v   = 0;
+	bool      got = false;
+	while (i < s.size() && isdigit((unsigned char) s[i]) && v < 100000)
+	{
+		v   = v * 10 + (s[i++] - '0');
+		got = true;
+	}
+	if (got && v > 0)
+	{
+		num = v;
+	}
+	if (i < s.size() && s[i] == '/')
+	{
+		long long halves = 0;
+		while (i < s.size() && s[i] == '/')
+		{
+			i++;
+			halves++;
+		}
+		long long d  = 0;
+		bool      gd = false;
+		while (i < s.size() && isdigit((unsigned char) s[i]) && d < 100000)
+		{
+			d  = d * 10 + (s[i++] - '0');
+			gd = true;
+		}
+		den = gd && d > 0 ? d : (1LL << std::min<long long>(halves, 20));
+	}
+}
+
+// SPEC_TEMPLATE §4: a bar is a maximal run between bar lines that holds at least
+// one note or rest; `Z` is one bar and `Zn` is n; a trailing run with no closing
+// bar line still counts. Bar *length* is measured beside the count but is never
+// a reason to reject a line — the reference model's own scores are not always
+// exact and the semantic stage follows the score loosely.
+//
+// Broken rhythm (`a>b`) needs no handling: it moves duration from one note to
+// its neighbour and leaves the bar's total alone.
+static BarCount count_bars(const std::string & line, const Meter & m)
+{
+	const std::string s = strip_line(line);
+
+	// note units per bar, as a multiple of L:
+	const long long tgt_num = (long long) m.m_num * m.l_den;
+	const long long tgt_den = (long long) m.m_den * m.l_num;
+
+	BarCount  out;
+	long long num      = 0;   // units of the bar being scanned
+	long long den      = 1;
+	int       extra    = 0;   // bars a multi-measure rest adds to it
+	bool      sounded  = false;
+	int       tup_left = 0;
+	long long tup_num  = 1;
+	long long tup_den  = 1;
+
+	auto take_note = [&](size_t & j)
+	{
+		long long n = 1;
+		long long d = 1;
+		parse_length(s, j, n, d);
+		if (tup_left > 0)
+		{
+			n *= tup_num;
+			d *= tup_den;
+			tup_left--;
+		}
+		add_frac(num, den, n, d);
+		sounded = true;
+	};
+
+	auto close_bar = [&]()
+	{
+		if (!sounded)
+		{
+			return;
+		}
+		out.bars += 1 + extra;
+		if (extra == 0 && num != 0 && num * tgt_den != tgt_num * den)
+		{
+			out.offlength++;
+		}
+		num     = 0;
+		den     = 1;
+		extra   = 0;
+		sounded = false;
+	};
+
+	size_t i = 0;
+	while (i < s.size())
+	{
+		const size_t bl = bar_line_at(s, i);
+		if (bl > 0)
+		{
+			close_bar();
+			i += bl;
+			continue;
+		}
+		const char c = s[i];
+		if (c == '{')
+		{
+			// grace notes carry no time of their own
+			const size_t end = s.find('}', i + 1);
+			i = end == std::string::npos ? s.size() : end + 1;
+			continue;
+		}
+		if (c == '(' && i + 1 < s.size() && isdigit((unsigned char) s[i + 1]))
+		{
+			// (p[:q[:r]] — p notes in the time of q, over the next r notes.
+			long long v[3] = {0, 0, 0};
+			int       n    = 0;
+			i++;
+			while (true)
+			{
+				while (i < s.size() && isdigit((unsigned char) s[i]) && v[n] < 1000)
+				{
+					v[n] = v[n] * 10 + (s[i++] - '0');
+				}
+				if (n == 2 || i >= s.size() || s[i] != ':')
+				{
+					break;
+				}
+				i++;
+				n++;
+			}
+			if (v[0] > 0)
+			{
+				tup_den  = v[0];
+				tup_num  = v[1] > 0 ? v[1] : (v[0] == 2 || v[0] == 4 || v[0] == 8 ? 3 : 2);
+				tup_left = (int) (v[2] > 0 ? v[2] : v[0]);
+			}
+			continue;
+		}
+		if (c == 'Z')
+		{
+			i++;
+			long long n   = 0;
+			bool      got = false;
+			while (i < s.size() && isdigit((unsigned char) s[i]) && n < 100000)
+			{
+				n   = n * 10 + (s[i++] - '0');
+				got = true;
+			}
+			extra  += (int) ((got && n > 0 ? n : 1) - 1);
+			sounded = true;
+			continue;
+		}
+		if (c == '[')
+		{
+			// `[1` / `[2` are repeat endings, not chords, and the bars inside
+			// them are bars. A real chord closes inside its own bar; a `[` that
+			// does not is an ordinary character, so an unclosed one cannot
+			// swallow the bar lines after it.
+			if (i + 1 < s.size() && isdigit((unsigned char) s[i + 1]))
+			{
+				i++;
+				while (i < s.size() && isdigit((unsigned char) s[i]))
+				{
+					i++;
+				}
+				continue;
+			}
+			const size_t end = s.find_first_of("]|", i + 1);
+			if (end == std::string::npos || s[end] != ']')
+			{
+				i++;
+				continue;
+			}
+			// a chord sounds as one note; its length follows the `]`
+			i = end + 1;
+			take_note(i);
+			continue;
+		}
+		if (is_note_letter(c) || c == 'z' || c == 'x')
+		{
+			i++;
+			while (i < s.size() && (s[i] == ',' || s[i] == '\''))
+			{
+				i++;
+			}
+			take_note(i);
+			continue;
+		}
+		i++;
+	}
+	close_bar();
+	return out;
+}
+
+// `M:` and `L:` as a header field line gives them. `C` is 4/4 and `C|` is 2/2.
+static void read_meter_field(const std::string & line, Meter & m)
+{
+	std::string v = line.substr(2);
+	const size_t a = v.find_first_not_of(" \t");
+	const size_t b = v.find_last_not_of(" \t\r");
+	v = a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+	if (v.empty())
+	{
+		return;
+	}
+	int num = 0;
+	int den = 0;
+	if (v[0] == 'C')
+	{
+		num = v.size() > 1 && v[1] == '|' ? 2 : 4;
+		den = num;
+	} else if (sscanf(v.c_str(), "%d/%d", &num, &den) != 2 || num <= 0 || den <= 0) {
+		return;
+	}
+	if (line[0] == 'M')
+	{
+		m.m_num = num;
+		m.m_den = den;
+	} else {
+		m.l_num = num;
+		m.l_den = den;
+	}
+}
+
+static bool starts_with(const std::string & s, const char * prefix)
+{
+	const size_t n = strlen(prefix);
+	return s.size() >= n && s.compare(0, n, prefix) == 0;
+}
+
+// Splits a template into the ordered segments the abc phase walks. Returns "" or
+// the reason the template is not usable; every request error of SPEC_TEMPLATE §2
+// is reported here, before anything loads.
+static std::string parse_template(const std::string & text, std::vector<TplSeg> & segs)
+{
+	segs.clear();
+
+	Meter       meter;
+	std::string above;        // nearest given body line above the next hole
+	bool        in_primer = false;
+	size_t      lineno    = 0;
+	size_t      i         = 0;
+	while (i < text.size())
+	{
+		const size_t      nl    = text.find('\n', i);
+		const size_t      stop  = nl == std::string::npos ? text.size() : nl;
+		const std::string whole = text.substr(i, (nl == std::string::npos ? text.size() : nl + 1) - i);
+		std::string       line  = text.substr(i, stop - i);
+		i = nl == std::string::npos ? text.size() : nl + 1;
+		lineno++;
+
+		// Only the *tests* see a trimmed line; what is fed to the model is the
+		// line exactly as the template wrote it, `\r` and all.
+		const size_t head = line.find_first_not_of(" \t");
+		const size_t tail = line.find_last_not_of(" \t\r");
+		const std::string trimmed = head == std::string::npos
+		                            ? std::string() : line.substr(head, tail - head + 1);
+		if (!starts_with(trimmed, "%%yue2-"))
+		{
+			// A primer is context, not score: it may not decide a hole's meter or
+			// its default bar count (SPEC_TEMPLATE §2 — the block is dropped, so a
+			// default taken from it would refer to a line the score never holds).
+			if (!in_primer)
+			{
+				if (starts_with(trimmed, "M:") || starts_with(trimmed, "L:"))
+				{
+					read_meter_field(trimmed, meter);
+				}
+				if (is_body_line(trimmed))
+				{
+					above = trimmed;
+				}
+			}
+			const TplKind kind = in_primer ? TPL_PRIMER : TPL_GIVEN;
+			if (segs.empty() || segs.back().kind != kind)
+			{
+				TplSeg seg;
+				seg.kind = kind;
+				segs.push_back(seg);
+			}
+			segs.back().text += whole;
+			continue;
+		}
+
+		if (trimmed == "%%yue2-primer-begin")
+		{
+			if (in_primer)
+			{
+				return strf("line %zu: %%%%yue2-primer-begin inside a primer block", lineno);
+			}
+			in_primer = true;
+			continue;
+		}
+		if (trimmed == "%%yue2-primer-end")
+		{
+			if (!in_primer)
+			{
+				return strf("line %zu: %%%%yue2-primer-end without a primer block", lineno);
+			}
+			in_primer = false;
+			continue;
+		}
+		if (!starts_with(trimmed, "%%yue2-gen"))
+		{
+			return strf("line %zu: unknown directive \"%s\"", lineno, trimmed.c_str());
+		}
+		if (in_primer)
+		{
+			return strf("line %zu: %%%%yue2-gen inside a primer block — a primer holds "
+			            "given lines only", lineno);
+		}
+
+		TplSeg seg;
+		seg.kind  = TPL_HOLE;
+		seg.above = above;
+		seg.meter = meter;
+
+		// `%%yue2-gen` alone, or `%%yue2-gen bars=N` with real whitespace between
+		// the two — `%%yue2-genbars=3` is a typo, not a directive with an argument.
+		const std::string args = trimmed.substr(strlen("%%yue2-gen"));
+		if (!args.empty() && args.find_first_of(" \t") != 0)
+		{
+			return strf("line %zu: unknown directive \"%s\"", lineno, trimmed.c_str());
+		}
+		const size_t arg = args.find_first_not_of(" \t");
+		if (arg == std::string::npos)
+		{
+			if (above.empty())
+			{
+				return strf("line %zu: %%%%yue2-gen needs bars=N — there is no body line "
+				            "above it to take the bar count from (a primer block's lines "
+				            "do not count: they never reach the score)", lineno);
+			}
+			seg.bars = count_bars(above, meter).bars;
+			if (seg.bars < 1)
+			{
+				return strf("line %zu: the body line above holds no bars; give %%%%yue2-gen "
+				            "an explicit bars=N", lineno);
+			}
+		} else {
+			const std::string value = args.substr(arg);
+			if (!starts_with(value, "bars="))
+			{
+				return strf("line %zu: %%%%yue2-gen takes nothing but bars=N (got \"%s\")",
+				            lineno, value.c_str());
+			}
+			// strtol, not sscanf: %d on an overflowing literal is undefined.
+			errno = 0;
+			const char * digits = value.c_str() + strlen("bars=");
+			char *       endp   = nullptr;
+			const long   bars   = strtol(digits, &endp, 10);
+			if (errno != 0 || endp == digits || *endp != '\0')
+			{
+				return strf("line %zu: %%%%yue2-gen takes nothing but bars=N (got \"%s\")",
+				            lineno, value.c_str());
+			}
+			if (bars < 1 || bars > TEMPLATE_MAX_BARS)
+			{
+				return strf("line %zu: bars=%ld — a hole holds between 1 and %d bars",
+				            lineno, bars, TEMPLATE_MAX_BARS);
+			}
+			seg.bars = (int) bars;
+		}
+		segs.push_back(seg);
+	}
+
+	if (in_primer)
+	{
+		return "the last %%yue2-primer-begin was never closed by %%yue2-primer-end";
+	}
+	return "";
 }
 
 // ------------------------------------------------------------- generation ---
@@ -208,7 +736,7 @@ static void scan_allowed(const float * logits, const int seg[2][2],
 static llama_token sample_step(const float * logits, int n_vocab, const Sampling & s,
 	const std::vector<llama_token> & history, int step,
 	bool phase_abc, bool legacy_off, std::mt19937_64 & rng,
-	SampleScratch * scratch = nullptr)
+	SampleScratch * scratch = nullptr, bool mask_end = false)
 {
 	const float ninf = -std::numeric_limits<float>::infinity();
 	const int   end  = phase_abc ? ABC_END : MUSIC_END;
@@ -231,7 +759,9 @@ static llama_token sample_step(const float * logits, int n_vocab, const Sampling
 		seg[1][0] = std::min(CODEC_OFFSET, n_vocab);
 		seg[1][1] = std::min(CODEC_OFFSET + CODEC_SIZE, n_vocab);
 	}
-	if (step < s.min_tokens)
+	// `mask_end` is the same mask kept up for a whole hole of a score template:
+	// a hole writes one line, so it may never end the score (SPEC_TEMPLATE §3).
+	if (step < s.min_tokens || mask_end)
 	{
 		const int e = phase_abc ? 1 : 0;
 		seg[e][1] = seg[e][0];
@@ -455,6 +985,11 @@ static json json_request(const Request & r)
 	out["seed"]      = r.seed;
 	out["abc"]       = r.has_abc ? json(r.abc) : json(nullptr);
 	out["cfg_scale"] = r.has_cfg ? json(r.cfg_scale) : json(nullptr);
+	// Deliberately *not* "abc_template": request.json has to stay loadable by
+	// the reference's `SongRequest(**request.json)`, which raises on an unknown
+	// key. A template job records its template as `template.abc` beside this
+	// file, and lands the score it wrote in `abc` — so the artifacts directory
+	// is a plain request that reproduces the song (SPEC_TEMPLATE §5).
 	out["id"]        = r.id;
 	return out;
 }
@@ -506,6 +1041,7 @@ struct Artifacts
 	std::vector<int32_t>     codes;
 	std::string              abc_text;
 	bool                     have_abc_text = false;
+	std::string              template_text;     // "" unless the request was a template
 };
 
 static void write_artifacts(const Artifacts & a)
@@ -521,6 +1057,12 @@ static void write_artifacts(const Artifacts & a)
 	if (a.have_abc_text)
 	{
 		write_file_or_die(dir + "score.abc", a.abc_text);
+	}
+	// The template as the request gave it, directives and primer and all — the
+	// one thing about a template job that request.json cannot carry.
+	if (!a.template_text.empty())
+	{
+		write_file_or_die(dir + "template.abc", a.template_text);
 	}
 	save_i32_or_die(dir + "abc_tokens.npy", std::vector<int32_t>(a.abc_ids.begin(), a.abc_ids.end()));
 	save_i32_or_die(dir + "prefix.npy",     std::vector<int32_t>(a.prefix_sem.begin(), a.prefix_sem.end()));
@@ -544,6 +1086,10 @@ static void write_artifacts(const Artifacts & a)
 		if (a.have_abc_text)
 		{
 			names.push_back("score.abc");
+		}
+		if (!a.template_text.empty())
+		{
+			names.push_back("template.abc");
 		}
 		json manifest = json::object();
 		for (size_t i = 0; i < names.size(); i++)
@@ -656,6 +1202,15 @@ static std::string parse_request(const std::string & path, Request & req)
 		req.has_abc = true;
 		req.abc     = root["abc"].get<std::string>();
 	}
+	if (root.contains("abc_template") && !root["abc_template"].is_null())
+	{
+		if (!root["abc_template"].is_string())
+		{
+			return strf("%s: \"abc_template\" must be a string or null", path.c_str());
+		}
+		req.has_tpl      = true;
+		req.abc_template = root["abc_template"].get<std::string>();
+	}
 	if (root.contains("cfg_scale") && !root["cfg_scale"].is_null())
 	{
 		if (!root["cfg_scale"].is_number())
@@ -703,6 +1258,29 @@ static std::string validate_request(const Request & r)
 		if (r.abc.find_first_not_of(" \t\n\r\f\v") == std::string::npos)
 		{
 			return "external ABC requires nonempty text";
+		}
+	}
+	if (r.has_tpl)
+	{
+		if (r.has_abc)
+		{
+			return "\"abc\" and \"abc_template\" are mutually exclusive: the first sings a "
+			       "score as given, the second lets the model write some of its lines";
+		}
+		if (r.cot == "off")
+		{
+			return "\"abc_template\" needs cot=melody or cot=full — cot=off has no abc phase "
+			       "to write the holes in";
+		}
+		if (r.abc_template.find_first_not_of(" \t\n\r\f\v") == std::string::npos)
+		{
+			return "\"abc_template\" requires nonempty text";
+		}
+		std::vector<TplSeg> segs;
+		const std::string   err = parse_template(r.abc_template, segs);
+		if (!err.empty())
+		{
+			return strf("\"abc_template\": %s", err.c_str());
 		}
 	}
 	if (r.has_cfg && (!std::isfinite(r.cfg_scale) || r.cfg_scale < 0 || r.cfg_scale > 20))
@@ -839,6 +1417,21 @@ struct JobState
 	bool                     have_abc_text = false;
 	bool                     do_abc        = false;
 	double                   guidance      = 1.0;
+
+	// SPEC_TEMPLATE.md, all unused unless the request carries an "abc_template".
+	bool                     is_template   = false;
+	std::vector<TplSeg>      segs;
+	std::vector<int>         budget;       // per segment, the hole's sampled-token ceiling
+	// Suffix sums over the segments, indexed 0..segs.size(): what is still to be
+	// fed, what of that still reaches the score, and how many holes are left.
+	// They are what tells a hole how much context it may take (§3).
+	std::vector<int>         tail_fed;
+	std::vector<int>         tail_given;
+	std::vector<int>         tail_holes;
+	std::string              tpl_text;     // the emitted score, grown segment by segment
+	size_t                   emitted      = 0;   // tokens of it, counted piece by piece
+	TemplateStats            tpl;
+
 	GenStats                 st_abc;
 	GenStats                 st_sem;
 	bool                     ok    = true;   // false once the job is rejected
@@ -859,7 +1452,20 @@ struct Seq
 	llama_token              next     = 0;   // fed by the next lockstep batch
 	llama_token              sampled  = 0;   // sampled from this step's logits, not applied yet
 	int                      i_batch  = -1;  // index in the batch last submitted
+	llama_token              last_fed = 0;   // last token a feed put into the cache
 	double                   t_phase0 = 0;
+
+	// The template walk (SPEC_TEMPLATE §3), untouched by a job without one.
+	size_t                   seg       = 0;  // the segment being fed or sampled
+	bool                     in_hole   = false;
+	bool                     tpl_full  = false;   // the job's sampled-token cap is spent
+	int                      attempt   = 0;  // 1..TEMPLATE_ATTEMPTS within the hole
+	llama_pos                hole_pos  = 0;  // where the hole's tokens start
+	size_t                   hole_hist = 0;  // history size there
+	int                      hole_step = 0;
+	llama_token              hole_prev = 0;  // the token before it, re-decoded on a rollback
+	std::vector<llama_token> hole_ids;       // sampled and decoded inside the hole
+	std::string              carry;          // the closing token's text, fed with the next segment
 };
 
 // The shared decode loop: one llama_decode per step carrying one token for each
@@ -903,10 +1509,26 @@ struct Runner
 	double    t_progress  = 0;
 
 	void        enter(Seq & q, int job);
+	void        feed_tokens(Seq & q, const std::vector<llama_token> & tokens, size_t expect_pos,
+	                        const char * what);
 	void        feed(Seq & q, const std::vector<llama_token> & tokens, size_t expect_pos,
 	                 const char * what);
 	llama_token sample(Seq & q, const float * logits);
 	void        apply(Seq & q, llama_token token);
+
+	// The template walk. give() feeds one forced stretch of score; the rest is
+	// the hole state machine. SPEC_TEMPLATE §3.
+	void        give(Seq & q, const std::string & text, bool emit, const char * what);
+	bool        abc_fits(const Seq & q, size_t extra) const;
+	bool        sem_fits(const Seq & q, size_t extra) const;
+	void        template_step(Seq & q);
+	void        open_hole(Seq & q);
+	void        template_token(Seq & q, llama_token token);
+	void        fail_hole(Seq & q, const std::string & why);
+	void        rollback_hole(Seq & q);
+	void        rest_fill(Seq & q);
+	void        template_done(Seq & q);
+
 	void        finish_job(Seq & q);
 	void        progress();
 	void        run();
@@ -935,11 +1557,11 @@ llama_token Runner::sample(Seq & q, const float * logits)
 	{
 		rng_ref = q.rng;
 		ref     = sample_step_ref(logits, n_vocab, s, q.history, q.step, abc, legacy_off,
-		                          rng_ref);
+		                          rng_ref, q.in_hole);
 	}
 
 	const llama_token token = sample_step(logits, n_vocab, s, q.history, q.step,
-	                                      abc, legacy_off, q.rng, &q.scratch);
+	                                      abc, legacy_off, q.rng, &q.scratch, q.in_hole);
 	if (verify)
 	{
 		if (token != ref)
@@ -966,6 +1588,12 @@ llama_token Runner::sample(Seq & q, const float * logits)
 
 void Runner::apply(Seq & q, llama_token token)
 {
+	if (q.in_hole)
+	{
+		template_token(q, token);
+		return;
+	}
+
 	JobState &       js  = (*states)[q.job];
 	const bool       abc = q.phase == PHASE_ABC;
 	const Sampling & s   = abc ? s_abc : s_sem;
@@ -1043,15 +1671,19 @@ void Runner::apply(Seq & q, llama_token token)
 	feed(q, bridge, js.prefix_sem.size(), "semantic");
 }
 
-void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expect_pos,
+// Decodes `tokens` into this slot in its own call(s) and checks that the cache
+// then holds exactly `expect_pos` of them. Nothing is sampled: the caller either
+// wants the logits (feed) or is forcing score text in (give, rollback_hole).
+void Runner::feed_tokens(Seq & q, const std::vector<llama_token> & tokens, size_t expect_pos,
 	const char * what)
 {
-	JobState & js = (*states)[q.job];
-	q.i_batch = decode_feed(ctx, batch, tokens, q.slot, q.pos, what);
+	if (tokens.empty())
+	{
+		die("%s: nothing to feed into slot %d", what, q.slot);
+	}
+	q.i_batch  = decode_feed(ctx, batch, tokens, q.slot, q.pos, what);
+	q.last_fed = tokens.back();
 	decodes++;
-
-	GenStats & st = q.phase == PHASE_ABC ? js.st_abc : js.st_sem;
-	st.prefill_seconds = now_seconds() - q.t_phase0;
 
 	// The KV cache must agree with the prefix the artifacts record: a phase that
 	// was truncated used to leave the cache one token short here.
@@ -1060,11 +1692,367 @@ void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expec
 	{
 		die("%s%s prefill left %d tokens in slot %d, the prefix is %zu — "
 		    "the cache and prefix.npy disagree",
-		    js.tag.c_str(), what, (int) have, q.slot, expect_pos);
+		    (*states)[q.job].tag.c_str(), what, (int) have, q.slot, expect_pos);
 	}
+}
+
+void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expect_pos,
+	const char * what)
+{
+	JobState & js = (*states)[q.job];
+	feed_tokens(q, tokens, expect_pos, what);
+
+	GenStats & st = q.phase == PHASE_ABC ? js.st_abc : js.st_sem;
+	st.prefill_seconds = now_seconds() - q.t_phase0;
 
 	// Immediately: the next llama_decode from any slot overwrites this buffer.
 	apply(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+}
+
+// One forced stretch of score: tokenized, decoded, and pushed into `history` so
+// the repetition-penalty window sees it as if the model had written it. `emit`
+// separates a given line (which reaches score.abc) from a primer line (which
+// does not) — the text itself is appended by the caller that knows which.
+void Runner::give(Seq & q, const std::string & text, bool emit, const char * what)
+{
+	JobState &                     js  = (*states)[q.job];
+	const std::vector<llama_token> ids = tokenize(vocab, text, what);
+
+	// Unreachable once the two guards below hold — the given text is counted
+	// exactly at sizing time and a hole is stopped before it eats the room the
+	// rest of the template needs. It is the backstop that turns a sizing bug
+	// into a message instead of a -1 from llama_decode.
+	if ((size_t) q.pos + ids.size() > (size_t) n_ctx_seq)
+	{
+		die("%sthe template's %s needs %zu of the %u tokens this slot has — the "
+		    "context estimate was wrong, please report the template",
+		    js.tag.c_str(), what, (size_t) q.pos + ids.size(), n_ctx_seq);
+	}
+
+	q.history.insert(q.history.end(), ids.begin(), ids.end());
+	if (emit)
+	{
+		js.tpl.given_tokens += (int) ids.size();
+		js.emitted          += ids.size();
+	} else {
+		js.tpl.primer_tokens += (int) ids.size();
+	}
+	feed_tokens(q, ids, (size_t) q.pos + ids.size(), what);
+}
+
+// Is there room in the slot for `extra` more tokens of this hole, plus every
+// given and primer segment still to be fed and a rest-fill for every hole after
+// this one? The abc phase runs in the slot; the guard is what keeps a hole that
+// writes until its budget stops it from starving the template behind it.
+bool Runner::abc_fits(const Seq & q, size_t extra) const
+{
+	const JobState & js = (*states)[q.job];
+	return (size_t) q.pos + extra + (size_t) js.tail_fed[q.seg + 1] +
+	       (size_t) TEMPLATE_REST_TOKENS * js.tail_holes[q.seg + 1] <= (size_t) n_ctx_seq;
+}
+
+// The same question for the phase after it: the semantic prefill is the emitted
+// score re-tokenized, and it has to leave max_tokens of codec behind it. Without
+// this, a template that writes more than the sizing estimate expected reaches
+// template_done and dies there — taking the whole batch with it.
+bool Runner::sem_fits(const Seq & q, size_t extra) const
+{
+	const JobState & js   = (*states)[q.job];
+	const size_t     need = js.prefix_abc.size() + js.emitted + extra +
+	                        (size_t) js.tail_given[q.seg + 1] +
+	                        (size_t) TEMPLATE_REST_TOKENS * js.tail_holes[q.seg + 1] +
+	                        2 + (size_t) s_sem.max_tokens + (size_t) TEMPLATE_SEAM_MARGIN;
+	return need <= (size_t) n_ctx_seq;
+}
+
+// Feeds given and primer segments until a hole opens or the template runs out.
+// A hole's first token is sampled from the logits of whatever was fed last,
+// which is why the feeds happen here and not in the lockstep batch.
+void Runner::template_step(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+	while (q.seg < js.segs.size())
+	{
+		const TplSeg & seg = js.segs[q.seg];
+		if (seg.kind == TPL_HOLE)
+		{
+			open_hole(q);
+			return;
+		}
+		q.seg++;
+		const bool        emit = seg.kind == TPL_GIVEN;
+		const std::string text = q.carry + seg.text;
+		q.carry.clear();
+		if (emit)
+		{
+			js.tpl_text += seg.text;
+		}
+		give(q, text, emit, emit ? "given segment" : "primer segment");
+	}
+	template_done(q);
+}
+
+void Runner::open_hole(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+
+	// The tail of the line the previous hole closed with: its text is already in
+	// score.abc, but the cache has not seen it (§3 — the closing token is never
+	// fed as sampled), so it goes in now, re-tokenized.
+	if (!q.carry.empty())
+	{
+		const std::string text = q.carry;
+		q.carry.clear();
+		give(q, text, true, "hole tail");
+	}
+
+	q.in_hole   = true;
+	q.attempt   = 1;
+	q.hole_pos  = q.pos;
+	q.hole_hist = q.history.size();
+	q.hole_step = q.step;
+	q.hole_prev = q.last_fed;
+	q.hole_ids.clear();
+	js.tpl.holes++;
+
+	if (q.tpl_full)
+	{
+		rest_fill(q);
+		return;
+	}
+	template_token(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+}
+
+// One token sampled inside a hole. The hole closes on the first `\n`; the token
+// that carries it is never fed as sampled, so the part of it before the newline
+// rides along with the next segment instead (§3).
+void Runner::template_token(Seq & q, llama_token token)
+{
+	JobState &     js  = (*states)[q.job];
+	const TplSeg & seg = js.segs[q.seg];
+
+	js.tpl.sampled_tokens++;
+	q.step++;
+
+	// --max-abc caps the job's *sampled* tokens — every draw, the ones a rolled
+	// back attempt spent included. `q.step` is restored by a rollback and is the
+	// wrong counter for it; `tpl.sampled_tokens` only ever grows.
+	if (js.tpl.sampled_tokens >= s_abc.max_tokens)
+	{
+		q.tpl_full = true;
+	}
+
+	// ABC_END is masked for the whole hole, so it can only arrive from a sampler
+	// that was told otherwise. Treated as a failed attempt rather than trusted.
+	if (token == ABC_END)
+	{
+		fail_hole(q, "ended the score");
+		return;
+	}
+
+	q.hole_ids.push_back(token);
+	const std::string full = detokenize(vocab, q.hole_ids);
+	const size_t      nl   = full.find('\n');
+	if (nl == std::string::npos)
+	{
+		if ((int) q.hole_ids.size() >= js.budget[q.seg])
+		{
+			fail_hole(q, strf("ran past its %d-token budget", js.budget[q.seg]));
+			return;
+		}
+		if (q.tpl_full)
+		{
+			fail_hole(q, "the job's sampled-token cap is spent");
+			return;
+		}
+		// One more sampled token is one more cell, and one more token of the
+		// score the semantic phase has to prefill. Either ceiling closes the hole
+		// and rest-fills it rather than failing a decode or dying in
+		// template_done (SPEC_TEMPLATE §3).
+		if (!abc_fits(q, q.hole_ids.size() + 1))
+		{
+			fail_hole(q, "ran the slot out of context");
+			return;
+		}
+		if (!sem_fits(q, q.hole_ids.size() + 1))
+		{
+			fail_hole(q, "would leave the semantic phase no room");
+			return;
+		}
+		q.history.push_back(token);
+		q.next = token;
+		return;
+	}
+
+	// The accepted line is what was decoded plus the closing token's head, which
+	// is re-tokenized into the next feed — one token, near enough for the check.
+	if (!sem_fits(q, q.hole_ids.size() + 1))
+	{
+		fail_hole(q, "would leave the semantic phase no room");
+		return;
+	}
+
+	q.hole_ids.pop_back();
+	const std::string prev = q.hole_ids.empty() ? std::string() : detokenize(vocab, q.hole_ids);
+	const std::string line = full.substr(0, nl + 1);
+	const std::string body = line.substr(0, nl);
+
+	if (!is_body_line(body))
+	{
+		fail_hole(q, "wrote a field or comment line, not a body line");
+		return;
+	}
+	const BarCount bc = count_bars(body, seg.meter);
+	if (bc.bars != seg.bars)
+	{
+		fail_hole(q, strf("got %d bars", bc.bars));
+		return;
+	}
+
+	js.tpl.offlength_bars += bc.offlength;
+	js.tpl_text           += line;
+	js.emitted            += q.hole_ids.size();   // the carry is counted by give()
+	q.carry   = line.substr(prev.size());
+	q.in_hole = false;
+	q.seg++;
+	template_step(q);
+}
+
+void Runner::fail_hole(Seq & q, const std::string & why)
+{
+	JobState &     js  = (*states)[q.job];
+	const TplSeg & seg = js.segs[q.seg];
+
+	printf("%sabc: hole %d (bars=%d): attempt %d, %s\n", js.tag.c_str(),
+	       js.tpl.holes, seg.bars, q.attempt, why.c_str());
+
+	if (q.attempt >= TEMPLATE_ATTEMPTS || q.tpl_full)
+	{
+		rest_fill(q);
+		return;
+	}
+	js.tpl.retries++;
+	q.attempt++;
+	rollback_hole(q);
+	template_token(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+}
+
+// Undoes an attempt: the slot's cells, position, history and step go back to
+// where the hole started. The RNG is deliberately *not* restored, so the retry
+// draws differently. The logits the next attempt samples from are gone with the
+// cells, so the token before the hole is decoded a second time (§3).
+void Runner::rollback_hole(Seq & q)
+{
+	llama_memory_seq_rm(mem, q.slot, q.hole_pos - 1, -1);
+	q.pos  = q.hole_pos - 1;
+	q.step = q.hole_step;
+	q.history.resize(q.hole_hist);
+	q.hole_ids.clear();
+
+	const std::vector<llama_token> one(1, q.hole_prev);
+	feed_tokens(q, one, (size_t) q.hole_pos, "hole rollback");
+}
+
+// The fallback after the last attempt: N bars of rest, fed as a given line.
+void Runner::rest_fill(Seq & q)
+{
+	JobState &     js  = (*states)[q.job];
+	const TplSeg & seg = js.segs[q.seg];
+
+	js.tpl.rest_filled++;
+	printf("%sabc: hole %d (bars=%d): filled with rests\n", js.tag.c_str(),
+	       js.tpl.holes, seg.bars);
+
+	// Only here: the phase really did lose a line to `--max-abc`. A cap that
+	// lands on the closing token of the last hole costs the score nothing.
+	if (q.tpl_full)
+	{
+		js.st_abc.truncated = true;
+	}
+
+	// Nothing to undo when the hole failed on its very first token, or when the
+	// sampled-token cap closed it before it opened — but `step` is restored
+	// either way, since a rest-fill spends none of the phase's draws.
+	if (!q.hole_ids.empty() || q.pos != q.hole_pos)
+	{
+		rollback_hole(q);
+	}
+	q.step = q.hole_step;
+	const std::string fill = seg.bars == 1 ? std::string("Z|\n") : strf("Z%d|\n", seg.bars);
+	js.tpl_text += fill;
+	q.in_hole    = false;
+	q.seg++;
+	give(q, fill, true, "rest fill");
+	template_step(q);
+}
+
+// The abc phase of a template job ends when the template runs out. The emitted
+// score is re-tokenized in one go — BPE merges across the segment seams differ
+// from the per-segment ids — and prefilled into a *cleared* slot, exactly as an
+// external "abc" would be. That is what lets the primer be dropped (§3).
+void Runner::template_done(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+	GenStats & st = js.st_abc;
+
+	js.abc_ids = tokenize(vocab, js.tpl_text, "template score");
+	for (size_t i = 0; i < js.abc_ids.size(); i++)
+	{
+		if (js.abc_ids[i] < 0 || js.abc_ids[i] >= EOD)
+		{
+			die("%sabc id %d at %zu leaves the ordinary text vocabulary",
+			    js.tag.c_str(), (int) js.abc_ids[i], i);
+		}
+	}
+	js.abc_text      = js.tpl_text;
+	js.have_abc_text = true;
+
+	// From here the request *is* a plain external-"abc" request for the score the
+	// holes produced, and that is what request.json and plan.json record. Nothing
+	// downstream reads `has_abc` any more — validation and the phase choice both
+	// happened before the decode — so this only changes what is written.
+	js.req.has_abc = true;
+	js.req.abc     = js.tpl_text;
+
+	st.seconds        = now_seconds() - q.t_phase0;
+	st.content_tokens = (int) js.abc_ids.size();
+	st.output_tokens  = st.content_tokens + 1;
+	st.output_tps     = st.seconds > 0 ? st.output_tokens / st.seconds : 0;
+
+	printf("%sabc:      %d tokens in %.2f s = %.2f tok/s%s\n", js.tag.c_str(),
+	       st.output_tokens, st.seconds, st.output_tps, st.truncated ? " (TRUNCATED)" : "");
+	printf("%sabc: template: %d holes, %d sampled tokens, %d retries, %d rest-filled, "
+	       "%d given + %d primer tokens, %d off-length bars\n", js.tag.c_str(),
+	       js.tpl.holes, js.tpl.sampled_tokens, js.tpl.retries, js.tpl.rest_filled,
+	       js.tpl.given_tokens, js.tpl.primer_tokens, js.tpl.offlength_bars);
+
+	js.prefix_sem = js.prefix_abc;
+	js.prefix_sem.insert(js.prefix_sem.end(), js.abc_ids.begin(), js.abc_ids.end());
+	js.prefix_sem.push_back(ABC_END);
+	js.prefix_sem.push_back(MUSIC_START);
+	if ((int) js.prefix_sem.size() + s_sem.max_tokens > (int) n_ctx_seq)
+	{
+		die("%ssemantic prefix %zu + max_tokens %d exceeds the allocated %u-token context",
+		    js.tag.c_str(), js.prefix_sem.size(), s_sem.max_tokens, n_ctx_seq);
+	}
+
+	llama_memory_seq_rm(mem, q.slot, -1, -1);
+	const llama_pos held = llama_memory_seq_pos_max(mem, q.slot);
+	if (held != -1)
+	{
+		die("slot %d still holds %d tokens after the template phase cleared it",
+		    q.slot, (int) held + 1);
+	}
+
+	q.pos      = 0;
+	q.phase    = PHASE_SEM;
+	q.history.clear();
+	q.step     = 0;
+	q.rng.seed(js.req.seed);
+	q.t_phase0 = now_seconds();
+
+	js.st_sem.prefix_tokens = (int) js.prefix_sem.size();
+	feed(q, js.prefix_sem, js.prefix_sem.size(), "semantic");
 }
 
 void Runner::enter(Seq & q, int job)
@@ -1086,11 +2074,25 @@ void Runner::enter(Seq & q, int job)
 	q.pos      = 0;
 	q.i_batch  = -1;
 	q.t_phase0 = now_seconds();
+	q.seg      = 0;
+	q.in_hole  = false;
+	q.tpl_full = false;
+	q.hole_ids.clear();
+	q.carry.clear();
 	active++;
 
 	if (js.do_abc)
 	{
 		js.st_abc.prefix_tokens = (int) js.prefix_abc.size();
+		if (js.is_template)
+		{
+			// The prefix is fed but nothing is sampled from it: the template says
+			// what comes next, and it is usually a given line (SPEC_TEMPLATE §3).
+			feed_tokens(q, js.prefix_abc, js.prefix_abc.size(), "abc");
+			js.st_abc.prefill_seconds = now_seconds() - q.t_phase0;
+			template_step(q);
+			return;
+		}
 		feed(q, js.prefix_abc, js.prefix_abc.size(), "abc");
 		return;
 	}
@@ -1134,6 +2136,7 @@ void Runner::finish_job(Seq & q)
 		a.codes         = codes;
 		a.abc_text      = js.abc_text;
 		a.have_abc_text = js.have_abc_text;
+		a.template_text = js.is_template ? js.req.abc_template : std::string();
 		write_artifacts(a);
 	}
 	printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
@@ -1149,6 +2152,8 @@ void Runner::finish_job(Seq & q)
 	r.cfg_scale   = js.guidance;
 	r.card        = card;
 	r.ok          = true;
+	r.is_template = js.is_template;
+	r.tpl         = js.tpl;
 	r.parallel    = parallel;
 	r.slot        = q.slot;
 	r.batch_jobs  = (int) jobs->size();
@@ -1697,6 +2702,64 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 
 		js.do_abc = js.req.cot != "off" && !js.req.has_abc;
 
+		// A template: the segments, and the token budget of every hole. Both are
+		// needed before the context is sized, since the abc phase holds the prefix,
+		// every forced token and the hole being written (SPEC_TEMPLATE §3).
+		size_t tpl_fed    = 0;   // given + primer tokens
+		size_t tpl_emit   = 0;   // of those, the ones that reach score.abc
+		size_t tpl_lines  = 0;   // what the holes are expected to write, all told
+		size_t tpl_budget = 0;   // the largest single hole budget
+		if (js.req.has_tpl)
+		{
+			js.is_template = true;
+			const std::string err = parse_template(js.req.abc_template, js.segs);
+			if (!err.empty())
+			{
+				die("%s%s: \"abc_template\": %s", js.tag.c_str(),
+				    jobs[i].request_path.c_str(), err.c_str());
+			}
+			js.budget.assign(js.segs.size(), 0);
+			js.tail_fed.assign(js.segs.size() + 1, 0);
+			js.tail_given.assign(js.segs.size() + 1, 0);
+			js.tail_holes.assign(js.segs.size() + 1, 0);
+			for (size_t k = 0; k < js.segs.size(); k++)
+			{
+				const TplSeg & seg = js.segs[k];
+				if (seg.kind != TPL_HOLE)
+				{
+					const size_t n = tokenize(vocab, seg.text, "template segment").size();
+					tpl_fed += n;
+					js.tail_fed[k] = (int) n;
+					if (seg.kind == TPL_GIVEN)
+					{
+						tpl_emit          += n;
+						js.tail_given[k]   = (int) n;
+					}
+					max_feed = std::max(max_feed, n);
+					continue;
+				}
+				js.tail_holes[k] = 1;
+				const size_t above = seg.above.empty()
+				                     ? 0 : tokenize(vocab, seg.above, "template line").size();
+				js.budget[k] = (int) std::min<size_t>(std::max<size_t>(64, 8 * above),
+				                                      (size_t) s_abc.max_tokens);
+				// The budget is what a hole may *spend*; what it is expected to
+				// *keep* is a line about as long as the one above it. Sizing the
+				// context on the budgets would ask for an order of magnitude more
+				// KV than any real template uses, so the expectation is what the
+				// estimate below uses and template_token guards the difference.
+				tpl_lines  += std::min<size_t>((size_t) js.budget[k],
+				                               std::max<size_t>(64, 2 * above + 16));
+				tpl_budget  = std::max(tpl_budget, (size_t) js.budget[k]);
+			}
+			for (size_t k = js.segs.size(); k > 0; k--)
+			{
+				js.tail_fed[k - 1]   += js.tail_fed[k];
+				js.tail_given[k - 1] += js.tail_given[k];
+				js.tail_holes[k - 1] += js.tail_holes[k];
+			}
+		}
+
 		// External ABC: tokenize it here so the semantic prefix matches torch.
 		if (js.req.cot != "off" && js.req.has_abc)
 		{
@@ -1743,6 +2806,22 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 		uint32_t want = (uint32_t) (js.prefix_abc.size() + js.abc_ids.size() +
 		                            (js.do_abc ? (size_t) s_abc.max_tokens : 0) + 2 +
 		                            (size_t) s_sem.max_tokens + 8);
+		if (js.is_template)
+		{
+			// A template job's two phases are a max, not a sum: the semantic phase
+			// starts from a cleared slot (SPEC_TEMPLATE §3). The abc phase holds
+			// the prefix, every forced token and one hole at a time; the emitted
+			// score is at most the given tokens plus the hole budgets.
+			const size_t sem_est = js.prefix_abc.size() + tpl_emit + tpl_lines + 2;
+			const size_t abc_est = js.prefix_abc.size() + tpl_fed + tpl_lines + tpl_budget;
+			max_feed = std::max(max_feed, sem_est);
+			want     = (uint32_t) (std::max(abc_est, sem_est + (size_t) s_sem.max_tokens) + 8);
+			if (want > (uint32_t) CONTEXT)
+			{
+				die("%sthe template needs %u tokens of context, the model has %d",
+				    js.tag.c_str(), want, CONTEXT);
+			}
+		}
 		if (want > (uint32_t) CONTEXT)
 		{
 			want = (uint32_t) CONTEXT;

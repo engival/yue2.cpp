@@ -69,6 +69,19 @@ struct GenStats
 	bool   truncated       = false;
 };
 
+// What the abc phase of a score-template job did with its holes. SPEC_TEMPLATE
+// §5: it reaches result.json and the batch summary, for template jobs only.
+struct TemplateStats
+{
+	int holes          = 0;
+	int retries        = 0;   // attempts that were rolled back and drawn again
+	int rest_filled    = 0;   // holes that exhausted their attempts
+	int primer_tokens  = 0;   // fed as context, dropped from the emitted score
+	int given_tokens   = 0;
+	int sampled_tokens = 0;   // every draw, including the ones that were rolled back
+	int offlength_bars = 0;   // written bars that do not hold M:/L: note units
+};
+
 // What `yue2 song` needs from the AR stage without re-reading the artifacts.
 struct ArResult
 {
@@ -82,6 +95,8 @@ struct ArResult
 	std::string          card;          // ggml device description
 	bool                 ok        = false;   // false until the job's artifacts are on disk
 	std::string          error;               // why not, when ok == false
+	bool                 is_template = false; // the request carried an "abc_template"
+	TemplateStats        tpl;
 	int                  parallel  = 1;       // how this song was decoded — see SPEC_BATCH §6
 	int                  slot      = 0;
 	int                  batch_jobs = 1;

@@ -63,10 +63,17 @@ target_compile_options(yue2 PRIVATE ${YUE2_WARN_FLAGS})
 # includes src/stage_ar.cpp to reach both samplers in its anonymous namespace,
 # so it tests the shipping code rather than a copy. Tests only — off by default,
 # never installed: cmake -B build_sampler -DYUE2_BUILD_TESTS=ON
-option(YUE2_BUILD_TESTS "Build the tests-only targets (yue2-sampler-diff)" OFF)
+option(YUE2_BUILD_TESTS "Build the tests-only targets (yue2-sampler-diff, yue2-bars)" OFF)
 if(YUE2_BUILD_TESTS)
 	add_executable(yue2-sampler-diff tests/sampler_diff.cpp)
 	target_include_directories(yue2-sampler-diff PRIVATE src)
 	target_link_libraries(yue2-sampler-diff PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-sampler-diff PRIVATE ${YUE2_WARN_FLAGS})
+
+	# Stage 7: the score template's bar counter and parser (SPEC_TEMPLATE.md §4),
+	# included the same way and for the same reason.
+	add_executable(yue2-bars tests/bars.cpp)
+	target_include_directories(yue2-bars PRIVATE src)
+	target_link_libraries(yue2-bars PRIVATE llama ggml vendor::hash vendor::nlohmann)
+	target_compile_options(yue2-bars PRIVATE ${YUE2_WARN_FLAGS})
 endif()
