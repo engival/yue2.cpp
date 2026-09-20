@@ -127,7 +127,7 @@ void usage(const char * argv0)
 	fprintf(stderr,
 	        "usage: %s --request R.json --out X.flac|X.opus [--artifacts DIR] [--seed N]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
-	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n"
+	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 16]\n"
 	        "        [--nar-lora LORA.safetensors[:S]]\n"
 	        "        [--guidance-trace] [--no-tags] [--opus-bitrate 160]\n", argv0);
 }
@@ -137,7 +137,7 @@ void usage_batch(const char * argv0)
 	fprintf(stderr,
 	        "usage: %s --jobs jobs.json [--parallel N] [--summary FILE]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf] [--seed N]\n"
-	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 32]\n"
+	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 16]\n"
 	        "        [--nar-lora LORA.safetensors[:S]]\n"
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
 	        "        [--continue-on-error] [--guidance-trace] [--no-tags]\n"

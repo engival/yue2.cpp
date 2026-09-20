@@ -472,6 +472,8 @@ request's seed for both the AR sampling and the noise; `--noise FILE` replaces
 the generated noise; `--gpu 0|1` picks the Vulkan device and with it the NAR's
 flags (AMD `--flash-attn`, Intel one untiled query chunk — by device *name*, and
 falling back to the default tiling on songs whose score buffer would not fit).
+`--steps N` is the NAR's ODE step count: the default is 16, the reference's
+`ode_steps` is 32, and the NAR's time scales with it.
 `--nar-f32` trades the fp16-staged matmuls for the exact ones; because
 ggml-vulkan reads that switch once per device init, it applies to the AR as
 well, whose logits then shift — so `--nar-f32` yields a *different song*, not the

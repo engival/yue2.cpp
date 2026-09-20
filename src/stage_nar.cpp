@@ -569,7 +569,7 @@ static void usage(const char * argv0)
 		"usage: %s --ar yue2-ar-f16.gguf -m yue2-nar-f16.gguf\n"
 		"           (--artifacts DIR | --prefix prefix.npy --codec semantic.npy)\n"
 		"           (--noise noise.npy | --seed N) -o latent.npy\n"
-		"           [--steps 32] [--context 24576] [--query-chunk 1024] [--prefill-block 512]\n"
+		"           [--steps 16] [--context 24576] [--query-chunk 1024] [--prefill-block 512]\n"
 		"           [--gpu N] [--cpu] [--threads N]\n"
 		"           [--frames N] [--flash-attn] [--kv-f16] [--dump-dir DIR] [--dump-kv-all]\n"
 		"           [--weights f16|f32] [--vk-f16-matmul] [--nar-lora LORA.safetensors[:S]]\n", argv0);

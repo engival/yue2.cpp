@@ -22,7 +22,7 @@ struct SongParams
 	std::string noise_path;
 	std::string device   = "vulkan";
 	int         gpu      = 0;
-	int         steps    = 32;
+	int         steps    = 16;   // the reference's ode_steps is 32: --steps 32
 	bool        has_seed = false;
 	uint64_t    seed     = 0;
 	bool        nar_f32  = false;
@@ -43,7 +43,7 @@ struct BatchParams
 	std::string vae_model;
 	std::string device   = "vulkan";
 	int         gpu      = 0;
-	int         steps    = 32;
+	int         steps    = 16;
 	int         parallel = 4;
 	int         threads  = 0;
 	bool        greedy   = false;

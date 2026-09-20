@@ -21,7 +21,7 @@ struct NarParams
 	std::string device        = "vulkan";   // the CPU is never a default or a fallback: --cpu asks for it
 	int      gpu              = 0;
 	int      threads          = 0;
-	int      steps            = 32;
+	int      steps            = 16;         // the reference's ode_steps is 32: --steps 32
 	int64_t  context          = 24576;
 	int64_t  query_chunk      = 1024;
 	int64_t  prefill_block    = 512;
