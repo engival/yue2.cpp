@@ -23,6 +23,7 @@ struct SongParams
 	bool        has_seed = false;
 	uint64_t    seed     = 0;
 	bool        nar_f32  = false;
+	bool        guidance_trace = false;   // --guidance-trace, needs --artifacts to land in
 };
 
 // What `yue2 batch` takes for the whole list; everything that differs per song
@@ -46,6 +47,7 @@ struct BatchParams
 	uint64_t    seed     = 0;
 	bool        nar_f32  = false;
 	bool        continue_on_error = false;
+	bool        guidance_trace = false;   // per job: only one with its own artifacts traces
 };
 
 SongParams  parse_song_args (const char * argv0, int argc, char ** argv);

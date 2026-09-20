@@ -126,6 +126,81 @@ void run_curves()
 	}
 }
 
+// ------------------------------------------------- the --guidance-trace math ---
+
+// softmax / TV / argmax on hand-sized rows: the three pure functions behind a
+// row of guidance_trace.npy, with the expectations worked out on paper.
+void run_trace_math()
+{
+	std::vector<double> p;
+	std::vector<double> q;
+
+	// Two equal logits: half the mass each, and log(sum exp) = log 2.
+	{
+		const float         row[] = { 0.0f, 0.0f };
+		const double        logz  = softmax_row(row, 2, p);
+		check(std::fabs(p[0] - 0.5) < 1e-12 && std::fabs(p[1] - 0.5) < 1e-12 &&
+		      std::fabs(logz - std::log(2.0)) < 1e-12,
+		      "softmax_row", strf("%g %g, logZ %g", p[0], p[1], logz),
+		      strf("0.5 0.5, logZ %g (two equal logits)", std::log(2.0)));
+		// log p_0 = row[0] - logZ, which is what column 7 reports.
+		check(std::fabs((row[0] - logz) + std::log(2.0)) < 1e-12, "softmax_row logp",
+		      strf("%g", row[0] - logz), strf("%g (a token of probability 0.5)", -std::log(2.0)));
+	}
+
+	// The same two logits a thousand nats up: the maximum is subtracted, so
+	// nothing overflows and the distribution is unchanged.
+	{
+		const float  row[] = { 1000.0f, 1000.0f };
+		const double logz  = softmax_row(row, 2, q);
+		check(std::fabs(q[0] - 0.5) < 1e-12 && std::fabs(logz - (1000.0 + std::log(2.0))) < 1e-9,
+		      "softmax_row (offset)", strf("%g, logZ %g", q[0], logz),
+		      strf("0.5, logZ %g (max-subtracted)", 1000.0 + std::log(2.0)));
+		check(std::fabs(tv_distance(p, q)) < 1e-12, "tv_distance (same)",
+		      strf("%g", tv_distance(p, q)), "0 (a constant shift is no distance at all)");
+	}
+
+	// exp(1) : 1 : 1 — the shares are e/(e+2), 1/(e+2), 1/(e+2).
+	{
+		const float  row[] = { 1.0f, 0.0f, 0.0f };
+		const double logz  = softmax_row(row, 3, p);
+		const double want  = std::exp(1.0) / (std::exp(1.0) + 2.0);
+		check(std::fabs(p[0] - want) < 1e-12 &&
+		      std::fabs(logz - (1.0 + std::log(1.0 + 2.0 * std::exp(-1.0)))) < 1e-12,
+		      "softmax_row (skewed)", strf("%g, logZ %g", p[0], logz),
+		      strf("%g, logZ %g", want, 1.0 + std::log(1.0 + 2.0 * std::exp(-1.0))));
+	}
+
+	// Two distributions sharing no mass are a full total variation apart, and
+	// 0.5 vs 0.25 over two ids is a quarter.
+	{
+		const float one[]  = { 0.0f, -1000.0f };
+		const float other[] = { -1000.0f, 0.0f };
+		softmax_row(one, 2, p);
+		softmax_row(other, 2, q);
+		check(std::fabs(tv_distance(p, q) - 1.0) < 1e-9, "tv_distance (disjoint)",
+		      strf("%g", tv_distance(p, q)), "1 (no shared mass)");
+
+		const float even[]   = { 0.0f, 0.0f };
+		const float lopsided[] = { 0.0f, (float) std::log(3.0) };
+		softmax_row(even, 2, p);
+		softmax_row(lopsided, 2, q);
+		// 1e-6: log 3 is only a float here, which is the precision the real rows
+		// come in at too.
+		check(std::fabs(tv_distance(p, q) - 0.25) < 1e-6, "tv_distance (0.5 vs 0.25)",
+		      strf("%g", tv_distance(p, q)), "0.25 (half of |0.5-0.25| twice)");
+	}
+
+	// argmax: the first of a tie, and a negative row has one too.
+	{
+		const float tie[]  = { 2.0f, 2.0f, 1.0f };
+		const float down[] = { -9.0f, -3.0f, -7.0f };
+		check(argmax_row(tie, 3) == 0 && argmax_row(down, 3) == 1, "argmax_row",
+		      strf("%d %d", argmax_row(tie, 3), argmax_row(down, 3)),
+		      "0 1 (the first of a tie; the least negative)");
+	}
+}
+
 // ------------------------------------------------------- the request form ---
 
 // The smallest request the parser accepts, with `extra` spliced in.
@@ -362,6 +437,7 @@ int main(int argc, char ** argv)
 	}
 
 	run_curves();
+	run_trace_math();
 	run_requests();
 	run_plans();
 

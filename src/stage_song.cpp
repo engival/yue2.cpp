@@ -70,7 +70,8 @@ void usage(const char * argv0)
 	fprintf(stderr,
 	        "usage: %s --request R.json --out X.flac [--artifacts DIR] [--seed N]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
-	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n", argv0);
+	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n"
+	        "        [--guidance-trace]\n", argv0);
 }
 
 void usage_batch(const char * argv0)
@@ -80,7 +81,7 @@ void usage_batch(const char * argv0)
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf] [--seed N]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 32]\n"
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
-	        "        [--continue-on-error]\n"
+	        "        [--continue-on-error] [--guidance-trace]\n"
 	        "\n"
 	        "jobs.json is an array of { \"request\", \"out\", \"artifacts\", \"seed\", \"noise\" };\n"
 	        "request and out are required and paths are relative to the working directory.\n",
@@ -343,6 +344,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			p.steps = atoi(need(argc, argv, i));
 		} else if (a == "--nar-f32") {
 			p.nar_f32 = true;
+		} else if (a == "--guidance-trace") {
+			p.guidance_trace = true;
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
@@ -415,6 +418,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			p.nar_f32 = true;
 		} else if (a == "--continue-on-error") {
 			p.continue_on_error = true;
+		} else if (a == "--guidance-trace") {
+			p.guidance_trace = true;
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
@@ -482,6 +487,14 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		{
 			jobs[k].has_seed = true;
 			jobs[k].seed     = p.seed;
+		}
+		// The trace belongs beside the artifacts it explains, so a job whose
+		// directory is the temporary one this run removes traces nothing.
+		jobs[k].trace = p.guidance_trace && !temp_dir[k];
+		if (p.guidance_trace && temp_dir[k])
+		{
+			printf("--guidance-trace: job %zu has no artifacts directory to write "
+			       "guidance_trace.npy into; nothing traced\n", k + 1);
 		}
 
 		const std::filesystem::path out_parent = std::filesystem::path(jobs[k].out).parent_path();
@@ -679,6 +692,7 @@ int run_song(const SongParams & p)
 	bp.steps     = p.steps;
 	bp.parallel  = 1;          // the reproducible path, SPEC_BATCH §6
 	bp.nar_f32   = p.nar_f32;
+	bp.guidance_trace = p.guidance_trace;
 
 	ArJob job;
 	job.request_path = p.request_path;

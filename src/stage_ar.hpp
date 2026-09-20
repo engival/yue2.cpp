@@ -25,6 +25,7 @@ struct ArParams
 	bool        continue_on_error = false;
 	bool        verify_sampler    = false;   // run the frozen stage-5 sampler beside the new one
 	bool        prefix_only       = false;   // tokenize request + given abc, write prefix.npy, decode nothing
+	bool        guidance_trace    = false;   // --guidance-trace: DIR/guidance_trace.npy, diagnostics only
 };
 
 // One song in a batch: exactly the per-song options `yue2 song` takes, minus
@@ -38,6 +39,10 @@ struct ArJob
 	std::string noise_path;
 	bool        has_seed = false;
 	uint64_t    seed     = 0;
+	// --guidance-trace, per job because it writes into the job's own artifacts
+	// directory: a job that has none (a `yue2 song` without --artifacts) traces
+	// nothing. Never a key of a `--jobs` file; the command line sets it.
+	bool        trace    = false;
 };
 
 // What the AR decode loop needs for a whole batch. Per-job overrides are in ArJob.

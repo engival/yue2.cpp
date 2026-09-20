@@ -598,3 +598,102 @@ shared with the other jobs of a batch, and growing it would move their numerics.
 - Nothing keeps the *end* of a render, or a middle slice: §2 is leading codes
   only, and the pending-token trick is what makes that the cheap case.
 - `tests/regress.sh` was not extended, for the reason stage 7 gives above.
+
+# STATUS — stage 7c: `--guidance-trace`
+
+Built on stages 7 and 7b. Build `build_trace/` (`cmake -B build_trace
+-DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DYUE2_BUILD_TESTS=ON`, `nice -n 10
+cmake --build build_trace -j8`). Every run below is **Vulkan device 1 (Intel Arc
+Pro B70)** with `yue2-ar-q8_0.gguf`; device 0 was never touched, and no other
+build directory was rebuilt.
+
+## 0c. What it is
+
+`--guidance-trace` is a flag on `yue2 ar`, `yue2 song` and `yue2 batch`. A guided
+job that has an `--artifacts DIR` writes `DIR/guidance_trace.npy`: float32,
+`[steps with a live branch, 8]`, one row per semantic step, columns
+
+| col | what |
+|---:|---|
+| 0 | the semantic step |
+| 1, 2 | the weight of `previous` / `blank` (0 where the branch is not live) |
+| 3, 4 | TV distance between `softmax(B)` and that branch's own softmax — NaN where not live |
+| 5 | 1 where `argmax(B) == argmax(previous)`, else 0; NaN where `previous` is not live |
+| 6 | TV distance between `softmax(B)` and the softmax of the blended row the sampler was handed (0 when no live branch carries a weight) |
+| 7 | the drawn token's log-probability under plain `softmax(B)` — how surprising the guided choice is to the unguided model |
+
+`B` is the primary's raw row; TV is `0.5 * sum |p - q|`; both softmaxes are taken
+in double with the maximum subtracted, over `MUSIC_END` + the codec range
+(`SEM_ROW_FIRST`, `SEM_ROW_LEN`) — the only ids the semantic sampler can visit.
+
+The row is built **after** the draw and before `apply()`, from the primary's
+row, the branches' copies and `q.blend`; it touches no RNG and no row the
+sampler reads, so a traced run sings the same song as an untraced one (§1c). Off
+by default it is one `if (q.traced)` per step.
+
+New code, all in `src/stage_ar.cpp` unless said otherwise: `TRACE_COLUMNS`,
+`softmax_row` / `tv_distance` / `argmax_row` (pure, tested in
+`tests/guidance.cpp`), `Runner::trace_step` + `Runner::{trace_p, trace_q}`,
+`JobState::{trace, trace_seconds}`, `Seq::traced`, `Artifacts::trace` and the
+`guidance_trace.npy` write, `ArParams::guidance_trace` + `ArJob::trace`
+(`src/stage_ar.hpp`), `SongParams`/`BatchParams::guidance_trace` and the per-job
+decision in `run_batch` (`src/stage_song.*`).
+
+## 1c. Commands and results
+
+```bash
+for r in ext ext_g64 ext_cfg3; do
+  ./build_trace/yue2 ar -m yue2-ar-q8_0.gguf --request tests/out/guidance/$r.json \
+      --artifacts tests/out/trace/plain_$r --gpu 1 --max-semantic 300
+  ./build_trace/yue2 ar -m yue2-ar-q8_0.gguf --request tests/out/guidance/$r.json \
+      --artifacts tests/out/trace/tr_$r --gpu 1 --max-semantic 300 --guidance-trace
+done
+```
+
+The requests are stage 7's (§1): `ext.json` unguided, `ext_cfg3.json`
+`"cfg_scale": 3`, `ext_g64.json` one entry at frame 64. `ext_ramp.json` (new,
+`tests/out/trace/`) is `ext.json` + one entry at frame 0 with
+`"blank": [[0, 0], [100, 4]]` — a live branch whose weight starts at 0.
+
+| # | check | result |
+|---|---|---|
+| 1 | `cmp` traced vs untraced, `semantic.npy` / `prefix.npy` / `abc_tokens.npy` | **PASS** — identical for `ext` (unguided), `ext_cfg3`, `ext_g64` |
+| 2 | the npy loads in numpy | **PASS** — `(300, 8)` / `(236, 8)` float32, column 0 strictly increasing |
+| 2 | columns 1–2 are the request's curves | **PASS** — recomputed `curve_at` in numpy, `allclose` for both branches of `ext_g64` and for `ext_ramp` |
+| 2 | TVs in [0, 1], col 6 = 0 where both weights are 0 | **PASS** — measured [0.0000, 1.0000] over four runs; `ext_ramp`'s weight-0 step has col 6 = 0 and col 4 = 0.023 (the branch is decoded, its distance still measured) |
+| 3 | `"cfg_scale": 3` traces | **PASS** — 300 rows, col 2 = 2.0 throughout, cols 1/3/5 all NaN or 0 as they should be |
+| 4 | `build_trace/yue2-guidance` | **PASS** — 91 cases, 0 failures (83 + 8 new) |
+| 5 | cost | **PASS** — 0.52 ms/row with one branch, 0.75 ms/row with two; see below |
+| — | lifecycle | `ext_life.json`: 190 rows, steps 40–299 with a 70-step gap where both branches were dropped |
+| — | `yue2 song --guidance-trace --artifacts DIR` | **PASS** — full song (1208 frames, entry at 40), 1168 rows beside the FLAC |
+| — | no `--artifacts` / no guidance / `--dump-logits` | **PASS** — one log line each, no file, no error |
+| — | determinism | **PASS** — `ext_g64.json` traced twice: `semantic.npy` *and* `guidance_trace.npy` byte-identical |
+| — | `--guidance-trace --verify-sampler` together | **PASS** — 300 steps matched the stage-5 sampler, same `semantic.npy` |
+
+## 2c. What it costs
+
+| request | untraced | traced | rows | per row |
+|---|---:|---:|---:|---:|
+| `ext.json` (unguided) | 2.21 s | 2.20 s | 0 | — |
+| `ext_cfg3.json` | 2.71 s | 2.86 s | 300 | 0.52 ms (internal), 0.50 ms (wall) |
+| `ext_g64.json` | 5.00 s | 5.18 s | 236 | 0.75 ms (internal), 0.76 ms (wall) |
+
+300 semantic steps each, `--max-semantic 300`. Two softmaxes over 32 769 floats
+per traced step, three when both branches are live — 3–5 % of a guided step, and
+nothing at all when the flag is off.
+
+## 3c. Deviations
+
+| # | what | why |
+|---|---|---|
+| T1 | `guidance_trace.npy` is in neither `plan.json` nor `plan_manifest.json`. | It is a diagnostic of one run, not part of the request the directory reproduces; the manifest is what a reproduction is checked against. |
+| T2 | The flag is on `yue2 batch` too, not only `ar` and `song`. | `run_song` goes through `run_batch`, so the parameter had to exist there; exposing it costs one `else if`. It is per job (`ArJob::trace`), never a `--jobs` file key. |
+| T3 | A job whose artifacts directory is the temporary one `yue2 song` makes for itself traces nothing (one log line). | The trace is only readable beside the artifacts it explains, and that directory is removed when the process exits. |
+| T4 | Column 5 compares argmaxes over the semantic row only, not the whole vocabulary. | Every other column is over that row, and no other id can be drawn. |
+| T5 | `tests/guidance.cpp`'s TV case for `0.5 vs 0.25` is checked to 1e-6, not 1e-9. | Its logits are `float`, as the real rows are; `log 3` in f32 is already 1e-8 off. |
+
+## 4c. Not done / open
+
+- Nothing traces the *abc* phase, which is never guided.
+- The trace holds no ids: it says how far the distributions stand apart, not
+  which tokens moved. `--dump-logits` is still the way to look at one step whole.

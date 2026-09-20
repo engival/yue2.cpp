@@ -1249,6 +1249,69 @@ static int decode_feed(llama_context * ctx, llama_batch & b,
 
 // ------------------------------------------------------------- artifacts ---
 
+// ---- --guidance-trace: what the branches did to a step ----------------------
+// Pure functions on one row of logits, so tests/guidance.cpp checks them on
+// small arrays with no model and no device. They run only when the flag is on.
+
+// One row of guidance_trace.npy. The columns are in README.md.
+static const int TRACE_COLUMNS = 8;
+
+// softmax over `n` logits, in double and with the row's maximum subtracted.
+// Returns log(sum exp(row)) — so `row[i] - the return value` is log p_i, which
+// is where the sampled token's log-probability comes from without going back
+// through the probabilities.
+static double softmax_row(const float * row, int n, std::vector<double> & out)
+{
+	out.assign((size_t) n, 0.0);
+	double top = row[0];
+	for (int i = 1; i < n; i++)
+	{
+		top = (double) row[i] > top ? (double) row[i] : top;
+	}
+	double sum = 0;
+	for (int i = 0; i < n; i++)
+	{
+		out[(size_t) i] = std::exp((double) row[i] - top);
+		sum += out[(size_t) i];
+	}
+	for (int i = 0; i < n; i++)
+	{
+		out[(size_t) i] /= sum;
+	}
+	return top + std::log(sum);
+}
+
+// Total variation: 0.5 * sum |p - q|, 0 for two identical distributions and 1
+// for two that share no mass.
+static double tv_distance(const std::vector<double> & p, const std::vector<double> & q)
+{
+	if (p.size() != q.size())
+	{
+		die("guidance trace: a TV distance between %zu and %zu probabilities",
+		    p.size(), q.size());
+	}
+	double sum = 0;
+	for (size_t i = 0; i < p.size(); i++)
+	{
+		sum += std::fabs(p[i] - q[i]);
+	}
+	return 0.5 * sum;
+}
+
+// The first index holding the row's maximum.
+static int argmax_row(const float * row, int n)
+{
+	int best = 0;
+	for (int i = 1; i < n; i++)
+	{
+		if (row[i] > row[best])
+		{
+			best = i;
+		}
+	}
+	return best;
+}
+
 static json json_request(const Request & r)
 {
 	json out = json::object();
@@ -1369,6 +1432,10 @@ struct Artifacts
 	// null unless the request carried a "semantic_keep": the codes it kept, for
 	// the frame count and the digest plan.json records (SPEC_KEEP §4).
 	const std::vector<int32_t> *       keep     = nullptr;
+	// null unless --guidance-trace traced this song: TRACE_COLUMNS floats per
+	// traced step, written as guidance_trace.npy. A diagnostic, so it is not in
+	// plan.json and not in the manifest.
+	const std::vector<float> *         trace    = nullptr;
 };
 
 static void write_artifacts(const Artifacts & a)
@@ -1396,6 +1463,17 @@ static void write_artifacts(const Artifacts & a)
 	if (a.guidance != nullptr)
 	{
 		write_file_or_die(dir + "guidance.json", dump_py(json_guidance(*a.guidance)));
+	}
+	if (a.trace != nullptr)
+	{
+		const std::vector<int64_t> shape = { (int64_t) (a.trace->size() / TRACE_COLUMNS),
+		                                     (int64_t) TRACE_COLUMNS };
+		const std::string          err   = npy::save((dir + "guidance_trace.npy").c_str(), shape,
+		                                             a.trace->empty() ? nullptr : a.trace->data());
+		if (!err.empty())
+		{
+			die("%s", err.c_str());
+		}
 	}
 	save_i32_or_die(dir + "abc_tokens.npy", std::vector<int32_t>(a.abc_ids.begin(), a.abc_ids.end()));
 	save_i32_or_die(dir + "prefix.npy",     std::vector<int32_t>(a.prefix_sem.begin(), a.prefix_sem.end()));
@@ -2167,6 +2245,11 @@ struct JobState
 	int                                   guided_steps = 0;
 	double                                branch_seconds = 0; // prefilling them
 
+	// --guidance-trace: TRACE_COLUMNS floats per semantic step that had a live
+	// branch, written as guidance_trace.npy. Empty unless the flag is on.
+	std::vector<float>                    trace;
+	double                                trace_seconds = 0;
+
 	// SPEC_KEEP.md, empty unless the request carried a "semantic_keep": the N
 	// leading codes of an earlier render, read at validation time, forced as
 	// history instead of being sampled.
@@ -2235,6 +2318,7 @@ struct Seq
 	// The primary's slot moves when an entry changes the positive prefix, so
 	// `slot` above is not `home` for the whole song.
 	bool                     guided    = false;
+	bool                     traced    = false; // --guidance-trace, and this song is guided
 	size_t                   g_next    = 0;   // the next entry of the plan to take effect
 	int                      g_entry   = -1;  // the entry in force, -1 before the first
 	Branch                   branch[BRANCH_KINDS];
@@ -2276,6 +2360,11 @@ struct Runner
 	bool      verify   = false;
 	long long verified = 0;
 
+	// --guidance-trace: the two distributions a traced step compares, kept here
+	// so that tracing a step allocates nothing after the first one.
+	std::vector<double> trace_p;
+	std::vector<double> trace_q;
+
 	// Batch-level progress, so a driver watching a pipe sees the loop is alive.
 	// Printed from run() at most every PROGRESS_SECONDS, never per step.
 	long long sampled     = 0;   // tokens drawn since the loop started
@@ -2302,6 +2391,7 @@ struct Runner
 	void          guidance_clear(Seq & q);
 	void          fetch_row(Branch & b);
 	const float * blend_row(Seq & q, const float * primary);
+	void          trace_step(Seq & q, const float * primary, llama_token token);
 
 	// SPEC_KEEP §3: the semantic phase entered on an earlier render's codes.
 	void        keep_enter(Seq & q);
@@ -2576,6 +2666,7 @@ void Runner::guidance_enter(Seq & q)
 		return;
 	}
 	q.guided  = true;
+	q.traced  = (*jobs)[q.job].trace;
 	q.g_next  = 0;
 	q.g_entry = -1;
 	q.blend.assign((size_t) n_vocab, 0.0f);
@@ -2602,6 +2693,7 @@ void Runner::guidance_clear(Seq & q)
 		q.branch[k] = Branch();
 	}
 	q.guided  = false;
+	q.traced  = false;
 	q.g_next  = 0;
 	q.g_entry = -1;
 	q.blend.clear();
@@ -2658,6 +2750,73 @@ const float * Runner::blend_row(Seq & q, const float * primary)
 		q.blend[(size_t) (SEM_ROW_FIRST + i)] = acc;
 	}
 	return q.blend.data();
+}
+
+// One row of guidance_trace.npy for the step just drawn: how far each branch
+// stands from the primary, how far the blend moved the distribution, and how
+// surprising the drawn token is to the unguided model. Called after the draw and
+// before apply(), on a guided song only, and it touches neither the RNG nor a
+// row the sampler reads — the flag cannot change what the song sings.
+void Runner::trace_step(Seq & q, const float * primary, llama_token token)
+{
+	if (primary == nullptr)
+	{
+		return;
+	}
+	bool live = false;
+	bool any  = false;
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		live = live || q.branch[k].live;
+		any  = any  || (q.branch[k].live && q.branch[k].weight != 0);
+	}
+	if (!live)
+	{
+		return;
+	}
+
+	JobState &    js    = (*states)[q.job];
+	const double  t0    = now_seconds();
+	const float * b_row = primary + SEM_ROW_FIRST;
+	const double  logz  = softmax_row(b_row, SEM_ROW_LEN, trace_p);
+	const float   na    = std::numeric_limits<float>::quiet_NaN();
+
+	// Columns 1..4 are two per branch, in BranchKind order.
+	static_assert(BRANCH_PREVIOUS == 0 && BRANCH_BLANK == 1 && BRANCH_KINDS == 2,
+	              "the trace columns are laid out in BranchKind order");
+	float row[TRACE_COLUMNS];
+	row[0] = (float) q.step;
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		const Branch & b = q.branch[k];
+		row[1 + k] = b.live ? (float) b.weight : 0.0f;
+		if (!b.live)
+		{
+			row[3 + k] = na;
+			continue;
+		}
+		softmax_row(b.row.data(), SEM_ROW_LEN, trace_q);
+		row[3 + k] = (float) tv_distance(trace_p, trace_q);
+	}
+	// Whether the branch this song pushes away from still wants the same token:
+	// the cheapest reading of "the two prefixes have parted".
+	const Branch & prev = q.branch[BRANCH_PREVIOUS];
+	row[5] = prev.live
+		? (argmax_row(b_row, SEM_ROW_LEN) == argmax_row(prev.row.data(), SEM_ROW_LEN) ? 1.0f : 0.0f)
+		: na;
+	// What the sampler was handed: blend_row leaves the primary's own row when
+	// no live branch carries a weight, and that is a distance of 0.
+	row[6] = 0.0f;
+	if (any)
+	{
+		softmax_row(q.blend.data() + SEM_ROW_FIRST, SEM_ROW_LEN, trace_q);
+		row[6] = (float) tv_distance(trace_p, trace_q);
+	}
+	const int id = (int) token - SEM_ROW_FIRST;
+	row[7] = id >= 0 && id < SEM_ROW_LEN ? (float) ((double) b_row[id] - logz) : na;
+
+	js.trace.insert(js.trace.end(), row, row + TRACE_COLUMNS);
+	js.trace_seconds += now_seconds() - t0;
 }
 
 void Runner::apply(Seq & q, llama_token token)
@@ -2787,7 +2946,13 @@ void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expec
 	// Immediately: the next llama_decode from any slot overwrites this buffer.
 	// The branches were prefilled before this feed, so their rows are in hand
 	// (SPEC_GUIDANCE §4.3).
-	apply(q, sample(q, blend_row(q, llama_get_logits_ith(ctx, q.i_batch))));
+	const float *     primary = llama_get_logits_ith(ctx, q.i_batch);
+	const llama_token token   = sample(q, blend_row(q, primary));
+	if (q.traced)
+	{
+		trace_step(q, primary, token);
+	}
+	apply(q, token);
 }
 
 // One forced stretch of score: tokenized, decoded, and pushed into `history` so
@@ -3497,10 +3662,24 @@ void Runner::finish_job(Seq & q)
 		a.template_text = js.is_template ? js.req.abc_template : std::string();
 		a.guidance      = js.req.has_guidance ? &js.guide : nullptr;
 		a.keep          = js.keep_codes.empty() ? nullptr : &js.keep_codes;
+		a.trace         = (*jobs)[q.job].trace && !js.guide.empty() ? &js.trace : nullptr;
 		write_artifacts(a);
 	}
 	printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
 	       (*jobs)[q.job].artifacts.c_str(), js.abc_ids.size(), codes.size());
+	if ((*jobs)[q.job].trace)
+	{
+		const size_t rows = js.trace.size() / TRACE_COLUMNS;
+		if (js.guide.empty())
+		{
+			printf("%sguidance trace: this request has no guidance, nothing to trace\n",
+			       js.tag.c_str());
+		} else {
+			printf("%sguidance trace: %zu rows x %d in guidance_trace.npy (%.3f ms/row)\n",
+			       js.tag.c_str(), rows, TRACE_COLUMNS,
+			       rows > 0 ? 1000 * js.trace_seconds / (double) rows : 0);
+		}
+	}
 
 	ArResult & r  = (*results)[q.job];
 	r.prefix_sem.assign(js.prefix_sem.begin(), js.prefix_sem.end());
@@ -3650,8 +3829,12 @@ void Runner::run()
 					fetch_row(seqs[i].branch[k]);
 				}
 			}
-			seqs[i].sampled = sample(seqs[i],
-			                         blend_row(seqs[i], llama_get_logits_ith(ctx, seqs[i].i_batch)));
+			const float * primary = llama_get_logits_ith(ctx, seqs[i].i_batch);
+			seqs[i].sampled       = sample(seqs[i], blend_row(seqs[i], primary));
+			if (seqs[i].traced)
+			{
+				trace_step(seqs[i], primary, seqs[i].sampled);
+			}
 		}
 		for (size_t i = 0; i < seqs.size(); i++)
 		{
@@ -3912,7 +4095,7 @@ static void usage(const char * argv0)
 	        "        [--seed N] [--cot full|melody|off] [--gpu N] [--cpu]\n"
 	        "        [--threads N] [--dump-logits FILE.npy] [--greedy]\n"
 	        "        [--max-abc N] [--max-semantic N] [--continue-on-error]\n"
-	        "        [--verify-sampler]\n"
+	        "        [--verify-sampler] [--guidance-trace]\n"
 	        "        [--prefix-only]   the request carries its \"abc\": write prefix.npy, decode nothing\n", argv0, argv0);
 }
 
@@ -4063,6 +4246,8 @@ ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
 			p.continue_on_error = true;
 		} else if (a == "--verify-sampler") {
 			p.verify_sampler = true;
+		} else if (a == "--guidance-trace") {
+			p.guidance_trace = true;
 		} else if (a == "--prefix-only") {
 			p.prefix_only = true;
 		} else if (a == "--max-abc") {
@@ -4611,6 +4796,11 @@ int run_ar(const ArParams & p, ArResult * out)
 {
 	if (!p.dump_logits.empty())
 	{
+		if (p.guidance_trace)
+		{
+			printf("--guidance-trace: --dump-logits decodes one step into no artifacts "
+			       "directory; nothing traced\n");
+		}
 		return run_ar_dump(p);
 	}
 
@@ -4636,6 +4826,7 @@ int run_ar(const ArParams & p, ArResult * out)
 		job.artifacts    = p.artifacts;
 		job.has_seed     = p.has_seed;
 		job.seed         = p.seed;
+		job.trace        = p.guidance_trace;
 		jobs.push_back(job);
 		bp.parallel = 1;
 	} else {
@@ -4645,17 +4836,16 @@ int run_ar(const ArParams & p, ArResult * out)
 			die("%s", err.c_str());
 		}
 		bp.parallel = p.parallel;
-		// A --seed on the command line is the default for jobs that name none.
-		if (p.has_seed)
+		// A --seed on the command line is the default for jobs that name none;
+		// --guidance-trace is for every job of the batch that is guided.
+		for (size_t i = 0; i < jobs.size(); i++)
 		{
-			for (size_t i = 0; i < jobs.size(); i++)
+			if (p.has_seed && !jobs[i].has_seed)
 			{
-				if (!jobs[i].has_seed)
-				{
-					jobs[i].has_seed = true;
-					jobs[i].seed     = p.seed;
-				}
+				jobs[i].has_seed = true;
+				jobs[i].seed     = p.seed;
 			}
+			jobs[i].trace = p.guidance_trace;
 		}
 	}
 

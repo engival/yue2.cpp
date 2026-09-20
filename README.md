@@ -246,6 +246,37 @@ keeps only `cfg_scale`, so it stays loadable by the reference. Guidance needs
 `--parallel 1` (the branches are the other KV streams) and does not combine with
 `"abc_template"` yet. Only the semantic phase is guided; the score phase never is.
 
+**What the push actually did: `--guidance-trace`.** A flag on `yue2 ar`,
+`yue2 song` and `yue2 batch`. A guided job run with it and `--artifacts DIR` writes
+`DIR/guidance_trace.npy` beside the rest: float32, one row per semantic step that
+had a live branch, eight columns. It costs about 0.5–0.8 ms a step (two or three
+softmaxes over the 32 769 ids the semantic sampler can visit) and changes
+nothing else — the same request, seed and card sing the same `semantic.npy`
+traced or not. Without `--artifacts`, or on a request with no guidance, it writes
+nothing and says so.
+
+```python
+import numpy as np
+t = np.load("DIR/guidance_trace.npy")      # [steps, 8] float32
+
+step      = t[:, 0]        # the semantic step; 25 = 1 s of audio
+w_prev    = t[:, 1]        # the weights that were in force, 0 where the
+w_blank   = t[:, 2]        #   branch is not live (its curve had dropped it)
+tv_prev   = t[:, 3]        # how far each branch's own distribution stands
+tv_blank  = t[:, 4]        #   from the positive one — NaN where not live
+same_top  = t[:, 5]        # 1 where `previous` still wants the same token
+tv_blend  = t[:, 6]        # how far the blend moved what the sampler saw
+logp      = t[:, 7]        # log p of the token drawn, under the *unguided* model
+
+print("pushed hardest at frame", int(step[tv_blend.argmax()]),
+      "- the unguided model gave that token", float(np.exp(logp[tv_blend.argmax()])))
+print("frames where the branches had parted:", int(np.nansum(same_top == 0)))
+```
+
+A `tv_blend` near 1 with a very negative `logp` is a step the guidance carried
+on its own — musically the interesting ones, and, if a whole run looks like
+that, the sign that the weights are too high for the lyrics to survive.
+
 **Keep the start of an earlier render: `semantic_keep`.** A guided song is still
 sampled from frame 0, so feeding the same score back gives a *new* performance.
 `"semantic_keep"` does the opposite — it forces the codes of a render you already
