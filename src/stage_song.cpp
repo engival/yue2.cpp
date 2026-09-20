@@ -111,13 +111,24 @@ std::string request_tags(const std::string & request_path, flac::Tags & tags)
 	return "";
 }
 
+// --opus-bitrate, the same range for `song` and for `batch`.
+int parse_opus_bitrate(const char * value)
+{
+	const int kbps = atoi(value);
+	if (kbps < opus::BITRATE_MIN || kbps > opus::BITRATE_MAX)
+	{
+		die("--opus-bitrate must be between %d and %d kbit/s", opus::BITRATE_MIN, opus::BITRATE_MAX);
+	}
+	return kbps;
+}
+
 void usage(const char * argv0)
 {
 	fprintf(stderr,
-	        "usage: %s --request R.json --out X.flac [--artifacts DIR] [--seed N]\n"
+	        "usage: %s --request R.json --out X.flac|X.opus [--artifacts DIR] [--seed N]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n"
-	        "        [--guidance-trace] [--no-tags]\n", argv0);
+	        "        [--guidance-trace] [--no-tags] [--opus-bitrate 160]\n", argv0);
 }
 
 void usage_batch(const char * argv0)
@@ -128,6 +139,7 @@ void usage_batch(const char * argv0)
 	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 32]\n"
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
 	        "        [--continue-on-error] [--guidance-trace] [--no-tags]\n"
+	        "        [--opus-bitrate 160]\n"
 	        "\n"
 	        "jobs.json is an array of { \"request\", \"out\", \"artifacts\", \"seed\", \"noise\" };\n"
 	        "request and out are required and paths are relative to the working directory.\n",
@@ -396,6 +408,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			p.guidance_trace = true;
 		} else if (a == "--no-tags") {
 			p.no_tags = true;
+		} else if (a == "--opus-bitrate") {
+			p.opus_bitrate = parse_opus_bitrate(need(argc, argv, i));
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
@@ -413,6 +427,12 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 	{
 		usage(argv0);
 		die("--request and --out are required");
+	}
+	// An Opus-less build refuses the output name here, before any model loads.
+	const std::string opus_err = opus::check_support(p.out);
+	if (!opus_err.empty())
+	{
+		die("%s", opus_err.c_str());
 	}
 	if (p.steps < 1)
 	{
@@ -472,6 +492,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			p.guidance_trace = true;
 		} else if (a == "--no-tags") {
 			p.no_tags = true;
+		} else if (a == "--opus-bitrate") {
+			p.opus_bitrate = parse_opus_bitrate(need(argc, argv, i));
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
@@ -509,6 +531,17 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 {
 	ggml_time_init();
 	const double t_batch0 = now_seconds();
+
+	// The jobs file has just been read and nothing has been loaded yet: an
+	// Opus-less build turns an .opus output away here, not after the render.
+	for (const ArJob & job : jobs)
+	{
+		const std::string err = opus::check_support(job.out);
+		if (!err.empty())
+		{
+			die("%s", err.c_str());
+		}
+	}
 
 	// ggml-vulkan reads the exactness switch once per device init, and the AR
 	// inits the device first — so --nar-f32 has to be set here, not inside
@@ -700,6 +733,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		vae.gpu           = p.gpu;
 		vae.threads       = p.threads;
 		vae.vk_f16_matmul = nar.vk_f16_matmul;
+		vae.opus_bitrate  = p.opus_bitrate;
 		if (!p.no_tags)
 		{
 			// Finds the artifacts directory a FLAC came from without saying what is in it.
@@ -763,6 +797,7 @@ int run_song(const SongParams & p)
 	bp.nar_f32   = p.nar_f32;
 	bp.guidance_trace = p.guidance_trace;
 	bp.no_tags   = p.no_tags;
+	bp.opus_bitrate = p.opus_bitrate;
 
 	ArJob job;
 	job.request_path = p.request_path;

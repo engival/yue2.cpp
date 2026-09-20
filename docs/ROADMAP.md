@@ -48,6 +48,12 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   exact) indistinguishable, and on the AMD the exact path is not faster — so
   exact-F32 is a numeric reference reached through the standalone `yue2 vae`,
   and asking `song`/`batch` for it is an error, not a downgrade. SPEC_SINGLE §2.2.
+- Opus output: an output named `X.opus` is encoded with libopusenc at
+  `--opus-bitrate` (default 160 kbit/s) in `song`, `batch` and `vae`, tags and
+  all. Optional at build time (`-DYUE2_OPUS`, default on when pkg-config finds
+  `libopusenc`); a build without it refuses the name while parsing arguments.
+  The exact and regression paths stay FLAC, and a kept `latent.npy` decodes the
+  lossless file again at any time.
 - Accuracy: VAE 117 dB vs torch CPU; AR prefix + greedy bit-identical; NAR fast
   path 29 dB (AMD) / 33 dB (Arc) from the f32 reference — same class as torch's
   own bf16 (35 dB), inaudible in A/B.

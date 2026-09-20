@@ -4,6 +4,8 @@
 
 #include "stage_ar.hpp"
 
+#include "common/opus.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -25,6 +27,7 @@ struct SongParams
 	bool        nar_f32  = false;
 	bool        guidance_trace = false;   // --guidance-trace, needs --artifacts to land in
 	bool        no_tags  = false;   // --no-tags: the FLAC carries no Vorbis comments
+	int         opus_bitrate = opus::BITRATE_DEFAULT;   // --opus-bitrate, kbit/s, for an .opus --out
 };
 
 // What `yue2 batch` takes for the whole list; everything that differs per song
@@ -50,6 +53,7 @@ struct BatchParams
 	bool        continue_on_error = false;
 	bool        guidance_trace = false;   // per job: only one with its own artifacts traces
 	bool        no_tags  = false;
+	int         opus_bitrate = opus::BITRATE_DEFAULT;
 };
 
 SongParams  parse_song_args (const char * argv0, int argc, char ** argv);

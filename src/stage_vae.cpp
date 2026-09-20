@@ -11,6 +11,7 @@
 #include "common/device.hpp"
 #include "common/flac.hpp"
 #include "common/gguf_kv.hpp"
+#include "common/opus.hpp"
 #include "common/util.hpp"
 
 #include "npy.hpp"
@@ -470,8 +471,8 @@ struct Runner
 static void usage(const char * argv0)
 {
 	fprintf(stderr,
-		"usage: %s -m vae.gguf -i latent.npy -o out.wav|out.flac\n"
-		"           [--gpu N] [--cpu] [--threads N]\n"
+		"usage: %s -m vae.gguf -i latent.npy -o out.wav|out.flac|out.opus\n"
+		"           [--gpu N] [--cpu] [--threads N] [--opus-bitrate 160]\n"
 		"           [--core-frames 256] [--halo-frames 16] [--im2col f32|f16]\n"
 		"           [--frames N] [--npy out.npy] [--full] [--vk-f16-matmul]\n"
 		"           [--probe] [--probe-dir DIR]   # debug: dump intermediates\n", argv0);
@@ -506,6 +507,12 @@ VaeParams parse_vae_args(const char * argv0, int argc, char ** argv)
 			p.core_frames = atoi(need(argc, argv, i));
 		} else if (a == "--halo-frames") {
 			p.halo_frames = atoi(need(argc, argv, i));
+		} else if (a == "--opus-bitrate") {
+			p.opus_bitrate = atoi(need(argc, argv, i));
+			if (p.opus_bitrate < opus::BITRATE_MIN || p.opus_bitrate > opus::BITRATE_MAX)
+			{
+				die("--opus-bitrate must be between %d and %d kbit/s", opus::BITRATE_MIN, opus::BITRATE_MAX);
+			}
 		} else if (a == "--vk-f16-matmul") {
 			p.vk_f16_matmul = true;
 		} else if (a == "--probe") {
@@ -545,6 +552,13 @@ VaeParams parse_vae_args(const char * argv0, int argc, char ** argv)
 	{
 		usage(argv0);
 		die("at least one of -o / --npy is required");
+	}
+	// An Opus-less build says so here rather than after the decode, with the
+	// output name already in hand and nothing written yet.
+	const std::string opus_err = opus::check_support(p.output);
+	if (!opus_err.empty())
+	{
+		die("%s", opus_err.c_str());
 	}
 	if (p.core_frames < 1)
 	{
@@ -729,12 +743,20 @@ int run_vae(const VaeParams & p)
 		const std::string path = atomic ? p.output + ".partial" : p.output;
 
 		// .flac goes through libFLAC as 24-bit PCM (what soundfile wrote for the
-		// reference pipeline); anything else stays float WAV.
-		const std::string e = ends_with(p.output, ".flac")
-			? flac::save_f32_24(path.c_str(), audio.data(),
-				model.cfg.out_channels, total, model.cfg.sample_rate, p.tags)
-			: wav::save_f32(path.c_str(), audio.data(),
+		// reference pipeline), .opus through libopusenc at --opus-bitrate;
+		// anything else stays float WAV.
+		std::string e;
+		if (ends_with(p.output, ".flac"))
+		{
+			e = flac::save_f32_24(path.c_str(), audio.data(),
+				model.cfg.out_channels, total, model.cfg.sample_rate, p.tags);
+		} else if (opus::wanted(p.output)) {
+			e = opus::save_f32(path.c_str(), audio.data(),
+				model.cfg.out_channels, total, model.cfg.sample_rate, p.opus_bitrate, p.tags);
+		} else {
+			e = wav::save_f32(path.c_str(), audio.data(),
 				model.cfg.out_channels, total, model.cfg.sample_rate);
+		}
 		if (!e.empty())
 		{
 			if (atomic)

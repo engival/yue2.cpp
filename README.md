@@ -34,7 +34,8 @@ has the lineage.
 ## Quick start
 
 From a fresh clone to a FLAC. Needs libFLAC 1.5 (`pkg-config flac`), a Vulkan
-driver + `glslc`, and python3. All paths below are relative to the repo root.
+driver + `glslc`, and python3; libopusenc is optional and adds `.opus` output.
+All paths below are relative to the repo root.
 
 **Tested on** one box only: Slackware64-current (Linux), an AMD Radeon RX 7900
 XTX (RADV) and an Intel Arc Pro B70 (ANV), both through ggml's Vulkan backend.
@@ -524,6 +525,21 @@ request names, plus the words that are sung:
 - `--no-tags` writes none: the file as earlier versions made it. The standalone
   `yue2 vae` has no request and writes none.
 
+**Opus output.** `song`, `batch` and `vae` pick the format from the output name,
+so `--out X.opus` writes an Ogg Opus file instead of FLAC (and `X.wav` a float
+WAV, as before). `--opus-bitrate KBPS` sets the rate, 16 to 510, default 160; the
+tags above are written as Vorbis comments there too, and with `--no-tags`
+libopusenc still puts its own vendor string in the file. Opus is lossy, so it is
+for the copy you listen to or upload, never for the exact and regression paths —
+those stay FLAC. Nothing is lost by choosing it late either: keep the render's
+`--artifacts` directory and `yue2 vae -m yue2-vae-f32.gguf -i DIR/latent.npy -o
+X.flac` decodes the lossless file again whenever you want it.
+
+Opus support is optional at build time: it needs libopusenc (pkg-config
+`libopusenc`), CMake reports which way it went (`yue2: Opus output ...`), and a
+build without it — or one configured with `-DYUE2_OPUS=OFF` — refuses an `.opus`
+output name while it parses its arguments, before any model loads.
+
 `yue2 noise --seed N --frames T -o noise.npy` exposes the NAR's noise generator
 (`std::mt19937_64` + Box–Muller, no `<random>` distribution, so one seed gives
 the same bytes everywhere); torch seed compatibility is explicitly not a goal.
@@ -600,7 +616,9 @@ build/yue2-vae -m yue2-vae-f32.gguf -i latent.npy -o song.wav --device vulkan --
 (default 0) and never falls back to the CPU: `--cpu` (= `--device cpu`) is the
 only way onto it, and a missing Vulkan device is an error. An `-o` ending in `.flac` is written as
 24-bit FLAC through libFLAC instead of float WAV; its integer samples are
-identical to what `soundfile`'s `PCM_24` wrote for the reference pipeline.
+identical to what `soundfile`'s `PCM_24` wrote for the reference pipeline. One
+ending in `.opus` goes through libopusenc at `--opus-bitrate KBPS` (default 160),
+when the build has it.
 
 `latent.npy` is the `[T, 64]` float32 array the reference pipeline writes with
 `--artifacts` (also accepts `[1, 64, T]`). Output is 48 kHz stereo float WAV,

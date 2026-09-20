@@ -20,11 +20,11 @@
 static void usage()
 {
 	fprintf(stderr,
-	        "usage: yue2 song  --request R.json --out X.flac [--artifacts DIR] ...\n"
+	        "usage: yue2 song  --request R.json --out X.flac|X.opus [--artifacts DIR] ...\n"
 	        "       yue2 batch --jobs jobs.json [--parallel N] [--summary FILE] ...\n"
 	        "       yue2 ar    -m AR.gguf --request R.json --artifacts DIR ...\n"
 	        "       yue2 nar   --ar AR.gguf -m NAR.gguf --artifacts DIR -o latent.npy ...\n"
-	        "       yue2 vae   -m VAE.gguf -i latent.npy -o out.flac ...\n"
+	        "       yue2 vae   -m VAE.gguf -i latent.npy -o out.flac|out.opus ...\n"
 	        "       yue2 noise --seed N --frames T -o noise.npy\n"
 	        "\n"
 	        "`yue2 <stage> --help` prints that stage's own flags.\n");

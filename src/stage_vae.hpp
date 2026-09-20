@@ -3,10 +3,11 @@
 
 #include "ggml.h"
 
+#include "common/opus.hpp"
+#include "common/tags.hpp"
+
 #include <cstdint>
 #include <string>
-#include <utility>
-#include <vector>
 
 struct VaeParams
 {
@@ -23,7 +24,8 @@ struct VaeParams
 	int64_t   frames      = 0;     // 0 = all
 	bool      full        = false;
 	bool      vk_f16_matmul = false;
-	std::vector<std::pair<std::string, std::string>> tags;   // Vorbis comments for a .flac output; `yue2 song` fills them
+	int       opus_bitrate  = opus::BITRATE_DEFAULT;   // --opus-bitrate, kbit/s, for an .opus output
+	vorbis::Tags tags;   // Vorbis comments for a .flac or .opus output; `yue2 song` fills them
 };
 
 VaeParams parse_vae_args(const char * argv0, int argc, char ** argv);

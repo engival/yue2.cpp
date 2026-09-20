@@ -30,12 +30,33 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac)
 
+# libopusenc is optional: with it, an output named X.opus is encoded as Ogg Opus;
+# without it, the stages refuse such a name while parsing their arguments.
+option(YUE2_OPUS "Opus output via libopusenc when it is installed" ON)
+if(YUE2_OPUS)
+	pkg_check_modules(OPUSENC IMPORTED_TARGET libopusenc)
+endif()
+if(YUE2_OPUS AND OPUSENC_FOUND)
+	message(STATUS "yue2: Opus output enabled (libopusenc ${OPUSENC_VERSION})")
+else()
+	message(STATUS "yue2: Opus output disabled (no libopusenc; FLAC and WAV only)")
+endif()
+
+# Everything that compiles src/stage_vae.cpp needs the writer and its flag.
+function(yue2_add_opus target)
+	if(YUE2_OPUS AND OPUSENC_FOUND)
+		target_compile_definitions(${target} PRIVATE YUE2_HAVE_OPUS)
+		target_link_libraries(${target} PRIVATE PkgConfig::OPUSENC)
+	endif()
+endfunction()
+
 # Each stage is one translation unit with its own Model/Builder/Graph behind an
 # anonymous namespace, so the per-stage binaries and `yue2` can share the source.
 add_executable(yue2-vae src/yue2-vae.cpp src/stage_vae.cpp)
 target_include_directories(yue2-vae PRIVATE src)
 target_link_libraries(yue2-vae PRIVATE ggml PkgConfig::FLAC)
 target_compile_options(yue2-vae PRIVATE ${YUE2_WARN_FLAGS})
+yue2_add_opus(yue2-vae)
 
 # vendor::hash gives us llama.cpp's SHA-256 (hash_sha256_hex) and vendor::nlohmann
 # the JSON header — both are built unconditionally by llama.cpp/vendor.
@@ -58,6 +79,7 @@ add_executable(yue2 src/yue2.cpp src/stage_song.cpp
 target_include_directories(yue2 PRIVATE src)
 target_link_libraries(yue2 PRIVATE llama ggml vendor::hash vendor::nlohmann PkgConfig::FLAC)
 target_compile_options(yue2 PRIVATE ${YUE2_WARN_FLAGS})
+yue2_add_opus(yue2)
 
 # Stage 6: the sparse sampler's differential test (SPEC_SAMPLER.md §4.2). It
 # includes src/stage_ar.cpp to reach both samplers in its anonymous namespace,

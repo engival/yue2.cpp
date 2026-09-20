@@ -2,20 +2,21 @@
 // PCM_24 produced for the reference pipeline. SPEC_SINGLE.md §2.5.
 #pragma once
 
+#include "tags.hpp"
+
 #include <FLAC/metadata.h>
 #include <FLAC/stream_encoder.h>
 
 #include <cmath>
 #include <cstdint>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace flac
 {
 
 // Vorbis comments, FLAC's native tags: NAME=value, the value UTF-8.
-using Tags = std::vector<std::pair<std::string, std::string>>;
+using Tags = vorbis::Tags;
 
 // "" when libFLAC will take the pair: the name printable ASCII without '=', the value UTF-8.
 inline std::string check_tag(const std::string & name, const std::string & value)
