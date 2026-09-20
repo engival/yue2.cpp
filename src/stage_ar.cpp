@@ -87,6 +87,89 @@ static Sampling sampling_semantic()
 	return s;
 }
 
+// -------------------------------------------------------------- guidance ---
+
+// SPEC_GUIDANCE.md. The semantic phase can be decoded beside up to two negative
+// branches, all three conditioned on the same generated history:
+//
+//	L = B + sum_i w_i(t) * (B - N_i)
+//
+// `previous` is the positive prefix that was in force before the entry opened
+// it, `blank` is the reference's negative prefix (§2.2). Each carries a weight
+// curve in frames after its entry's frame; 25 frames = 1 s of audio.
+enum BranchKind { BRANCH_PREVIOUS = 0, BRANCH_BLANK = 1, BRANCH_KINDS = 2 };
+
+static const char * branch_name(int kind)
+{
+	return kind == BRANCH_PREVIOUS ? "previous" : "blank";
+}
+
+// What a keyframe's weight may be, and how far out a keyframe may sit. The
+// offset ceiling is only there to keep the arithmetic in int range; a curve that
+// reaches past the semantic phase is legal and simply never gets there.
+static const double GUIDANCE_MAX_WEIGHT = 20.0;
+static const int    GUIDANCE_MAX_OFFSET = 1000000;
+
+struct Keyframe
+{
+	int    offset = 0;   // frames after the entry's frame
+	double weight = 0;
+};
+
+struct GuidanceEntry
+{
+	int                   frame     = 0;
+	bool                  has_style = false;
+	std::string           style;               // the tags of the new positive prefix
+	bool                  has[BRANCH_KINDS]  = { false, false };
+	std::vector<Keyframe> curve[BRANCH_KINDS];
+	bool                  reached   = false;   // the decode loop got this far
+};
+
+// The curve's weight `off` frames into its entry: linear between keyframes, the
+// first weight before the first and the last weight after the last. Two
+// keyframes at one offset are a step, and the later one wins at that offset —
+// which is what the `off <= kf[i].offset` return gives, since the scan below
+// stops on the *last* keyframe at or before `off` (§2.3).
+static double curve_at(const std::vector<Keyframe> & kf, int off)
+{
+	size_t i = 0;
+	while (i + 1 < kf.size() && kf[i + 1].offset <= off)
+	{
+		i++;
+	}
+	if (off <= kf[i].offset || i + 1 == kf.size())
+	{
+		return kf[i].weight;
+	}
+	const double span = kf[i + 1].offset - kf[i].offset;
+	return kf[i].weight + (kf[i + 1].weight - kf[i].weight) * ((off - kf[i].offset) / span);
+}
+
+// Is the curve non-zero anywhere at or after `off`? A branch whose curve is not
+// is dropped and stops being decoded — that is what keeps guidance's cost to the
+// transition window (§4.3). The pieces are linear, so a piece whose two ends are
+// both zero is zero throughout and the ends are all that has to be looked at.
+static bool curve_needed_from(const std::vector<Keyframe> & kf, int off)
+{
+	if (kf.back().weight != 0)
+	{
+		return true;
+	}
+	for (size_t i = 0; i + 1 < kf.size(); i++)
+	{
+		if (kf[i + 1].offset < off)
+		{
+			continue;
+		}
+		if (curve_at(kf, std::max(off, kf[i].offset)) != 0 || kf[i + 1].weight != 0)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 struct Request
 {
 	std::string style;
@@ -99,6 +182,11 @@ struct Request
 	std::string abc_template;
 	bool        has_cfg    = false;
 	double      cfg_scale  = 1.0;
+	bool        has_guidance = false;             // "guidance": SPEC_GUIDANCE.md
+	std::vector<GuidanceEntry> guidance;
+	bool        has_keep   = false;               // "semantic_keep": SPEC_KEEP.md
+	std::string keep_file;                        // a semantic.npy of an earlier render
+	int         keep_frames = 0;                  // N, how many of its leading codes to keep
 	std::string id         = "song";
 
 	std::string text() const
@@ -106,6 +194,42 @@ struct Request
 		return std::string(instruction(cot)) + "\n[Tags]\n" + style + "\n[Lyrics]\n" + lyrics + "\n";
 	}
 };
+
+// protocol.SongRequest.guidance: the effective cfg scalar, 1.01 for cot=off.
+static double cfg_scalar(const Request & r)
+{
+	return r.has_cfg ? r.cfg_scale : (r.cot == "off" ? 1.01 : 1.0);
+}
+
+// Either request form asks for branches beside the positive sequence.
+static bool is_guided(const Request & r)
+{
+	return r.has_guidance || cfg_scalar(r) != 1.0;
+}
+
+// The entries the decode loop runs, so that both request forms are one
+// mechanism: plain `cfg_scale = c` is the blank branch live from semantic step 0
+// with the constant weight c - 1 (SPEC_GUIDANCE §2.2).
+static std::vector<GuidanceEntry> guidance_plan(const Request & r)
+{
+	if (r.has_guidance)
+	{
+		return r.guidance;
+	}
+	std::vector<GuidanceEntry> out;
+	const double               c = cfg_scalar(r);
+	if (c != 1.0)
+	{
+		GuidanceEntry g;
+		Keyframe      k;
+		k.offset             = 0;
+		k.weight             = c - 1.0;
+		g.has[BRANCH_BLANK]  = true;
+		g.curve[BRANCH_BLANK].push_back(k);
+		out.push_back(g);
+	}
+	return out;
+}
 
 // ------------------------------------------------------------------ utils ---
 
@@ -1153,9 +1277,57 @@ static json json_timing(const GenStats & st)
 	out["content_tokens"]  = st.content_tokens;
 	out["output_tps"]      = st.output_tps;
 	out["prefix_tokens"]   = st.prefix_tokens;
-	out["cfg_branches"]    = 1;
+	// SPEC_GUIDANCE §3: the most sequences this song ever decoded at once, the
+	// steps that had more than one, and what prefilling the branches cost.
+	out["cfg_branches"]            = st.cfg_branches;
+	out["guided_steps"]            = st.guided_steps;
+	out["branch_prefill_seconds"]  = st.branch_prefill_seconds;
+	// SPEC_KEEP §4: the leading codes this song did not sample, and their cost.
+	out["kept_frames"]             = st.kept_frames;
+	out["keep_prefill_seconds"]    = st.keep_prefill_seconds;
 	out["execution"]       = "eager";
 	out["attention"]       = "llama.cpp";
+	return out;
+}
+
+// The guidance plan as the artifacts record it: the request's own block, plus
+// whether the decode loop ever got to each entry (SPEC_GUIDANCE §3).
+static json json_guidance(const std::vector<GuidanceEntry> & guide)
+{
+	json out = json::array();
+	for (size_t i = 0; i < guide.size(); i++)
+	{
+		const GuidanceEntry & g = guide[i];
+		json                  e = json::object();
+		e["frame"] = g.frame;
+		if (g.has_style)
+		{
+			e["style"] = g.style;
+		}
+		json against = json::object();
+		for (int k = 0; k < BRANCH_KINDS; k++)
+		{
+			if (!g.has[k])
+			{
+				continue;
+			}
+			json curve = json::array();
+			for (size_t c = 0; c < g.curve[k].size(); c++)
+			{
+				json kf = json::array();
+				kf.push_back(g.curve[k][c].offset);
+				kf.push_back(g.curve[k][c].weight);
+				curve.push_back(kf);
+			}
+			against[branch_name(k)] = curve;
+		}
+		if (!against.empty())
+		{
+			e["against"] = against;
+		}
+		e["reached"] = g.reached;
+		out.push_back(e);
+	}
 	return out;
 }
 
@@ -1191,6 +1363,12 @@ struct Artifacts
 	std::string              abc_text;
 	bool                     have_abc_text = false;
 	std::string              template_text;     // "" unless the request was a template
+	// null unless the request carried a "guidance" block; a plain `cfg_scale`
+	// is in request.json and needs no file of its own (SPEC_GUIDANCE §3).
+	const std::vector<GuidanceEntry> * guidance = nullptr;
+	// null unless the request carried a "semantic_keep": the codes it kept, for
+	// the frame count and the digest plan.json records (SPEC_KEEP §4).
+	const std::vector<int32_t> *       keep     = nullptr;
 };
 
 static void write_artifacts(const Artifacts & a)
@@ -1213,6 +1391,12 @@ static void write_artifacts(const Artifacts & a)
 	{
 		write_file_or_die(dir + "template.abc", a.template_text);
 	}
+	// Not in request.json, for the same reason "abc_template" is not: it has to
+	// stay loadable by the reference's SongRequest(**request.json).
+	if (a.guidance != nullptr)
+	{
+		write_file_or_die(dir + "guidance.json", dump_py(json_guidance(*a.guidance)));
+	}
 	save_i32_or_die(dir + "abc_tokens.npy", std::vector<int32_t>(a.abc_ids.begin(), a.abc_ids.end()));
 	save_i32_or_die(dir + "prefix.npy",     std::vector<int32_t>(a.prefix_sem.begin(), a.prefix_sem.end()));
 	save_i32_or_die(dir + "semantic.npy",   a.codes);
@@ -1227,6 +1411,20 @@ static void write_artifacts(const Artifacts & a)
 		plan["prefix"]    = json_int_array(a.prefix_sem);
 		plan["abc_ids"]   = json_int_array(a.abc_ids);
 		plan["abc"]       = a.have_abc_text ? json(a.abc_text) : json(nullptr);
+		if (a.guidance != nullptr)
+		{
+			plan["guidance"] = json_guidance(*a.guidance);
+		}
+		// What of this song came from an earlier render, and enough of a digest
+		// to tell which. The path is deliberately not here: an artifacts
+		// directory has to stay relocatable and carry no local paths (§4).
+		if (a.keep != nullptr)
+		{
+			json keep     = json::object();
+			keep["frames"] = (int) a.keep->size();
+			keep["sha256"] = hash_sha256_hex(a.keep->data(), a.keep->size() * sizeof(int32_t));
+			plan["semantic_keep"] = keep;
+		}
 		write_file_or_die(dir + "plan.json", dump_py(plan));
 	}
 
@@ -1239,6 +1437,10 @@ static void write_artifacts(const Artifacts & a)
 		if (!a.template_text.empty())
 		{
 			names.push_back("template.abc");
+		}
+		if (a.guidance != nullptr)
+		{
+			names.push_back("guidance.json");
 		}
 		json manifest = json::object();
 		for (size_t i = 0; i < names.size(); i++)
@@ -1263,13 +1465,283 @@ static int parse_positive_arg(const char * name, const char * text)
 	return (int) value;
 }
 
+// One `[offset, weight]` list. SPEC_GUIDANCE §2.3: non-empty, offsets
+// non-decreasing and >= 0, weights finite and within +-GUIDANCE_MAX_WEIGHT.
+static std::string parse_curve(const json & v, const char * what, std::vector<Keyframe> & out)
+{
+	if (!v.is_array() || v.empty())
+	{
+		return strf("\"%s\" must be a non-empty list of [offset, weight] pairs", what);
+	}
+	for (size_t i = 0; i < v.size(); i++)
+	{
+		const json & kf = v[i];
+		if (!kf.is_array() || kf.size() != 2 || !kf[0].is_number_integer() || !kf[1].is_number())
+		{
+			return strf("\"%s\" keyframe %zu must be [offset, weight]", what, i + 1);
+		}
+		Keyframe k;
+		const long long offset = kf[0].get<long long>();
+		if (offset < 0 || offset > GUIDANCE_MAX_OFFSET)
+		{
+			return strf("\"%s\" keyframe %zu: offset must be in [0, %d] frames",
+			            what, i + 1, GUIDANCE_MAX_OFFSET);
+		}
+		k.offset = (int) offset;
+		k.weight = kf[1].get<double>();
+		if (!std::isfinite(k.weight) || std::fabs(k.weight) > GUIDANCE_MAX_WEIGHT)
+		{
+			return strf("\"%s\" keyframe %zu: weight must be finite and within +-%g",
+			            what, i + 1, GUIDANCE_MAX_WEIGHT);
+		}
+		if (!out.empty() && k.offset < out.back().offset)
+		{
+			return strf("\"%s\" keyframe %zu: offsets must not decrease", what, i + 1);
+		}
+		out.push_back(k);
+	}
+	return "";
+}
+
+// The "guidance" block. New in stage 7, so it is strict: an unknown key inside
+// an entry or inside "against" is an error rather than something ignored.
+static std::string parse_guidance(const json & v, std::vector<GuidanceEntry> & out)
+{
+	if (!v.is_array() || v.empty())
+	{
+		return "must be a non-empty list of entries";
+	}
+	for (size_t i = 0; i < v.size(); i++)
+	{
+		const json & e = v[i];
+		if (!e.is_object())
+		{
+			return strf("entry %zu is not an object", i + 1);
+		}
+		GuidanceEntry g;
+		bool          has_frame = false;
+		for (json::const_iterator it = e.begin(); it != e.end(); ++it)
+		{
+			const std::string & key = it.key();
+			if (key == "frame")
+			{
+				if (!it.value().is_number_integer() || it.value().get<long long>() < 0 ||
+				    it.value().get<long long>() > CONTEXT)
+				{
+					return strf("entry %zu: \"frame\" must be an integer in [0, %d]",
+					            i + 1, CONTEXT);
+				}
+				g.frame   = it.value().get<int>();
+				has_frame = true;
+			} else if (key == "style") {
+				if (!it.value().is_string())
+				{
+					return strf("entry %zu: \"style\" must be a string", i + 1);
+				}
+				g.has_style = true;
+				g.style     = it.value().get<std::string>();
+			} else if (key == "against") {
+				if (!it.value().is_object() || it.value().empty())
+				{
+					return strf("entry %zu: \"against\" must be a non-empty object "
+					            "(previous, blank)", i + 1);
+				}
+				for (json::const_iterator a = it.value().begin(); a != it.value().end(); ++a)
+				{
+					const int kind = a.key() == "previous" ? BRANCH_PREVIOUS
+					                 : a.key() == "blank"   ? BRANCH_BLANK : -1;
+					if (kind < 0)
+					{
+						return strf("entry %zu: \"against\": unknown branch \"%s\" "
+						            "(previous, blank)", i + 1, a.key().c_str());
+					}
+					const std::string err = parse_curve(a.value(), a.key().c_str(),
+					                                    g.curve[kind]);
+					if (!err.empty())
+					{
+						return strf("entry %zu: \"against\": %s", i + 1, err.c_str());
+					}
+					g.has[kind] = true;
+				}
+			} else {
+				return strf("entry %zu: unknown key \"%s\" (frame, style, against)",
+				            i + 1, key.c_str());
+			}
+		}
+		if (!has_frame)
+		{
+			return strf("entry %zu needs a \"frame\"", i + 1);
+		}
+		out.push_back(g);
+	}
+	return "";
+}
+
+// The "semantic_keep" block (SPEC_KEEP §2): the start of an earlier render,
+// forced as history instead of being sampled. Strict like "guidance" — both
+// keys are required and an unknown one is an error rather than something
+// ignored. The file itself is read later, once the base directory is known.
+static std::string parse_semantic_keep(const json & v, Request & req)
+{
+	if (!v.is_object())
+	{
+		return "must be an object with a \"file\" and a \"frames\"";
+	}
+	bool has_frames = false;
+	for (json::const_iterator it = v.begin(); it != v.end(); ++it)
+	{
+		const std::string & key = it.key();
+		if (key == "file")
+		{
+			if (!it.value().is_string() || it.value().get<std::string>().empty())
+			{
+				return "\"file\" must be a path to a semantic.npy";
+			}
+			req.keep_file = it.value().get<std::string>();
+		} else if (key == "frames") {
+			if (!it.value().is_number_integer() || it.value().get<long long>() < 1 ||
+			    it.value().get<long long>() > CONTEXT)
+			{
+				return strf("\"frames\" must be an integer in [1, %d]", CONTEXT);
+			}
+			req.keep_frames = it.value().get<int>();
+			has_frames      = true;
+		} else {
+			return strf("unknown key \"%s\" (file, frames)", key.c_str());
+		}
+	}
+	if (req.keep_file.empty())
+	{
+		return "needs a \"file\"";
+	}
+	if (!has_frames)
+	{
+		// Deliberately no implicit "all of it": the last frames of a render are
+		// where it ended, and keeping them by accident keeps the ending too.
+		return "needs a \"frames\": how many leading codes of the file to keep";
+	}
+	return "";
+}
+
+// The request as JSON, with `where` naming it in the error messages. Split out
+// of parse_request so tests/guidance.cpp can drive the request errors of
+// SPEC_GUIDANCE §2.3/§2.4 without a file on disk.
+static std::string parse_request_json(const json & root, const std::string & where, Request & req)
+{
+	const char * path = where.c_str();
+	if (!root.is_object())
+	{
+		return strf("%s: expected a JSON object", path);
+	}
+
+	// A request cannot pick the VAE's matmul precision: `yue2 song`/`yue2 batch`
+	// decode it in the process that ran the NAR, and ggml-vulkan fixes operand
+	// staging at device init (SPEC_SINGLE.md §2.2). This runs before any model
+	// loads.
+	if (root.contains("vk_f16_matmul"))
+	{
+		return strf("%s: \"vk_f16_matmul\": song/batch decode the VAE in-process at the "
+		            "NAR's Vulkan precision; for the exact-F32 decode run the stage on its "
+		            "own: yue2 vae -m yue2-vae-f32.gguf -i ARTIFACTS/latent.npy -o OUT.flac",
+		            path);
+	}
+
+	if (root.contains("style") && root["style"].is_string())
+	{
+		req.style = root["style"].get<std::string>();
+	} else if (root.contains("tags") && root["tags"].is_string()) {
+		req.style = root["tags"].get<std::string>();
+	} else {
+		return strf("%s: needs a \"style\" (or \"tags\") string", path);
+	}
+	if (root.contains("lyrics") && root["lyrics"].is_string())
+	{
+		req.lyrics = root["lyrics"].get<std::string>();
+	} else {
+		return strf("%s: needs a \"lyrics\" string", path);
+	}
+	if (root.contains("cot") && !root["cot"].is_null())
+	{
+		if (!root["cot"].is_string())
+		{
+			return strf("%s: \"cot\" must be a string", path);
+		}
+		req.cot = root["cot"].get<std::string>();
+	}
+	if (root.contains("seed") && !root["seed"].is_null())
+	{
+		// protocol.SongRequest: an integer in [0, 2**63). Read it as an exact
+		// uint64 — never through a double, which loses seeds above 2**53.
+		const json & v = root["seed"];
+		if (!v.is_number_unsigned())
+		{
+			return strf("%s: \"seed\" must be a non-negative integer below 2**63", path);
+		}
+		req.seed = v.get<uint64_t>();
+	}
+	if (root.contains("id") && !root["id"].is_null())
+	{
+		if (!root["id"].is_string())
+		{
+			return strf("%s: \"id\" must be a string", path);
+		}
+		req.id = root["id"].get<std::string>();
+	}
+	if (root.contains("abc") && !root["abc"].is_null())
+	{
+		if (!root["abc"].is_string())
+		{
+			return strf("%s: \"abc\" must be a string or null", path);
+		}
+		req.has_abc = true;
+		req.abc     = root["abc"].get<std::string>();
+	}
+	if (root.contains("abc_template") && !root["abc_template"].is_null())
+	{
+		if (!root["abc_template"].is_string())
+		{
+			return strf("%s: \"abc_template\" must be a string or null", path);
+		}
+		req.has_tpl      = true;
+		req.abc_template = root["abc_template"].get<std::string>();
+	}
+	if (root.contains("cfg_scale") && !root["cfg_scale"].is_null())
+	{
+		if (!root["cfg_scale"].is_number())
+		{
+			return strf("%s: \"cfg_scale\" must be a number or null", path);
+		}
+		req.has_cfg   = true;
+		req.cfg_scale = root["cfg_scale"].get<double>();
+	}
+	if (root.contains("guidance") && !root["guidance"].is_null())
+	{
+		const std::string err = parse_guidance(root["guidance"], req.guidance);
+		if (!err.empty())
+		{
+			return strf("%s: \"guidance\": %s", path, err.c_str());
+		}
+		req.has_guidance = true;
+	}
+	if (root.contains("semantic_keep") && !root["semantic_keep"].is_null())
+	{
+		const std::string err = parse_semantic_keep(root["semantic_keep"], req);
+		if (!err.empty())
+		{
+			return strf("%s: \"semantic_keep\": %s", path, err.c_str());
+		}
+		req.has_keep = true;
+	}
+	return "";
+}
+
 // Returns "" or the reason the file is not a usable request. A batch validates
 // every job before the model loads (SPEC_BATCH §3.1), so this reports rather
 // than exits; the single-request paths turn a non-empty return into die().
 static std::string parse_request(const std::string & path, Request & req)
 {
 	std::string text;
-	std::string err = read_file(path, text);
+	const std::string err = read_file(path, text);
 	if (!err.empty())
 	{
 		return err;
@@ -1284,92 +1756,7 @@ static std::string parse_request(const std::string & path, Request & req)
 	{
 		return strf("%s: %s", path.c_str(), e.what());
 	}
-	if (!root.is_object())
-	{
-		return strf("%s: expected a JSON object", path.c_str());
-	}
-
-	// A request cannot pick the VAE's matmul precision: `yue2 song`/`yue2 batch`
-	// decode it in the process that ran the NAR, and ggml-vulkan fixes operand
-	// staging at device init (SPEC_SINGLE.md §2.2). This runs before any model
-	// loads.
-	if (root.contains("vk_f16_matmul"))
-	{
-		return strf("%s: \"vk_f16_matmul\": song/batch decode the VAE in-process at the "
-		            "NAR's Vulkan precision; for the exact-F32 decode run the stage on its "
-		            "own: yue2 vae -m yue2-vae-f32.gguf -i ARTIFACTS/latent.npy -o OUT.flac",
-		            path.c_str());
-	}
-
-	if (root.contains("style") && root["style"].is_string())
-	{
-		req.style = root["style"].get<std::string>();
-	} else if (root.contains("tags") && root["tags"].is_string()) {
-		req.style = root["tags"].get<std::string>();
-	} else {
-		return strf("%s: needs a \"style\" (or \"tags\") string", path.c_str());
-	}
-	if (root.contains("lyrics") && root["lyrics"].is_string())
-	{
-		req.lyrics = root["lyrics"].get<std::string>();
-	} else {
-		return strf("%s: needs a \"lyrics\" string", path.c_str());
-	}
-	if (root.contains("cot") && !root["cot"].is_null())
-	{
-		if (!root["cot"].is_string())
-		{
-			return strf("%s: \"cot\" must be a string", path.c_str());
-		}
-		req.cot = root["cot"].get<std::string>();
-	}
-	if (root.contains("seed") && !root["seed"].is_null())
-	{
-		// protocol.SongRequest: an integer in [0, 2**63). Read it as an exact
-		// uint64 — never through a double, which loses seeds above 2**53.
-		const json & v = root["seed"];
-		if (!v.is_number_unsigned())
-		{
-			return strf("%s: \"seed\" must be a non-negative integer below 2**63", path.c_str());
-		}
-		req.seed = v.get<uint64_t>();
-	}
-	if (root.contains("id") && !root["id"].is_null())
-	{
-		if (!root["id"].is_string())
-		{
-			return strf("%s: \"id\" must be a string", path.c_str());
-		}
-		req.id = root["id"].get<std::string>();
-	}
-	if (root.contains("abc") && !root["abc"].is_null())
-	{
-		if (!root["abc"].is_string())
-		{
-			return strf("%s: \"abc\" must be a string or null", path.c_str());
-		}
-		req.has_abc = true;
-		req.abc     = root["abc"].get<std::string>();
-	}
-	if (root.contains("abc_template") && !root["abc_template"].is_null())
-	{
-		if (!root["abc_template"].is_string())
-		{
-			return strf("%s: \"abc_template\" must be a string or null", path.c_str());
-		}
-		req.has_tpl      = true;
-		req.abc_template = root["abc_template"].get<std::string>();
-	}
-	if (root.contains("cfg_scale") && !root["cfg_scale"].is_null())
-	{
-		if (!root["cfg_scale"].is_number())
-		{
-			return strf("%s: \"cfg_scale\" must be a number or null", path.c_str());
-		}
-		req.has_cfg   = true;
-		req.cfg_scale = root["cfg_scale"].get<double>();
-	}
-	return "";
+	return parse_request_json(root, path, req);
 }
 
 // protocol.SongRequest.__post_init__, so anything we accept can still be read
@@ -1436,12 +1823,103 @@ static std::string validate_request(const Request & r)
 	{
 		return strf("cfg_scale must be finite and in [0, 20] (got %g)", r.cfg_scale);
 	}
+
+	// SPEC_GUIDANCE §2.3 and §2.4.
+	if (r.has_guidance)
+	{
+		if (r.has_cfg && r.cfg_scale != 1.0)
+		{
+			return "\"guidance\" and \"cfg_scale\" are two ways to ask for the same "
+			       "machinery: give the blend curves in \"guidance\", or a single scalar in "
+			       "\"cfg_scale\", not both";
+		}
+		// The tags in force before the entry being checked.
+		std::string style      = r.style;
+		int         prev_frame = -1;
+		for (size_t i = 0; i < r.guidance.size(); i++)
+		{
+			const GuidanceEntry & g = r.guidance[i];
+			if (g.frame <= prev_frame)
+			{
+				return strf("\"guidance\" entry %zu: entries must be strictly increasing "
+				            "in \"frame\" (got %d after %d)", i + 1, g.frame, prev_frame);
+			}
+			prev_frame = g.frame;
+			if (g.has_style && g.frame == 0)
+			{
+				// The cut relabels the sequence the song has been decoding and
+				// prefills its replacement; at frame 0 there is nothing to
+				// relabel, and "these tags from the first frame on" is what the
+				// request's own "style" already says. It is also what keeps
+				// prefix.npy — the frame-0 positive prefix, and what the NAR
+				// reads — the prefix the song actually started from. With this,
+				// §2.3's "previous is not allowed at frame 0" needs no rule of
+				// its own: it needs a style, and a style cannot be there.
+				return strf("\"guidance\" entry %zu: a \"style\" at frame 0 is the request's "
+				            "own \"style\"; put it there instead", i + 1);
+			}
+			if (g.has[BRANCH_PREVIOUS])
+			{
+				if (!g.has_style)
+				{
+					return strf("\"guidance\" entry %zu: \"against\".\"previous\" needs a "
+					            "\"style\" — without one there is nothing to push against",
+					            i + 1);
+				}
+				if (g.style == style)
+				{
+					return strf("\"guidance\" entry %zu: \"style\" is the one already in "
+					            "force, so \"against\".\"previous\" would push against "
+					            "itself", i + 1);
+				}
+			}
+			if (g.has_style)
+			{
+				style = g.style;
+			}
+		}
+	}
+	// SPEC_KEEP §2. Everything here is decided without opening the file; the
+	// rules that need its contents are checked where it is read, still before
+	// the model loads.
+	if (r.has_keep)
+	{
+		if (r.has_tpl)
+		{
+			return "\"semantic_keep\" with \"abc_template\" is not supported: the kept codes "
+			       "were sung to one exact score, and a template writes some of its lines";
+		}
+		if (!r.has_abc)
+		{
+			return "\"semantic_keep\" needs the score its codes were sung to, in \"abc\" — a "
+			       "freshly written score would not match them";
+		}
+		for (size_t i = 0; i < r.guidance.size(); i++)
+		{
+			// frame == N is the normal case: the cut is the first sampled step.
+			// A plain cfg_scale needs no rule of its own — its blank branch is
+			// simply born at step N.
+			if (r.guidance[i].frame < r.keep_frames)
+			{
+				return strf("\"guidance\" entry %zu: guidance frame %d is inside the kept "
+				            "%d frames", i + 1, r.guidance[i].frame, r.keep_frames);
+			}
+		}
+	}
+	if (r.has_tpl && (r.has_guidance || cfg_scalar(r) != 1.0))
+	{
+		return strf("%s with \"abc_template\" is not supported yet: the template's abc phase "
+		            "re-prefills the slot, and the branches would have to follow it",
+		            r.has_guidance ? "\"guidance\"" : "classifier-free guidance");
+	}
 	return "";
 }
 
 // The request as one job's decode loop needs it: parsed, the command-line
-// overrides applied, validated, and cfg rejected. protocol.SongRequest.guidance
-// is 1.01 for cot=off, which yue2.cpp cannot run either (stage 2b+).
+// overrides applied, validated. `guidance` comes back as the effective cfg
+// scalar the artifacts record — 1.0 whenever the request drives the branches
+// through its own "guidance" block, which guidance.json then carries
+// (SPEC_GUIDANCE §3).
 static std::string prepare_request(const std::string & path, const std::string & cot_override,
 	bool has_seed, uint64_t seed, Request & req, double & guidance)
 {
@@ -1463,11 +1941,65 @@ static std::string prepare_request(const std::string & path, const std::string &
 	{
 		return strf("%s: %s", path.c_str(), err.c_str());
 	}
-	guidance = req.has_cfg ? req.cfg_scale : (req.cot == "off" ? 1.01 : 1.0);
-	if (guidance != 1.0)
+	guidance = req.has_guidance ? 1.0 : cfg_scalar(req);
+	return "";
+}
+
+// Where a relative path inside a request resolves from: the directory of the
+// file the request was read out of (SPEC_KEEP §2).
+static std::string dir_of(const std::string & path)
+{
+	return std::filesystem::path(path).parent_path().string();
+}
+
+// The kept codes of SPEC_KEEP §2, through the NAR's `--codec` reader: a 1-D
+// int32 .npy, every value a codec index. `max_steps` is the semantic phase's
+// own cap, which kept steps count against like any other (§3), so a request
+// that keeps all of it would have nothing left to sample. Runs at validation
+// time, before the model loads; `name` comes back as the basename, which is all
+// the artifacts and the log line ever show of the path.
+static std::string load_keep_codes(const Request & r, const std::string & base, int max_steps,
+	std::vector<int32_t> & out, std::string & name)
+{
+	std::filesystem::path path = r.keep_file;
+	if (path.is_relative() && !base.empty())
 	{
-		return strf("%s: cfg_scale %g: classifier-free guidance is not supported (stage 2b+)",
-		            path.c_str(), guidance);
+		path = std::filesystem::path(base) / path;
+	}
+	name = path.filename().string();
+
+	npy::ArrayI32     codec;
+	const std::string err = npy::load_i32(path.string().c_str(), codec);
+	if (!err.empty())
+	{
+		return strf("\"semantic_keep\": %s", err.c_str());
+	}
+	if (codec.shape.size() != 1)
+	{
+		return strf("\"semantic_keep\": %s must be a 1-D int32 array, as the NAR's --codec is",
+		            path.string().c_str());
+	}
+	if ((size_t) r.keep_frames > codec.data.size())
+	{
+		return strf("\"semantic_keep\": \"frames\" %d exceeds the %zu codes in %s",
+		            r.keep_frames, codec.data.size(), name.c_str());
+	}
+	if (r.keep_frames >= max_steps)
+	{
+		return strf("\"semantic_keep\": \"frames\" %d leaves nothing to sample under the "
+		            "%d-step semantic cap", r.keep_frames, max_steps);
+	}
+	out.assign(codec.data.begin(), codec.data.begin() + r.keep_frames);
+	for (size_t i = 0; i < out.size(); i++)
+	{
+		// A `semantic.npy` the AR stage wrote holds codes, never token ids and
+		// never an end marker — generate() drops MUSIC_END — so this one check
+		// is also the SPEC's "the end marker cannot be kept".
+		if (out[i] < 0 || out[i] >= CODEC_SIZE)
+		{
+			return strf("\"semantic_keep\": %s[%zu] = %d is not a codec index in [0, %d)",
+			            name.c_str(), i, (int) out[i], CODEC_SIZE);
+		}
 	}
 	return "";
 }
@@ -1507,6 +2039,50 @@ static std::string detokenize(const llama_vocab * vocab, const std::vector<llama
 		die("detokenizing the abc ids failed");
 	}
 	return std::string(buf.data(), (size_t) n);
+}
+
+// protocol.token_prefixes without abc ids: [EOD] + tokenize(text) + [ABC_START].
+// The abc phase's whole prefix, and the head of every semantic one — including
+// the head of a guidance entry that changes the tags (SPEC_GUIDANCE §4.4).
+static std::vector<llama_token> prefix_head(const llama_vocab * vocab, const std::string & text)
+{
+	std::vector<llama_token>       out(1, (llama_token) EOD);
+	const std::vector<llama_token> ids = tokenize(vocab, text, "request text");
+	out.insert(out.end(), ids.begin(), ids.end());
+	out.push_back(ABC_START);
+	return out;
+}
+
+// protocol.token_prefixes with abc ids: the semantic phase's prefix. A cot=off
+// job has no abc ids, which is that branch of the reference verbatim
+// (base + [ABC_START, ABC_END, MUSIC_START]).
+static std::vector<llama_token> semantic_prefix(const std::vector<llama_token> & head,
+	const std::vector<llama_token> & abc_ids)
+{
+	std::vector<llama_token> out = head;
+	out.insert(out.end(), abc_ids.begin(), abc_ids.end());
+	out.push_back(ABC_END);
+	out.push_back(MUSIC_START);
+	return out;
+}
+
+// protocol.negative_prefix: the instruction with no tags and no lyrics, then the
+// positive branch's exact score. The instruction is tokenized on its own, so its
+// last token is not the one the positive prefix holds — where ".\n" merges — and
+// the positive prefix may not be sliced to get this (SPEC_GUIDANCE §2.2).
+static std::vector<llama_token> blank_prefix(const llama_vocab * vocab, const Request & r,
+	const std::vector<llama_token> & abc_ids)
+{
+	std::vector<llama_token>       out(1, (llama_token) EOD);
+	const std::vector<llama_token> ids = tokenize(vocab, instruction(r.cot), "negative instruction");
+	out.insert(out.end(), ids.begin(), ids.end());
+	if (r.cot == "off")
+	{
+		out.push_back(MUSIC_START);
+		return out;
+	}
+	out.push_back(ABC_START);
+	return semantic_prefix(out, abc_ids);
 }
 
 
@@ -1581,16 +2157,48 @@ struct JobState
 	size_t                   emitted      = 0;   // tokens of it, counted piece by piece
 	TemplateStats            tpl;
 
+	// SPEC_GUIDANCE.md, empty unless the request asked for branches. `guide` is
+	// the normalised plan (a plain `cfg_scale` is one entry at frame 0), `heads`
+	// the prefix head of every entry that changes the tags — tokenized once, at
+	// sizing time, so the cut itself is a splice.
+	std::vector<GuidanceEntry>            guide;
+	std::vector<std::vector<llama_token>> heads;
+	int                                   max_branches = 1;   // live sequences at once
+	int                                   guided_steps = 0;
+	double                                branch_seconds = 0; // prefilling them
+
+	// SPEC_KEEP.md, empty unless the request carried a "semantic_keep": the N
+	// leading codes of an earlier render, read at validation time, forced as
+	// history instead of being sampled.
+	std::vector<int32_t>     keep_codes;
+	std::string              keep_name;     // its basename, all the log line shows
+	double                   keep_seconds = 0;
+
 	GenStats                 st_abc;
 	GenStats                 st_sem;
 	bool                     ok    = true;   // false once the job is rejected
 	std::string              tag;            // "[k/N name] ", empty for a single job
 };
 
+// One shadow sequence of a guided song: the same generated history under a
+// different prefix. SPEC_GUIDANCE §4.1.
+struct Branch
+{
+	int                      slot    = -1;   // llama seq_id, >= 1
+	int                      kind    = BRANCH_BLANK;
+	llama_pos                pos     = 0;    // tokens this slot holds
+	int                      i_batch = -1;   // row in the batch last submitted
+	bool                     live    = false;
+	double                   weight  = 0;    // w_i at the step being sampled
+	std::vector<llama_token> prefix;         // what it is (re-)prefilled from
+	std::vector<float>       row;            // its logits over [MUSIC_END, codec end)
+};
+
 // One KV stream of the shared context, and the phase it is in. SPEC_BATCH §4.3.
 struct Seq
 {
 	int                      slot     = 0;   // == the llama seq_id
+	int                      home     = 0;   // the slot it starts every job in
 	int                      job      = -1;  // -1 = idle
 	Phase                    phase    = PHASE_DONE;
 	std::vector<llama_token> history;        // the current phase's output and penalty window
@@ -1622,6 +2230,15 @@ struct Seq
 	llama_pos                chk_pos   = 0;
 	size_t                   chk_hist  = 0;
 	int                      chk_step  = 0;
+
+	// Guidance (SPEC_GUIDANCE §4.1), all unused unless the job carries a plan.
+	// The primary's slot moves when an entry changes the positive prefix, so
+	// `slot` above is not `home` for the whole song.
+	bool                     guided    = false;
+	size_t                   g_next    = 0;   // the next entry of the plan to take effect
+	int                      g_entry   = -1;  // the entry in force, -1 before the first
+	Branch                   branch[BRANCH_KINDS];
+	std::vector<float>       blend;           // n_vocab floats: the blended row
 };
 
 // The shared decode loop: one llama_decode per step carrying one token for each
@@ -1637,6 +2254,7 @@ struct Runner
 	Sampling                   s_sem   = sampling_semantic();
 	uint32_t                   n_ctx_seq = 0;
 	int                        parallel  = 1;
+	int                        n_streams = 1;   // KV streams: parallel, or 3 when guided
 	std::string                card;
 	const std::vector<ArJob> * jobs    = nullptr;
 	std::vector<JobState> *    states  = nullptr;
@@ -1671,6 +2289,22 @@ struct Runner
 	                 const char * what);
 	llama_token sample(Seq & q, const float * logits);
 	void        apply(Seq & q, llama_token token);
+
+	// Guidance (SPEC_GUIDANCE §4.2, §4.3). Everything below returns at once for
+	// a job with no plan.
+	int           free_slot(const Seq & q) const;
+	llama_pos     prefill_branch(Seq & q, int slot, const std::vector<llama_token> & prefix,
+	                             const char * what, int & i_batch);
+	void          branch_drop(Seq & q, Branch & b, const char * why);
+	void          take_entry(Seq & q, size_t idx);
+	void          guidance_enter(Seq & q);
+	void          guidance_step(Seq & q);
+	void          guidance_clear(Seq & q);
+	void          fetch_row(Branch & b);
+	const float * blend_row(Seq & q, const float * primary);
+
+	// SPEC_KEEP §3: the semantic phase entered on an earlier render's codes.
+	void        keep_enter(Seq & q);
 
 	// The template walk. give() feeds one forced stretch of score; the rest is
 	// the hole state machine. SPEC_TEMPLATE §3.
@@ -1747,6 +2381,285 @@ llama_token Runner::sample(Seq & q, const float * logits)
 	return token;
 }
 
+// The ids the semantic sampler can visit: MUSIC_END and the codec block, which
+// sit next to each other, so one contiguous run of floats is the whole of what a
+// branch row has to carry and the whole of what the blend writes (§2.1).
+static const int SEM_ROW_FIRST = MUSIC_END;
+static const int SEM_ROW_LEN   = CODEC_OFFSET + CODEC_SIZE - MUSIC_END;
+
+// The lowest KV stream this song is not already using. Live slots are kept
+// contiguous from 0 that way, which is what `split_equal` wants (SPEC_BATCH
+// §4.7 item 3); a guided song runs at parallel 1, so no other Seq competes.
+int Runner::free_slot(const Seq & q) const
+{
+	for (int s = 0; s < n_streams; s++)
+	{
+		if (s == q.slot)
+		{
+			continue;
+		}
+		bool used = false;
+		for (int k = 0; k < BRANCH_KINDS; k++)
+		{
+			used = used || (q.branch[k].live && q.branch[k].slot == s);
+		}
+		if (!used)
+		{
+			return s;
+		}
+	}
+	die("guidance: no free KV stream among %d for slot %d", n_streams, q.slot);
+}
+
+// Prefills a sequence with `prefix` followed by every code generated so far but
+// the one still pending in `q.next` — the state every sequence of a guided song
+// shares (§4.3). Its own llama_decode calls, never the lockstep batch. Returns
+// the position the slot then stands at, and hands back the last token's logits
+// row index, which is this branch's row for the step about to be sampled *only*
+// at the semantic entry, where nothing is pending; mid-song the lockstep decode
+// of `q.next` produces it.
+llama_pos Runner::prefill_branch(Seq & q, int slot, const std::vector<llama_token> & prefix,
+	const char * what, int & i_batch)
+{
+	JobState &               js   = (*states)[q.job];
+	const double             t0   = now_seconds();
+	std::vector<llama_token> feed = prefix;
+	if (!q.history.empty())
+	{
+		feed.insert(feed.end(), q.history.begin(), q.history.end() - 1);
+	}
+	// What the slot will hold at the end: this prefix and, at the most, a whole
+	// semantic phase of codes. Sized for in run_ar_batch (§4.5); checked here
+	// because that estimate is the only thing between it and a decode error.
+	if (prefix.size() + (size_t) s_sem.max_tokens > (size_t) n_ctx_seq)
+	{
+		die("%sguidance: the %s prefix %zu + max_tokens %d exceeds the allocated "
+		    "%u-token context", js.tag.c_str(), what, prefix.size(), s_sem.max_tokens, n_ctx_seq);
+	}
+	const llama_pos held = llama_memory_seq_pos_max(mem, slot);
+	if (held != -1)
+	{
+		die("%sguidance: slot %d still holds %d tokens before the %s prefix enters it",
+		    js.tag.c_str(), slot, (int) held + 1, what);
+	}
+
+	llama_pos pos = 0;
+	i_batch = decode_feed(ctx, batch, feed, slot, pos, what);
+	decodes++;
+	if ((size_t) (llama_memory_seq_pos_max(mem, slot) + 1) != feed.size())
+	{
+		die("%sguidance: the %s prefill left %d tokens in slot %d, it fed %zu",
+		    js.tag.c_str(), what, (int) llama_memory_seq_pos_max(mem, slot) + 1, slot, feed.size());
+	}
+	js.branch_seconds += now_seconds() - t0;
+	printf("%sguidance: step %d: %s prefilled into slot %d (%zu + %zu tokens)\n",
+	       js.tag.c_str(), q.step, what, slot, prefix.size(), feed.size() - prefix.size());
+	return pos;
+}
+
+void Runner::branch_drop(Seq & q, Branch & b, const char * why)
+{
+	llama_memory_seq_rm(mem, b.slot, -1, -1);
+	const llama_pos held = llama_memory_seq_pos_max(mem, b.slot);
+	if (held != -1)
+	{
+		die("guidance: slot %d still holds %d tokens after the %s branch was dropped",
+		    b.slot, (int) held + 1, branch_name(b.kind));
+	}
+	printf("%sguidance: step %d: %s branch dropped from slot %d (%s)\n",
+	       (*states)[q.job].tag.c_str(), q.step, branch_name(b.kind), b.slot, why);
+	b.live = false;
+	b.pos  = 0;
+	b.slot = -1;
+}
+
+// One guidance entry takes effect. A new `style` is the cut (§4.3): the old
+// primary sequence already *is* "previous prefix + history", so it is relabelled
+// rather than recomputed, and the new prefix is prefilled into a free slot.
+void Runner::take_entry(Seq & q, size_t idx)
+{
+	JobState &      js = (*states)[q.job];
+	GuidanceEntry & g  = js.guide[idx];
+	g.reached = true;
+
+	if (g.has_style)
+	{
+		Branch & prev = q.branch[BRANCH_PREVIOUS];
+		if (prev.live)
+		{
+			// Three slots always suffice because the outgoing entry's `previous`
+			// goes before this entry's takes its place.
+			branch_drop(q, prev, "replaced by the entry that follows it");
+		}
+		const std::vector<llama_token> np = semantic_prefix(js.heads[idx], js.abc_ids);
+		const int                      old_slot = q.slot;
+		q.slot = -1;
+		if (g.has[BRANCH_PREVIOUS])
+		{
+			prev.slot   = old_slot;
+			prev.pos    = q.pos;
+			prev.live   = true;
+			prev.prefix.clear();     // it is never re-prefilled: see guidance_step
+			printf("%sguidance: step %d: slot %d relabelled as the previous branch\n",
+			       js.tag.c_str(), q.step, old_slot);
+		} else {
+			llama_memory_seq_rm(mem, old_slot, -1, -1);
+			if (llama_memory_seq_pos_max(mem, old_slot) != -1)
+			{
+				die("%sguidance: slot %d still holds tokens after the cut cleared it",
+				    js.tag.c_str(), old_slot);
+			}
+		}
+		const int slot = free_slot(q);
+		q.pos  = prefill_branch(q, slot, np, "new positive", q.i_batch);
+		q.slot = slot;
+	}
+	q.g_entry = (int) idx;
+}
+
+// Called for a guided sequence before the batch that yields the logits of
+// semantic step `q.step`: takes every entry whose frame has come, then prefills
+// or drops branches so that exactly the ones still needed are live (§4.3).
+void Runner::guidance_step(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+	while (q.g_next < js.guide.size() && js.guide[q.g_next].frame <= q.step)
+	{
+		take_entry(q, q.g_next++);
+	}
+	if (q.g_entry < 0)
+	{
+		return;
+	}
+
+	const GuidanceEntry & g   = js.guide[(size_t) q.g_entry];
+	const int             off = q.step - g.frame;
+	int                   live = 1;
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		Branch &   b    = q.branch[k];
+		const bool need = g.has[k] && curve_needed_from(g.curve[k], off);
+		if (need && !b.live)
+		{
+			// `previous` is only ever born at a cut, where it is relabelled; and
+			// "needed at or after off" only ever goes from true to false, so a
+			// branch this entry needs later was live when the entry was taken.
+			if (b.prefix.empty())
+			{
+				die("%sguidance: the %s branch is needed at step %d and has no prefix",
+				    js.tag.c_str(), branch_name(k), q.step);
+			}
+			b.slot = free_slot(q);
+			b.pos  = prefill_branch(q, b.slot, b.prefix, branch_name(k), b.i_batch);
+			b.live = true;
+			fetch_row(b);
+		} else if (!need && b.live) {
+			branch_drop(q, b, "its curve is zero from here on");
+		}
+		// A needed branch whose weight happens to be 0 is still decoded: its KV
+		// has to stay in step with the history.
+		b.weight = need ? curve_at(g.curve[k], off) : 0;
+		live    += b.live ? 1 : 0;
+	}
+	js.max_branches = std::max(js.max_branches, live);
+}
+
+// The semantic phase of a guided job is about to start: the branch prefixes are
+// known (the score is written), and whatever step 0 needs is prefilled *before*
+// the primary's own feed, so that the primary's is the last decode and its
+// logits are the live ones when the first token is sampled (§4.3).
+void Runner::guidance_enter(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+	if (js.guide.empty())
+	{
+		return;
+	}
+	q.guided  = true;
+	q.g_next  = 0;
+	q.g_entry = -1;
+	q.blend.assign((size_t) n_vocab, 0.0f);
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		q.branch[k]      = Branch();
+		q.branch[k].kind = k;
+		q.branch[k].row.assign((size_t) SEM_ROW_LEN, 0.0f);
+	}
+	q.branch[BRANCH_BLANK].prefix = blank_prefix(vocab, js.req, js.abc_ids);
+	guidance_step(q);
+}
+
+// Every shadow slot goes back, so the next job of a --parallel 1 batch enters a
+// clean context (§4.1), and the primary returns to the slot it started in.
+void Runner::guidance_clear(Seq & q)
+{
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		if (q.branch[k].live)
+		{
+			branch_drop(q, q.branch[k], "the song is finished");
+		}
+		q.branch[k] = Branch();
+	}
+	q.guided  = false;
+	q.g_next  = 0;
+	q.g_entry = -1;
+	q.blend.clear();
+}
+
+// A branch's row for this step, copied out of the context's output buffer: the
+// next llama_decode overwrites it, and at the semantic entry the branches were
+// decoded before the primary.
+void Runner::fetch_row(Branch & b)
+{
+	const float * logits = llama_get_logits_ith(ctx, b.i_batch);
+	if (logits == nullptr)
+	{
+		die("llama_get_logits_ith(%d) returned NULL for the %s branch in slot %d",
+		    b.i_batch, branch_name(b.kind), b.slot);
+	}
+	memcpy(b.row.data(), logits + SEM_ROW_FIRST, (size_t) SEM_ROW_LEN * sizeof(float));
+}
+
+// L = B + sum_i w_i * (B - N_i), in f32 and only over the ids the semantic
+// sampler can visit; the rest of the scratch row is never read (§2.1). The raw
+// row is handed back untouched when nothing contributes, which is every step of
+// an unguided song and every abc step.
+const float * Runner::blend_row(Seq & q, const float * primary)
+{
+	if (!q.guided || primary == nullptr)
+	{
+		return primary;
+	}
+	bool live = false;
+	bool any  = false;
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		live = live || q.branch[k].live;
+		any  = any  || (q.branch[k].live && q.branch[k].weight != 0);
+	}
+	(*states)[q.job].guided_steps += live ? 1 : 0;
+	if (!any)
+	{
+		return primary;
+	}
+
+	for (int i = 0; i < SEM_ROW_LEN; i++)
+	{
+		const float b   = primary[SEM_ROW_FIRST + i];
+		float       acc = b;
+		for (int k = 0; k < BRANCH_KINDS; k++)
+		{
+			if (q.branch[k].live && q.branch[k].weight != 0)
+			{
+				acc += (float) q.branch[k].weight * (b - q.branch[k].row[(size_t) i]);
+			}
+		}
+		q.blend[(size_t) (SEM_ROW_FIRST + i)] = acc;
+	}
+	return q.blend.data();
+}
+
 void Runner::apply(Seq & q, llama_token token)
 {
 	if (q.in_hole)
@@ -1805,11 +2718,7 @@ void Runner::apply(Seq & q, llama_token token)
 	js.abc_text      = detokenize(vocab, js.abc_ids);
 	js.have_abc_text = true;
 
-	// protocol.token_prefixes(request, tokenizer, abc_ids)
-	js.prefix_sem = js.prefix_abc;
-	js.prefix_sem.insert(js.prefix_sem.end(), js.abc_ids.begin(), js.abc_ids.end());
-	js.prefix_sem.push_back(ABC_END);
-	js.prefix_sem.push_back(MUSIC_START);
+	js.prefix_sem = semantic_prefix(js.prefix_abc, js.abc_ids);
 	if ((int) js.prefix_sem.size() + s_sem.max_tokens > (int) n_ctx_seq)
 	{
 		die("%ssemantic prefix %zu + max_tokens %d exceeds the allocated %u-token context",
@@ -1834,6 +2743,10 @@ void Runner::apply(Seq & q, llama_token token)
 	bridge.push_back(MUSIC_START);
 
 	js.st_sem.prefix_tokens = (int) js.prefix_sem.size();
+
+	// Whatever step 0 is guided against goes in before the bridge, so that the
+	// primary's decode is the last one and its logits are live (§4.3).
+	guidance_enter(q);
 	feed(q, bridge, js.prefix_sem.size(), "semantic");
 }
 
@@ -1872,7 +2785,9 @@ void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expec
 	st.prefill_seconds = now_seconds() - q.t_phase0;
 
 	// Immediately: the next llama_decode from any slot overwrites this buffer.
-	apply(q, sample(q, llama_get_logits_ith(ctx, q.i_batch)));
+	// The branches were prefilled before this feed, so their rows are in hand
+	// (SPEC_GUIDANCE §4.3).
+	apply(q, sample(q, blend_row(q, llama_get_logits_ith(ctx, q.i_batch))));
 }
 
 // One forced stretch of score: tokenized, decoded, and pushed into `history` so
@@ -2395,10 +3310,7 @@ void Runner::template_done(Seq & q)
 	       js.tpl.given_tokens, js.tpl.primer_tokens, js.tpl.offlength_bars,
 	       js.tpl.continued_tokens, js.tpl.chord_lines);
 
-	js.prefix_sem = js.prefix_abc;
-	js.prefix_sem.insert(js.prefix_sem.end(), js.abc_ids.begin(), js.abc_ids.end());
-	js.prefix_sem.push_back(ABC_END);
-	js.prefix_sem.push_back(MUSIC_START);
+	js.prefix_sem = semantic_prefix(js.prefix_abc, js.abc_ids);
 	if ((int) js.prefix_sem.size() + s_sem.max_tokens > (int) n_ctx_seq)
 	{
 		die("%ssemantic prefix %zu + max_tokens %d exceeds the allocated %u-token context",
@@ -2428,6 +3340,10 @@ void Runner::enter(Seq & q, int job)
 {
 	JobState & js = (*states)[job];
 
+	// A guided job before this one moved the primary between streams; every one
+	// of them was cleared when it finished, and this one starts at home again.
+	q.slot = q.home;
+
 	const llama_pos held = llama_memory_seq_pos_max(mem, q.slot);
 	if (held != -1)
 	{
@@ -2436,6 +3352,7 @@ void Runner::enter(Seq & q, int job)
 	}
 
 	q.job      = job;
+	q.guided   = false;
 	q.phase    = js.do_abc ? PHASE_ABC : PHASE_SEM;
 	q.history.clear();
 	q.step     = 0;
@@ -2453,6 +3370,14 @@ void Runner::enter(Seq & q, int job)
 
 	if (js.do_abc)
 	{
+		// Unreachable: "semantic_keep" needs the score in "abc" (§2), and that
+		// is exactly what clears do_abc. The backstop is here because the keep
+		// would otherwise be dropped in silence while plan.json still claimed it.
+		if (!js.keep_codes.empty())
+		{
+			die("%skept codes belong to a score this job is about to write itself",
+			    js.tag.c_str());
+		}
 		js.st_abc.prefix_tokens = (int) js.prefix_abc.size();
 		if (js.is_template)
 		{
@@ -2473,7 +3398,56 @@ void Runner::enter(Seq & q, int job)
 		printf("%sabc:      %zu externally provided tokens\n", js.tag.c_str(), js.abc_ids.size());
 	}
 	js.st_sem.prefix_tokens = (int) js.prefix_sem.size();
+	if (!js.keep_codes.empty())
+	{
+		keep_enter(q);
+		return;
+	}
+	guidance_enter(q);
 	feed(q, js.prefix_sem, js.prefix_sem.size(), "semantic");
+}
+
+// SPEC_KEEP §3: steps 0 .. N-1 are not sampled. The slot is prefilled with the
+// semantic prefix and every kept code but the last, which is left pending in
+// `q.next` — exactly the state a sampled step leaves behind, so the lockstep
+// batch feeds it to the primary and to every branch at once and the first row
+// it yields is step N's. No row is read here, so the rng makes no draw for a
+// kept step; the penalty window is `history`, which holds the kept codes as if
+// they had been drawn.
+void Runner::keep_enter(Seq & q)
+{
+	JobState &   js = (*states)[q.job];
+	const double t0 = now_seconds();
+
+	q.history.clear();
+	q.history.reserve(js.keep_codes.size());
+	std::vector<llama_token> tokens = js.prefix_sem;
+	for (size_t i = 0; i < js.keep_codes.size(); i++)
+	{
+		const llama_token id = (llama_token) js.keep_codes[i] + CODEC_OFFSET;
+		q.history.push_back(id);
+		if (i + 1 < js.keep_codes.size())
+		{
+			tokens.push_back(id);
+		}
+	}
+	// One call, chunked by the batch size like any long prefix (decode_feed).
+	feed_tokens(q, tokens, tokens.size(), "semantic");
+	q.step = (int) js.keep_codes.size();
+	q.next = q.history.back();
+
+	js.keep_seconds           = now_seconds() - t0;
+	js.st_sem.prefill_seconds = now_seconds() - q.t_phase0;
+	printf("%skeep: %d frames from %s prefilled (%zu + %d tokens, %.2f s)\n",
+	       js.tag.c_str(), q.step, js.keep_name.c_str(), js.prefix_sem.size(), q.step,
+	       js.keep_seconds);
+
+	// After the primary, not before it as an unkept song does: an entry at
+	// frame N is a cut, and a cut relabels the sequence the song has been
+	// decoding, which at this point is the one just prefilled (§3). Nothing is
+	// sampled here, so the rows those prefills leave behind are stale by
+	// design — run() re-fetches every live branch's row before it samples.
+	guidance_enter(q);
 }
 
 void Runner::finish_job(Seq & q)
@@ -2496,6 +3470,20 @@ void Runner::finish_job(Seq & q)
 		codes.push_back((int32_t) code);
 	}
 
+	// What the branches cost this song, on both phases' timing blocks: they
+	// describe the song, and the semantic phase is the only one they touch
+	// (SPEC_GUIDANCE §3).
+	js.st_abc.cfg_branches = js.max_branches;
+	js.st_sem.cfg_branches = js.max_branches;
+	js.st_abc.guided_steps = js.guided_steps;
+	js.st_sem.guided_steps = js.guided_steps;
+	js.st_abc.branch_prefill_seconds = js.branch_seconds;
+	js.st_sem.branch_prefill_seconds = js.branch_seconds;
+	js.st_abc.kept_frames = (int) js.keep_codes.size();
+	js.st_sem.kept_frames = (int) js.keep_codes.size();
+	js.st_abc.keep_prefill_seconds = js.keep_seconds;
+	js.st_sem.keep_prefill_seconds = js.keep_seconds;
+
 	{
 		Artifacts a;
 		a.dir           = (*jobs)[q.job].artifacts;
@@ -2507,6 +3495,8 @@ void Runner::finish_job(Seq & q)
 		a.abc_text      = js.abc_text;
 		a.have_abc_text = js.have_abc_text;
 		a.template_text = js.is_template ? js.req.abc_template : std::string();
+		a.guidance      = js.req.has_guidance ? &js.guide : nullptr;
+		a.keep          = js.keep_codes.empty() ? nullptr : &js.keep_codes;
 		write_artifacts(a);
 	}
 	printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
@@ -2525,8 +3515,12 @@ void Runner::finish_job(Seq & q)
 	r.is_template = js.is_template;
 	r.tpl         = js.tpl;
 	r.parallel    = parallel;
-	r.slot        = q.slot;
+	r.slot        = q.home;
 	r.batch_jobs  = (int) jobs->size();
+
+	// The shadow slots first: the next job of a --parallel 1 batch has to enter
+	// a context with nothing of this one left in it (§4.1).
+	guidance_clear(q);
 
 	// The whole sequence, so this never fails (llama.h:745-747); the
 	// postcondition is what the next enter() depends on.
@@ -2580,6 +3574,17 @@ void Runner::run()
 			break;
 		}
 
+		// A guided sequence takes its entries and settles which branches are live
+		// before the batch is built — a branch prefill is its own decode call,
+		// never part of the lockstep step (§4.3).
+		for (size_t i = 0; i < seqs.size(); i++)
+		{
+			if (seqs[i].job >= 0 && seqs[i].guided && seqs[i].phase == PHASE_SEM)
+			{
+				guidance_step(seqs[i]);
+			}
+		}
+
 		batch.n_tokens = 0;
 		int first = -1;
 		int last  = -1;
@@ -2592,8 +3597,22 @@ void Runner::run()
 			}
 			q.i_batch = batch.n_tokens;
 			batch_add(batch, q.next, q.pos++, q.slot, true);
-			first = first < 0 ? q.slot : first;
-			last  = q.slot;
+			first = first < 0 || q.slot < first ? q.slot : first;
+			last  = std::max(last, q.slot);
+			// The same token into every live shadow branch, each at its own
+			// position: one history, several prefixes (§2.1).
+			for (int k = 0; k < BRANCH_KINDS; k++)
+			{
+				Branch & b = q.branch[k];
+				if (!b.live)
+				{
+					continue;
+				}
+				b.i_batch = batch.n_tokens;
+				batch_add(batch, q.next, b.pos++, b.slot, true);
+				first = b.slot < first ? b.slot : first;
+				last  = std::max(last, b.slot);
+			}
 		}
 
 		const double t0  = now_seconds();
@@ -2618,10 +3637,21 @@ void Runner::run()
 		// a phase decodes, and that invalidates the logits of every other slot.
 		for (size_t i = 0; i < seqs.size(); i++)
 		{
-			if (seqs[i].job >= 0)
+			if (seqs[i].job < 0)
 			{
-				seqs[i].sampled = sample(seqs[i], llama_get_logits_ith(ctx, seqs[i].i_batch));
+				continue;
 			}
+			// Every row of this decode, the branches' included, before any of it
+			// is applied (SPEC_BATCH §4.7).
+			for (int k = 0; k < BRANCH_KINDS; k++)
+			{
+				if (seqs[i].branch[k].live)
+				{
+					fetch_row(seqs[i].branch[k]);
+				}
+			}
+			seqs[i].sampled = sample(seqs[i],
+			                         blend_row(seqs[i], llama_get_logits_ith(ctx, seqs[i].i_batch)));
 		}
 		for (size_t i = 0; i < seqs.size(); i++)
 		{
@@ -2697,6 +3727,26 @@ static void run_dump_logits(llama_context * ctx, llama_batch & batch, int n_voca
 	printf("wrote %s [%d] float32\n", p.dump_logits.c_str(), n_vocab);
 }
 
+// `--dump-logits FILE.npy` writes the branch rows beside it as
+// `FILE.primary.npy`, `FILE.blank.npy`, ... (SPEC_GUIDANCE §3).
+static std::string dump_sibling(const std::string & path, const char * what)
+{
+	const size_t npy = path.size() >= 4 && path.compare(path.size() - 4, 4, ".npy") == 0
+	                   ? path.size() - 4 : path.size();
+	return path.substr(0, npy) + "." + what + ".npy";
+}
+
+static void save_row_or_die(const std::string & path, int n_vocab, const float * row)
+{
+	const std::vector<int64_t> shape = { (int64_t) n_vocab };
+	const std::string          err   = npy::save(path.c_str(), shape, row);
+	if (!err.empty())
+	{
+		die("%s", err.c_str());
+	}
+	printf("wrote %s [%d] float32\n", path.c_str(), n_vocab);
+}
+
 // `yue2 ar --dump-logits`: the goldens' path, one sequence, unchanged.
 static int run_ar_dump(const ArParams & p)
 {
@@ -2709,6 +3759,14 @@ static int run_ar_dump(const ArParams & p)
 		{
 			die("%s", err.c_str());
 		}
+	}
+	if (req.has_keep)
+	{
+		// The row this flag dumps is the *first* semantic step, and with codes
+		// kept that step is N — a prefill of the whole kept stretch, which is
+		// what --artifacts is for.
+		die("--dump-logits dumps the first semantic step, which \"semantic_keep\" moves to "
+		    "frame %d; run the request with --artifacts instead", req.keep_frames);
 	}
 
 	llama_log_set(quiet_log, nullptr);
@@ -2725,19 +3783,58 @@ static int run_ar_dump(const ArParams & p)
 		die("vocab is %d, the protocol requires exactly %d — wrong GGUF?", n_vocab, VOCAB_SIZE);
 	}
 
-	std::vector<llama_token> prefix_abc;
-	prefix_abc.push_back(EOD);
+	const std::vector<llama_token> prefix_abc = prefix_head(vocab, req.text());
+
+	// Guided: the row worth dumping is the *blended* one of the first semantic
+	// step, so the prefixes are the semantic ones and every live branch is
+	// prefilled beside the positive sequence (SPEC_GUIDANCE §3).
+	const bool                            guided = is_guided(req);
+	const std::vector<GuidanceEntry>      plan   = guidance_plan(req);
+	std::vector<std::vector<llama_token>> feeds;
+	std::vector<int>                      kinds;   // parallel to feeds, -1 = the positive one
+	if (!guided)
 	{
-		const std::vector<llama_token> ids = tokenize(vocab, req.text(), "request text");
-		prefix_abc.insert(prefix_abc.end(), ids.begin(), ids.end());
+		feeds.push_back(prefix_abc);
+		kinds.push_back(-1);
+	} else {
+		if (req.cot != "off" && !req.has_abc)
+		{
+			die("--dump-logits on a guided request dumps the first *semantic* step, so the "
+			    "score has to be in the request's \"abc\" (or cot=off) — writing one is a "
+			    "whole decode, which is what --artifacts is for");
+		}
+		const std::vector<llama_token> abc_ids = req.cot == "off"
+		                                         ? std::vector<llama_token>()
+		                                         : tokenize(vocab, req.abc, "external abc");
+		feeds.push_back(semantic_prefix(prefix_abc, abc_ids));
+		kinds.push_back(-1);
+		// Only an entry at frame 0 is in force at step 0, and §2.3 keeps
+		// "previous" out of one: in practice that is the blank branch alone.
+		if (!plan.empty() && plan[0].frame == 0)
+		{
+			for (int k = 0; k < BRANCH_KINDS; k++)
+			{
+				if (plan[0].has[k] && curve_needed_from(plan[0].curve[k], 0))
+				{
+					feeds.push_back(k == BRANCH_BLANK ? blank_prefix(vocab, req, abc_ids)
+					                                  : semantic_prefix(prefix_abc, abc_ids));
+					kinds.push_back(k);
+				}
+			}
+		}
 	}
-	prefix_abc.push_back(ABC_START);
+
+	size_t longest = 0;
+	for (size_t i = 0; i < feeds.size(); i++)
+	{
+		longest = std::max(longest, feeds[i].size());
+	}
 
 	llama_context_params cparams = llama_context_default_params();
-	cparams.n_ctx     = (uint32_t) prefix_abc.size() + 4;
-	cparams.n_batch   = (uint32_t) std::max<size_t>(prefix_abc.size(), 512);
+	cparams.n_ctx     = (uint32_t) (longest + 4) * (uint32_t) feeds.size();
+	cparams.n_batch   = (uint32_t) std::max<size_t>(longest, 512);
 	cparams.n_ubatch  = cparams.n_batch;
-	cparams.n_seq_max = 1;
+	cparams.n_seq_max = (uint32_t) feeds.size();
 	cparams.no_perf   = true;
 	if (p.threads > 0)
 	{
@@ -2750,11 +3847,55 @@ static int run_ar_dump(const ArParams & p)
 	{
 		die("failed to create the llama context");
 	}
-	printf("context: %u tokens, abc prefix %zu tokens, batch %u\n",
-	       cparams.n_ctx, prefix_abc.size(), llama_n_batch(ctx));
+	printf("context: %u tokens, %s prefix %zu tokens, batch %u\n",
+	       cparams.n_ctx, guided ? "semantic" : "abc", feeds[0].size(), llama_n_batch(ctx));
 
 	llama_batch batch = llama_batch_init((int32_t) llama_n_batch(ctx), 0, 1);
-	run_dump_logits(ctx, batch, n_vocab, p, prefix_abc);
+	if (!guided)
+	{
+		run_dump_logits(ctx, batch, n_vocab, p, prefix_abc);
+	} else {
+		// Branches first, the positive sequence last: each row is copied out as
+		// it is produced, since the next llama_decode overwrites the buffer.
+		const double                    t0 = now_seconds();
+		std::vector<std::vector<float>> rows(feeds.size());
+		for (size_t i = feeds.size(); i > 0; i--)
+		{
+			llama_pos     pos    = 0;
+			const int     last   = decode_feed(ctx, batch, feeds[i - 1], (int) i - 1, pos,
+			                                   kinds[i - 1] < 0 ? "primary" : branch_name(kinds[i - 1]));
+			const float * logits = llama_get_logits_ith(ctx, last);
+			if (logits == nullptr)
+			{
+				die("llama_get_logits_ith(%d) returned NULL for the %s prefix", last,
+				    kinds[i - 1] < 0 ? "primary" : branch_name(kinds[i - 1]));
+			}
+			rows[i - 1].assign(logits, logits + n_vocab);
+		}
+
+		// The blend of §2.1 over the ids the semantic sampler can visit; outside
+		// them the file keeps the positive row, so one .npy shows both.
+		std::vector<float> blended = rows[0];
+		for (int i = 0; i < SEM_ROW_LEN; i++)
+		{
+			const float b   = rows[0][(size_t) (SEM_ROW_FIRST + i)];
+			float       acc = b;
+			for (size_t k = 1; k < rows.size(); k++)
+			{
+				const float w = (float) curve_at(plan[0].curve[kinds[k]], 0);
+				acc += w * (b - rows[k][(size_t) (SEM_ROW_FIRST + i)]);
+			}
+			blended[(size_t) (SEM_ROW_FIRST + i)] = acc;
+		}
+		printf("prefill: %.3f s, %zu branch%s\n", now_seconds() - t0, rows.size() - 1,
+		       rows.size() == 2 ? "" : "es");
+		save_row_or_die(p.dump_logits, n_vocab, blended.data());
+		for (size_t i = 0; i < rows.size(); i++)
+		{
+			save_row_or_die(dump_sibling(p.dump_logits, i == 0 ? "primary" : branch_name(kinds[i])),
+			                n_vocab, rows[i].data());
+		}
+	}
 
 	llama_batch_free(batch);
 	llama_free(ctx);
@@ -2848,6 +3989,10 @@ std::string load_jobs_file(const std::string & path, bool need_out, std::vector<
 		{
 			return strf("%s: job %zu needs a \"request\"", path.c_str(), i + 1);
 		}
+		// SPEC_KEEP §2: for a batch, a relative path inside a request resolves
+		// against the batch file, which is the one the paths around it are
+		// written beside.
+		job.base_dir = dir_of(path);
 		if (need_out && job.out.empty())
 		{
 			return strf("%s: job %zu needs an \"out\"", path.c_str(), i + 1);
@@ -2966,41 +4111,9 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	std::vector<JobState> states(jobs.size());
 	results.assign(jobs.size(), ArResult());
 
-	// ---- validation, before anything loads (SPEC_BATCH §3.1) ----------------
-
-	int rejected = 0;
-	for (size_t i = 0; i < jobs.size(); i++)
-	{
-		JobState & js = states[i];
-		if (jobs.size() > 1)
-		{
-			const std::string & shown = jobs[i].out.empty() ? jobs[i].artifacts : jobs[i].out;
-			const size_t        slash = shown.find_last_of('/');
-			js.tag = strf("[%zu/%zu %s] ", i + 1, jobs.size(),
-			              slash == std::string::npos ? shown.c_str() : shown.c_str() + slash + 1);
-		}
-		const std::string err = prepare_request(jobs[i].request_path, p.cot,
-			jobs[i].has_seed, jobs[i].has_seed ? jobs[i].seed : 0, js.req, js.guidance);
-		if (err.empty())
-		{
-			continue;
-		}
-		if (!p.continue_on_error)
-		{
-			die("%s", err.c_str());
-		}
-		fprintf(stderr, "error: %s%s\n", js.tag.c_str(), err.c_str());
-		js.ok            = false;
-		results[i].ok    = false;
-		results[i].error = err;
-		rejected++;
-	}
-	if (rejected == (int) jobs.size())
-	{
-		fprintf(stderr, "error: every job was rejected; nothing to decode\n");
-		return 1;
-	}
-
+	// The per-phase limits, before validation rather than after it: the kept
+	// frames of SPEC_KEEP count against the semantic cap, and that is a
+	// request error like any other (§2).
 	Sampling s_abc = sampling_abc();
 	Sampling s_sem = sampling_semantic();
 	if (p.max_abc > 0)
@@ -3017,6 +4130,78 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	{
 		s_abc.temperature = 0;
 		s_sem.temperature = 0;
+	}
+
+	// ---- validation, before anything loads (SPEC_BATCH §3.1) ----------------
+
+	int rejected = 0;
+	auto reject = [&](size_t i, const std::string & err)
+	{
+		if (!p.continue_on_error)
+		{
+			die("%s", err.c_str());
+		}
+		fprintf(stderr, "error: %s%s\n", states[i].tag.c_str(), err.c_str());
+		states[i].ok     = false;
+		results[i].ok    = false;
+		results[i].error = err;
+		rejected++;
+	};
+
+	for (size_t i = 0; i < jobs.size(); i++)
+	{
+		JobState & js = states[i];
+		if (jobs.size() > 1)
+		{
+			const std::string & shown = jobs[i].out.empty() ? jobs[i].artifacts : jobs[i].out;
+			const size_t        slash = shown.find_last_of('/');
+			js.tag = strf("[%zu/%zu %s] ", i + 1, jobs.size(),
+			              slash == std::string::npos ? shown.c_str() : shown.c_str() + slash + 1);
+		}
+		const std::string err = prepare_request(jobs[i].request_path, p.cot,
+			jobs[i].has_seed, jobs[i].has_seed ? jobs[i].seed : 0, js.req, js.guidance);
+		if (!err.empty())
+		{
+			reject(i, err);
+			continue;
+		}
+		// The earlier render's codes (SPEC_KEEP §2). Read here, so a bad file is
+		// one more rejected job rather than a death in the middle of a batch,
+		// and so nothing has touched the GPU yet.
+		if (js.req.has_keep)
+		{
+			const std::string keep_err = load_keep_codes(js.req, jobs[i].base_dir,
+				s_sem.max_tokens, js.keep_codes, js.keep_name);
+			if (!keep_err.empty())
+			{
+				js.keep_codes.clear();
+				reject(i, strf("%s: %s", jobs[i].request_path.c_str(), keep_err.c_str()));
+			}
+		}
+	}
+
+	// SPEC_GUIDANCE §2.4: a guided job needs the whole context to itself, since
+	// its shadow branches are the other KV streams. The decode runs at the
+	// *clamped* parallel — one job of a `yue2 batch --parallel 4` is still a
+	// single song — so that is what the jobs are held to.
+	int parallel = std::min<int>(p.parallel, (int) jobs.size() - rejected);
+	if (parallel > 1)
+	{
+		for (size_t i = 0; i < jobs.size(); i++)
+		{
+			if (states[i].ok && is_guided(states[i].req))
+			{
+				reject(i, strf("%s: guidance needs --parallel 1 (this batch decodes %d songs "
+				               "side by side)", jobs[i].request_path.c_str(), parallel));
+			}
+		}
+		parallel = std::min<int>(parallel, (int) jobs.size() - rejected);
+	}
+
+	if (rejected == (int) jobs.size())
+	{
+		fprintf(stderr, "error: every job was rejected; nothing to decode\n");
+		return 1;
 	}
 
 	// ---- model -------------------------------------------------------------
@@ -3065,10 +4250,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			                "already (no normalisation is performed)\n", js.tag.c_str());
 		}
 
-		const std::vector<llama_token> ids = tokenize(vocab, text, "request text");
-		js.prefix_abc.push_back(EOD);
-		js.prefix_abc.insert(js.prefix_abc.end(), ids.begin(), ids.end());
-		js.prefix_abc.push_back(ABC_START);
+		js.prefix_abc = prefix_head(vocab, text);
 
 		js.do_abc = js.req.cot != "off" && !js.req.has_abc;
 
@@ -3194,10 +4376,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 		const size_t sem_prefix_len = js.prefix_abc.size() + js.abc_ids.size() + 2;
 		if (!js.do_abc)
 		{
-			js.prefix_sem = js.prefix_abc;
-			js.prefix_sem.insert(js.prefix_sem.end(), js.abc_ids.begin(), js.abc_ids.end());
-			js.prefix_sem.push_back(ABC_END);
-			js.prefix_sem.push_back(MUSIC_START);
+			js.prefix_sem = semantic_prefix(js.prefix_abc, js.abc_ids);
 			max_feed = std::max(max_feed, sem_prefix_len);
 		}
 		max_feed = std::max(max_feed, js.prefix_abc.size());
@@ -3209,7 +4388,50 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			    js.tag.c_str(), sem_prefix_len, s_sem.max_tokens, CONTEXT);
 		}
 
-		uint32_t want = (uint32_t) (js.prefix_abc.size() + js.abc_ids.size() +
+		// The guidance plan and the prefix head of every branch it can open
+		// (SPEC_GUIDANCE §4.4/§4.5). Only the head differs between the positive
+		// sequence and a branch — the score and the two closing tokens are the
+		// same — so the longest head is what the context has to be sized on.
+		js.guide = guidance_plan(js.req);
+		js.heads.assign(js.guide.size(), std::vector<llama_token>());
+		size_t head_max = js.prefix_abc.size();
+		if (!js.guide.empty())
+		{
+			// [EOD] + the instruction on its own + [ABC_START], which is what
+			// blank_prefix builds; cot=off's is shorter still.
+			head_max = std::max(head_max,
+			                    tokenize(vocab, instruction(js.req.cot),
+			                             "negative instruction").size() + 2);
+			for (size_t k = 0; k < js.guide.size(); k++)
+			{
+				if (!js.guide[k].has_style)
+				{
+					continue;
+				}
+				Request alt = js.req;      // only the tags change: same lyrics, same score
+				alt.style   = js.guide[k].style;
+				js.heads[k] = prefix_head(vocab, alt.text());
+				head_max    = std::max(head_max, js.heads[k].size());
+			}
+			const size_t longest = head_max + js.abc_ids.size() +
+			                       (js.do_abc ? (size_t) s_abc.max_tokens : 0) + 2;
+			if ((int) longest + s_sem.max_tokens > CONTEXT)
+			{
+				die("%sguidance: a branch prefix of %zu tokens + max_tokens %d exceeds the "
+				    "%d context; shorten the style text of the entries",
+				    js.tag.c_str(), longest, s_sem.max_tokens, CONTEXT);
+			}
+			if (!js.do_abc)
+			{
+				// As for the positive sequence: a job that skips the abc phase
+				// prefills a whole prefix in one go. A job that writes its score
+				// prefills the branches through decode_feed's chunking instead,
+				// so n_batch stays where the unguided path put it.
+				max_feed = std::max(max_feed, longest);
+			}
+		}
+
+		uint32_t want = (uint32_t) (head_max + js.abc_ids.size() +
 		                            (js.do_abc ? (size_t) s_abc.max_tokens : 0) + 2 +
 		                            (size_t) s_sem.max_tokens + 8);
 		if (js.is_template)
@@ -3271,13 +4493,22 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 
 	// ---- context -----------------------------------------------------------
 
-	const int parallel = std::min<int>(p.parallel, (int) jobs.size() - rejected);
+	// A guided song owns three KV streams: the positive sequence and up to two
+	// shadow branches (SPEC_GUIDANCE §4.1). `parallel` keeps meaning "songs
+	// decoded side by side" — it is what result.json records — so the stream
+	// count is its own number, and it is 3 only when a guided job was accepted.
+	bool guided = false;
+	for (size_t i = 0; i < jobs.size(); i++)
+	{
+		guided = guided || (states[i].ok && !states[i].guide.empty());
+	}
+	const int n_streams = guided ? BRANCH_KINDS + 1 : parallel;
 
 	llama_context_params cparams = llama_context_default_params();
-	cparams.n_ctx     = n_ctx_want * (uint32_t) parallel;
+	cparams.n_ctx     = n_ctx_want * (uint32_t) n_streams;
 	cparams.n_batch   = (uint32_t) std::max<size_t>(max_feed, 512);
 	cparams.n_ubatch  = cparams.n_batch;
-	cparams.n_seq_max = (uint32_t) parallel;
+	cparams.n_seq_max = (uint32_t) n_streams;
 	cparams.kv_unified = false;     // one KV stream per slot; llama's default
 	cparams.no_perf   = true;
 	if (p.threads > 0)
@@ -3290,16 +4521,17 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	const int    head_dim     = llama_model_n_embd(model) / llama_model_n_head(model);
 	const double kv_per_token = (double) llama_model_n_layer(model) *
 	                            llama_model_n_head_kv(model) * head_dim * 2 * 2;
-	printf("context: %u tokens/slot x %d slot%s, batch %u, KV ~%.0f MiB/slot = %.2f GiB\n",
-	       n_ctx_want, parallel, parallel == 1 ? "" : "s", cparams.n_batch,
+	printf("context: %u tokens/slot x %d slot%s%s, batch %u, KV ~%.0f MiB/slot = %.2f GiB\n",
+	       n_ctx_want, n_streams, n_streams == 1 ? "" : "s",
+	       guided ? " (1 song + up to 2 guidance branches)" : "", cparams.n_batch,
 	       kv_per_token * n_ctx_want / 1048576.0,
-	       kv_per_token * n_ctx_want * parallel / 1073741824.0);
+	       kv_per_token * n_ctx_want * n_streams / 1073741824.0);
 
 	llama_context * ctx = llama_init_from_model(model, cparams);
 	if (ctx == nullptr)
 	{
 		die("failed to create a %u-token context with %d sequences — "
-		    "out of VRAM? lower --parallel", cparams.n_ctx, parallel);
+		    "out of VRAM? lower --parallel", cparams.n_ctx, n_streams);
 	}
 	// libllama pads n_ctx to a multiple of 256 and n_ctx_seq = n_ctx / n_seq_max
 	// up again (llama-context.cpp:288-303), so this can only hold — but every
@@ -3317,12 +4549,13 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	r.vocab     = vocab;
 	r.mem       = llama_get_memory(ctx);
 	r.batch     = llama_batch_init((int32_t) std::max<uint32_t>(cparams.n_batch,
-	                                                            (uint32_t) parallel), 0, 1);
+	                                                            (uint32_t) n_streams), 0, 1);
 	r.n_vocab   = n_vocab;
 	r.s_abc     = s_abc;
 	r.s_sem     = s_sem;
 	r.n_ctx_seq = n_ctx_seq;
 	r.parallel  = parallel;
+	r.n_streams = n_streams;
 	r.card      = backend_name;
 	r.verify    = p.verify_sampler;
 	r.jobs      = &jobs;
@@ -3332,6 +4565,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	for (int i = 0; i < parallel; i++)
 	{
 		r.seqs[(size_t) i].slot = i;
+		r.seqs[(size_t) i].home = i;
 	}
 
 	const double t_ar0 = now_seconds();
@@ -3398,6 +4632,7 @@ int run_ar(const ArParams & p, ArResult * out)
 	{
 		ArJob job;
 		job.request_path = p.request_path;
+		job.base_dir     = dir_of(p.request_path);
 		job.artifacts    = p.artifacts;
 		job.has_seed     = p.has_seed;
 		job.seed         = p.seed;

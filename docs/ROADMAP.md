@@ -18,6 +18,17 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   step allocates nothing. Token-for-token identical to stage 5 (over 600 000
   differential cases including one-ulp tie injection + full songs under
   `--verify-sampler` + a byte-identical seeded song). Numbers in [src/STATUS_SAMPLER.md](../src/STATUS_SAMPLER.md).
+- Stage 7: guided semantic decoding. `cfg_scale` is honoured (the reference's
+  classifier-free guidance), and the `guidance` request key generalises it to
+  time-varying weight curves against up to two negative branches plus a positive
+  prefix that can change at a given frame — mid-song style changes. One song,
+  up to three KV streams, one blended row into the unchanged sampler. Numbers in
+  [src/STATUS_GUIDANCE.md](../src/STATUS_GUIDANCE.md).
+- Stage 7b: `semantic_keep` — the leading codes of an earlier render are forced
+  as history instead of being sampled, so "keep this take up to the cut, change
+  it from there" is a prefill (1000 frames in 0.4 s on the Arc, against 7.3 s to
+  sample them) and combines with a `guidance` entry at that frame. Numbers in
+  [src/STATUS_GUIDANCE.md](../src/STATUS_GUIDANCE.md) §"Stage 7b".
 - The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
   Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
   exact) indistinguishable, and on the AMD the exact path is not faster — so
@@ -53,8 +64,12 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
    never share the box. With two cards (AR on one, NAR on the other) a batch
    would cost `max(AR, NAR)` instead of their sum. Needs a thread and two device
    contexts; deliberately out of stage 5.
-5. **`cfg_scale` (classifier-free guidance).** yue2-ar dies on it today. The
-   reference implements it in the AR stage; the NAR is unaffected.
+5. **Guidance at `--parallel > 1`, and with `abc_template`.** A guided song owns
+   all three KV streams today, so it rejects a batch that decodes several songs
+   side by side; lifting that means slot bookkeeping for `3 x parallel` streams
+   (and the VRAM for it). A template job re-prefills its slot when the score is
+   done, which the branches would have to follow — neither is hard, both were
+   out of stage 7.
 6. **Regression harness in-tree.** `tests/regress.sh` decodes a directory of
    the author's own renders (45 styles of one song, 63–117 dB against the
    reference audio, all passing); a public repo needs one that runs from the

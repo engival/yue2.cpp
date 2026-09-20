@@ -76,4 +76,11 @@ if(YUE2_BUILD_TESTS)
 	target_include_directories(yue2-bars PRIVATE src)
 	target_link_libraries(yue2-bars PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-bars PRIVATE ${YUE2_WARN_FLAGS})
+
+	# Stage 7 (guidance): the weight curves, the branch lifecycle rule and every
+	# request error of SPEC_GUIDANCE.md §2.3/§2.4 — no model, no device.
+	add_executable(yue2-guidance tests/guidance.cpp)
+	target_include_directories(yue2-guidance PRIVATE src)
+	target_link_libraries(yue2-guidance PRIVATE llama ggml vendor::hash vendor::nlohmann)
+	target_compile_options(yue2-guidance PRIVATE ${YUE2_WARN_FLAGS})
 endif()

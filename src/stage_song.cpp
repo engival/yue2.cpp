@@ -193,7 +193,11 @@ json json_timing(const GenStats & st)
 	out["content_tokens"]  = st.content_tokens;
 	out["output_tps"]      = st.output_tps;
 	out["prefix_tokens"]   = st.prefix_tokens;
-	out["cfg_branches"]    = 1;
+	out["cfg_branches"]           = st.cfg_branches;
+	out["guided_steps"]           = st.guided_steps;
+	out["branch_prefill_seconds"] = st.branch_prefill_seconds;
+	out["kept_frames"]            = st.kept_frames;
+	out["keep_prefill_seconds"]   = st.keep_prefill_seconds;
 	out["execution"]       = "eager";
 	out["attention"]       = "llama.cpp";
 	return out;
@@ -678,6 +682,8 @@ int run_song(const SongParams & p)
 
 	ArJob job;
 	job.request_path = p.request_path;
+	// SPEC_KEEP §2: a relative "semantic_keep" path is beside the request file.
+	job.base_dir     = std::filesystem::path(p.request_path).parent_path().string();
 	job.out          = p.out;
 	job.artifacts    = p.artifacts;
 	job.noise_path   = p.noise_path;

@@ -95,8 +95,9 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template` and `cfg_scale` are optional. Lyrics carry `[Section]` tags on their own
-lines:
+`abc`, `abc_template`, `cfg_scale`, `guidance` and `semantic_keep` are optional.
+Lyrics carry `[Section]` tags on
+their own lines:
 
 ```json
 {
@@ -174,6 +175,113 @@ song, and the template as given is kept beside it as `template.abc`.
 `result.json` gains a `template` block counting the holes, retries and
 rest-fills. `"abc_template"` is mutually exclusive with `"abc"` and needs `cot`
 `full` or `melody`.
+
+**Push the semantic phase around: `cfg_scale` and `guidance`.** The codec phase
+can be decoded beside up to two *negative* sequences carrying the same generated
+history under a different prefix, and the blend of the three is what the sampler
+sees:
+
+```
+L = B + sum_i w_i(t) * (B - N_i)
+```
+
+`"cfg_scale": c` is the reference's classifier-free guidance and needs nothing
+else: one negative branch holding the instruction and the exact score but no tags
+and no lyrics, at the constant weight `c - 1`, for the whole phase. (`cot: "off"`
+defaults to `1.01`, as the reference does; say `"cfg_scale": 1.0` for the plain
+single-sequence decode.)
+
+`"guidance"` is the same machinery with time-varying weights and a positive
+prefix that can change part-way through — which is how a song changes band or
+gains a voice mid-stream:
+
+```json
+"guidance": [
+  { "frame": 3400,
+    "style": "brass band, snare rolls, bright trumpet lead",
+    "against": {
+      "previous": [[0, 11], [60, 11], [85, 3]],
+      "blank":    [[0, 2]]
+    } }
+]
+```
+
+- `frame` is the semantic step the entry takes effect at — **25 frames = 1 s of
+  audio**. Entries are strictly increasing in `frame`; one that the song never
+  reaches is reported as `"reached": false` rather than being an error.
+- `style` replaces the tags of the positive prefix (same lyrics, same score). It
+  is optional: without it the entry only changes the curves. It cannot sit on an
+  entry at frame 0 — from the first frame on, the request's own `style` is that.
+- `against.previous` pushes away from the prefix that was in force *before* this
+  entry — it needs a `style` to have something to push away from. `against.blank`
+  pushes away from `cfg_scale`'s negative prefix.
+- A curve is a list of `[offset, weight]` with `offset` in frames after the
+  entry's `frame`: linear in between, the first weight before the first keyframe,
+  the last weight after the last, and two keyframes at one offset a step. A curve
+  that reaches zero and stays there drops its branch, and the song goes back to
+  full speed.
+- A new entry replaces the previous entry's curves; a branch it does not name has
+  weight 0 from there on.
+
+Swapping the tags mid-stream on its own does nothing audible — after ~3 s of
+audio the codec history dominates the next token and the tags barely move it.
+Amplifying what is left of their influence is what works. Starting points, from
+listening tests on one song (not laws):
+
+| intent | `previous` | `blank` |
+|---|---|---|
+| the band changes at a section | `[[0, 5]]` | `[[0, 2]]` |
+| a new lead voice enters | `[[0, 11], [60, 11], [85, 3]]` | `[[0, 2]]` |
+| gradual colouring | `[[0, 0], [750, 5]]` | — |
+
+Start the entry about 1.4 s (35 frames) **before** the bar line of the section
+that should open in the new style; a push that starts inside a sung phrase
+garbles it. A strong `previous` push alone will bring in a voice the recording
+never held but destroys the words with it — the small `blank` push beside it is
+what keeps them intelligible.
+
+The normalised block, with a `reached` flag per entry, is written to
+`guidance.json` in the artifacts directory and into `plan.json`; `request.json`
+keeps only `cfg_scale`, so it stays loadable by the reference. Guidance needs
+`--parallel 1` (the branches are the other KV streams) and does not combine with
+`"abc_template"` yet. Only the semantic phase is guided; the score phase never is.
+
+**Keep the start of an earlier render: `semantic_keep`.** A guided song is still
+sampled from frame 0, so feeding the same score back gives a *new* performance.
+`"semantic_keep"` does the opposite — it forces the codes of a render you already
+like as history and only changes what comes after the cut:
+
+```json
+"abc": "X:1\nM:3/4\n…the score that render sang…",
+"semantic_keep": { "file": "earlier/semantic.npy", "frames": 3400 },
+"guidance": [
+  { "frame": 3400,
+    "style": "uptempo ska, offbeat guitar, horn section, bright tenor vocal",
+    "against": { "previous": [[0, 11], [60, 11], [85, 3]], "blank": [[0, 2]] } }
+]
+```
+
+- It is not automatically the better way to restyle a render you like. Guidance
+  only pushes where the old and the new tags disagree *given the history*: a kept
+  history that lacks what the new style expects (no drums under a voice the model
+  associates with a beat) gives the transition the most to fight, and the band may
+  be rebuilt along with the voice. A fresh guided take, whose own band suits both
+  halves, often cuts cleaner. Try fresh seeds first; keep is for A/B against a known
+  first half and for skipping its sampling time.
+- `file` is a `semantic.npy` as `yue2 ar|song --artifacts` writes it; a relative
+  path resolves against the request file (for `--requests`/`--jobs`, against the
+  batch file). `frames` is how many of its leading codes to keep — required,
+  there is no implicit "all of it".
+- It needs the score those codes were sung to, in `"abc"`: a freshly written
+  score would not match them. `"abc_template"` is out for the same reason.
+- Frames `0 .. N-1` are not sampled and cost one prefill instead (1000 frames in
+  0.4 s on the Arc, against 7.3 s to sample them). Everything else counts them as
+  steps: the repetition window, the frame cap, the end token.
+- The run's `semantic.npy` is the kept codes followed by the sampled ones, so the
+  NAR and VAE need nothing new, and `plan.json` records `frames` and a SHA-256 of
+  what was kept (not the path — artifacts stay relocatable).
+- Combine it with `guidance` at `"frame": N` for "keep this take up to the cut,
+  change the band from there". A `guidance` entry *below* `N` is a request error.
 
 Transposing a score, moving the singer's register, stripping the chords, resting
 out or re-writing the accompaniment, reading a seed's score before rendering it:
@@ -290,7 +398,10 @@ job of the artifacts instead: `semantic.npy` and `latent.npy` from
 `--artifacts DIR` re-render bit-identically through `yue2 nar` and `yue2 vae` on
 the same card, with no seed involved. The same seed with the same card, build,
 `--parallel` and batch shape will in practice repeat a song — treat that as a
-convenience, not a contract.
+convenience, not a contract. A guided song (`cfg_scale`, `guidance`) decodes
+batches of two or three rows for as long as a branch is live, so the same rule
+applies to it: a seed repeats it only together with the same guidance block. The
+steps before the first entry are single-row and match the unguided song exactly.
 
 ## Decode
 

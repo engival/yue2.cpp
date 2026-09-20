@@ -32,6 +32,7 @@ struct ArParams
 struct ArJob
 {
 	std::string request_path;
+	std::string base_dir;          // what a relative path inside the request resolves against
 	std::string artifacts;
 	std::string out;               // the FLAC `yue2 batch` writes; `yue2 ar` ignores it
 	std::string noise_path;
@@ -67,6 +68,16 @@ struct GenStats
 	double ttft_seconds    = 0;
 	double output_tps      = 0;
 	bool   truncated       = false;
+	// SPEC_GUIDANCE §3: how many sequences this song decoded at once at the most
+	// (1 unguided), how many semantic steps had more than one, and what
+	// prefilling the extra ones cost. Song-level, carried on both phases.
+	int    cfg_branches    = 1;
+	int    guided_steps    = 0;
+	double branch_prefill_seconds = 0;
+	// SPEC_KEEP §4: the leading codes this song took from an earlier render
+	// instead of sampling them, and what prefilling them cost.
+	int    kept_frames     = 0;
+	double keep_prefill_seconds = 0;
 };
 
 // What the abc phase of a score-template job did with its holes. SPEC_TEMPLATE

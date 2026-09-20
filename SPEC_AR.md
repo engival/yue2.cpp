@@ -144,8 +144,9 @@ temperature == 0: argmax → else divide by temperature → top-k (keep ≥ k-th
 → top-p (sort desc, softmax, drop where `cumsum − p > top_p`, always keep the top 1)
 → sample from softmax with a seeded RNG (`std::mt19937_64(seed)`; exact RNG
 parity with torch is not expected — greedy is the parity path). Stop on `end`
-or `max_tokens`. Refuse prefix + max_tokens > CONTEXT. `cfg_scale != 1` →
-error "not supported" (stage 2b+).
+or `max_tokens`. Refuse prefix + max_tokens > CONTEXT. `cfg_scale != 1` blends
+the row this sampler is given, and changes nothing else in the order above:
+SPEC_GUIDANCE.md (stage 7) is its contract, and `guidance` generalises it.
 
 CLI:
 ```
