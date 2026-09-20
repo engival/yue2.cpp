@@ -43,6 +43,12 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   to rendering it by hand. The lag one take runs ahead of another is measured
   from the tokens (`"offset": "auto"`). Numbers in
   [src/STATUS_HANDOVER.md](../src/STATUS_HANDOVER.md).
+- Stage 10: `--nar-lora FILE[:S]` — a plain-layout safetensors LoRA is folded
+  into the NAR weights while they are read (single-threaded, a few seconds, no
+  graph change), so an adapter or a strength can be tried without a new GGUF;
+  `convert_nar.py --lora` bakes a keeper. A run without the flag is bit-identical
+  to stage 9. The AR half (libllama adapters) is not done. Numbers in
+  [src/STATUS_LORA.md](../src/STATUS_LORA.md).
 - The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
   Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
   exact) indistinguishable, and on the AMD the exact path is not faster — so

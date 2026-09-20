@@ -66,9 +66,10 @@ target_link_libraries(yue2-ar PRIVATE llama ggml vendor::hash vendor::nlohmann)
 target_compile_options(yue2-ar PRIVATE ${YUE2_WARN_FLAGS})
 
 # Stage 3: the NAR flow-matching half, raw ggml only (SPEC_NAR.md section 4.1).
+# vendor::nlohmann is for nothing but the safetensors header of --nar-lora.
 add_executable(yue2-nar src/yue2-nar.cpp src/stage_nar.cpp)
 target_include_directories(yue2-nar PRIVATE src)
-target_link_libraries(yue2-nar PRIVATE ggml)
+target_link_libraries(yue2-nar PRIVATE ggml vendor::nlohmann)
 target_compile_options(yue2-nar PRIVATE ${YUE2_WARN_FLAGS})
 
 # Stage 4: one binary for the whole song (SPEC_SINGLE.md). `yue2 song` runs the

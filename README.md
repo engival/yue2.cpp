@@ -697,3 +697,49 @@ Measured on the 164 s `alley_swing_s1`, 32 steps: Arc B70 92 s with
 F32 path (66.0 dB); 7900 XTX 52 s with `--flash-attn --vk-f16-matmul` (29.3 dB)
 or 124 s exact. torch ROCm bf16 on the same AMD card: 46 s. Details in
 `src/STATUS_NAR.md` and `src/STATUS_NAR_PERF.md`.
+
+### Trying a NAR LoRA (`--nar-lora`)
+
+`yue2 song`, `yue2 batch` and `yue2-nar` take `--nar-lora LORA.safetensors[:S]`,
+repeatable, and fold the adapter into the NAR weights while they are read — no
+new GGUF, no graph change, no per-step cost:
+
+```bash
+build/yue2 song --request song.json --out song.opus --nar-lora LORA.safetensors:0.8
+```
+
+`S` is the strength (default 1.0). Per weight the merge is `W += S·(B @ A)`, and
+for the `vae2llm` / `llm2vae` full replacements some adapters carry,
+`W += S·(W_new − W_base)`. Both are deltas against the base, so several
+`--nar-lora` flags stack in any order and `:0` is exactly the stock model. Each
+tensor is widened to F32 once, takes every adapter's delta and is narrowed back
+once; tensors no adapter names are not touched at all, so a run without the flag
+is bit-identical to one from a build that has never heard of LoRA. It is a
+property of the model, not of a request: one setting covers a whole `batch`, and
+`config.json` records the file, the strength and its SHA-256.
+
+Only the **plain** adapter layout is read: `layers.{i}.nar_self_attn.{q,k,v,o}_proj`
+and `layers.{i}.nar_mlp.{gate,up,down}_proj` as `lora_A` `[r, in]` + `lora_B`
+`[out, r]`, plus optional `vae2llm.*` / `llm2vae.*` replacements; `F32`, `F16`
+and `BF16` all load. A fused ComfyUI file (`diffusion_model.…`, block-diagonal
+`qkv_proj` / `gate_up_proj`) is refused with a message saying so — use the plain
+file. The AR half goes through libllama and is a separate job; this flag does not
+touch it.
+
+Once an adapter is a keeper, bake it in instead of merging it every load:
+
+```bash
+convert/convert_nar.py --out yue2-nar-lora.gguf --lora LORA.safetensors:0.8
+```
+
+Same merge rule, so the baked GGUF and the runtime merge agree to ~90 dB on the
+latent (they differ only in float summation order and in whether the base was
+rounded to F16 before the delta or after). `src/STATUS_LORA.md` has the numbers.
+
+The layout above is the one published by
+[Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4](https://huggingface.co/Mothersuperior/yue2-mothersuperior-realaudio-tokenizer-v4),
+whose `nar_lora_joint_v*.safetensors` files this was built and tested against
+(the plain ones, not `_comfyui`; its README documents the merge rule used here).
+
+Adapter weights carry their own licence, which is not this repo's: the NAR LoRAs
+published so far are CC BY-NC, and none are distributed here.

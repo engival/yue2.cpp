@@ -2,6 +2,8 @@
 // SPEC_NAR.md, src/STATUS_NAR.md, src/STATUS_NAR_PERF.md.
 #pragma once
 
+#include "common/lora.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -31,6 +33,10 @@ struct NarParams
 	bool     kv_f16           = false;
 	bool     have_seed        = false;
 	uint64_t seed             = 0;
+
+	// --nar-lora FILE[:S], stacked in command-line order and folded into the NAR
+	// weights while they are read (SPEC_LORA.md).
+	std::vector<lora::Spec> nar_lora;
 
 	// `yue2 song` hands the tokens and the noise over in memory rather than
 	// through prefix.npy / semantic.npy / nar_noise.npy (SPEC_SINGLE.md §2.3).

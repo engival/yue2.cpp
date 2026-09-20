@@ -20,6 +20,11 @@ cache -- see common.py:resolve_snapshot(). `--ar-gguf` is used only to read
 back its `yue2.source_sha256` so this script can assert the two files will
 agree (yue2-nar.cpp aborts at load time if they don't); if the AR gguf does
 not exist yet this check is skipped with a warning.
+
+`--lora LORA.safetensors[:STRENGTH]` (repeatable) bakes NAR adapters into the
+output, with the same merge rule `yue2 --nar-lora` applies at load: the deltas
+are summed in F32 against the checkpoint weight and the result is narrowed once.
+See ../SPEC_LORA.md.
 """
 from __future__ import annotations
 
@@ -72,6 +77,86 @@ def layer_tensor_map(n_layers: int) -> dict:
 	return m
 
 
+def parse_lora_arg(text: str) -> tuple[Path, float]:
+	"""SPEC_LORA section 2: split on the last ':' and only when what follows is a
+	float, so a path that happens to contain a colon still works."""
+	head, sep, tail = text.rpartition(":")
+	if sep:
+		try:
+			strength = float(tail)
+		except ValueError:
+			pass
+		else:
+			if not math.isfinite(strength):
+				raise SystemExit(f"--lora strength must be finite (got {text!r})")
+			return Path(head), strength
+	return Path(text), 1.0
+
+
+def lora_plan(lora_args: list[str], n_layers: int) -> dict:
+	"""{gguf tensor name: [(path, strength, lora_A, lora_B) or (path, strength,
+	W_new, None)]}, in command-line order. Mirrors src/common/lora.hpp."""
+	proj_map = {}
+	for n in range(n_layers):
+		for lora_proj, gguf_proj in (
+			("nar_self_attn.q_proj", "nar_attn_q"),
+			("nar_self_attn.k_proj", "nar_attn_k"),
+			("nar_self_attn.v_proj", "nar_attn_v"),
+			("nar_self_attn.o_proj", "nar_attn_output"),
+			("nar_mlp.gate_proj", "nar_ffn_gate"),
+			("nar_mlp.up_proj", "nar_ffn_up"),
+			("nar_mlp.down_proj", "nar_ffn_down"),
+		):
+			proj_map[f"layers.{n}.{lora_proj}"] = f"blk.{n}.{gguf_proj}.weight"
+	full_map = {
+		"vae2llm.weight": "nar.vae2llm.weight",
+		"vae2llm.bias": "nar.vae2llm.bias",
+		"llm2vae.weight": "nar.llm2vae.weight",
+		"llm2vae.bias": "nar.llm2vae.bias",
+	}
+
+	plan: dict = {}
+	for arg in lora_args:
+		path, strength = parse_lora_arg(arg)
+		pairs: dict = {}
+		with safe_open(path, framework="pt", device="cpu") as lf:
+			for key in lf.keys():
+				if key.startswith("diffusion_model."):
+					raise SystemExit(f"--lora {path}: fused ComfyUI layout (key {key!r}); "
+					                  f"use the plain adapter file instead")
+				if key in full_map:
+					plan.setdefault(full_map[key], []).append(
+						(path, strength, lf.get_tensor(key).to(torch.float32).numpy(), None))
+					continue
+				stem, sep, part = key.rpartition(".")
+				if not sep or part not in ("lora_A", "lora_B") or stem not in proj_map:
+					raise SystemExit(f"--lora {path}: key {key!r} maps to no NAR tensor")
+				pairs.setdefault(proj_map[stem], {})[part] = lf.get_tensor(key).to(torch.float32).numpy()
+		for gguf_name, both in pairs.items():
+			if "lora_A" not in both or "lora_B" not in both:
+				raise SystemExit(f"--lora {path}: {gguf_name} has only "
+				                  f"{sorted(both)[0]}, not both factors")
+			plan.setdefault(gguf_name, []).append((path, strength, both["lora_A"], both["lora_B"]))
+	return plan
+
+
+def apply_lora(base: np.ndarray, ops: list) -> np.ndarray:
+	"""W += s*(B @ A) for a pair, W += s*(W_new - W) for a replacement -- every
+	delta against `base`, summed in F32 before the single narrowing the caller
+	does (SPEC_LORA section 3.3)."""
+	out = base.astype(np.float32, copy=True)
+	for _, strength, a, b in ops:
+		if b is None:
+			if a.shape != base.shape:
+				raise SystemExit(f"--lora: replacement shape {a.shape} != base {base.shape}")
+			out += np.float32(strength) * (a - base)
+		else:
+			if a.shape[1] != base.shape[1] or b.shape[0] != base.shape[0] or a.shape[0] != b.shape[1]:
+				raise SystemExit(f"--lora: factors {b.shape} x {a.shape} do not fit base {base.shape}")
+			out += (np.float32(strength) * b) @ a
+	return out
+
+
 def reference_pe(max_frames: int, hidden_size: int) -> np.ndarray:
 	"""Reimplementation of AudioPositionEmbedding.__init__ (modeling_yue2.py
 	:334-346), for the sanity check against the checkpoint's stored (BF16-
@@ -106,7 +191,11 @@ def main() -> int:
 	ap.add_argument("--type", choices=["f16", "f32"], default="f16",
 	                 help="dtype for 2D+ weight matrices and latent_pos_embed.pe; "
 	                      "1D norm/bias weights always stay F32")
+	ap.add_argument("--lora", action="append", default=[], metavar="FILE[:S]",
+	                 help="bake a NAR LoRA in (repeatable, applied in order); see ../SPEC_LORA.md")
 	args = ap.parse_args()
+
+	torch.set_num_threads(4)
 
 	import gguf
 
@@ -167,6 +256,19 @@ def main() -> int:
 	writer.add_string("yue2nar.ode_method", "midpoint")
 	writer.add_key_value("yue2.source_sha256", source_sha256, gguf.GGUFValueType.STRING)
 
+	# A baked GGUF keeps the checkpoint's source_sha256 -- it is still the same
+	# model pair, and yue2-nar.cpp matches it against the AR file. The adapters
+	# are recorded separately, as `yue2 song` records them in config.json.
+	plan = lora_plan(args.lora, n_layers)
+	if plan:
+		provenance = []
+		for arg in args.lora:
+			path, strength = parse_lora_arg(arg)
+			provenance.append({"file": path.name, "strength": strength, "sha256": sha256_of(path)})
+			print(f"[convert_nar] lora: {path} strength {strength}")
+		writer.add_key_value("yue2nar.lora", json.dumps(provenance), gguf.GGUFValueType.STRING)
+		print(f"[convert_nar] {len(plan)} tensors take a baked delta")
+
 	tmap = layer_tensor_map(n_layers)
 	table = []
 	qtype = gguf.GGMLQuantizationType.F16 if args.type == "f16" else gguf.GGMLQuantizationType.F32
@@ -189,6 +291,8 @@ def main() -> int:
 		for src_name, (gguf_name, kind) in tmap.items():
 			t = f.get_tensor(src_name).to(torch.float32).numpy()
 			t = np.ascontiguousarray(t)
+			if gguf_name in plan:
+				t = np.ascontiguousarray(apply_lora(t, plan.pop(gguf_name)))
 			if kind == "norm":
 				out = t.astype(np.float32)
 				writer.add_tensor(gguf_name, out)
@@ -203,6 +307,9 @@ def main() -> int:
 				out = gguf.quants.quantize(t, qtype)
 				writer.add_tensor(gguf_name, out, raw_dtype=qtype)
 				table.append((gguf_name, list(t.shape), qtype.name))
+
+	if plan:
+		raise SystemExit(f"--lora: {sorted(plan)[:5]} name tensors this converter does not write")
 
 	n_expected = 11 * n_layers + 9
 	assert len(tmap) == n_expected, f"expected {n_expected} tensors, mapped {len(tmap)}"

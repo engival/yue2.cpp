@@ -4,6 +4,7 @@
 
 #include "stage_ar.hpp"
 
+#include "common/lora.hpp"
 #include "common/opus.hpp"
 
 #include <cstdint>
@@ -28,6 +29,7 @@ struct SongParams
 	bool        guidance_trace = false;   // --guidance-trace, needs --artifacts to land in
 	bool        no_tags  = false;   // --no-tags: the FLAC carries no Vorbis comments
 	int         opus_bitrate = opus::BITRATE_DEFAULT;   // --opus-bitrate, kbit/s, for an .opus --out
+	std::vector<lora::Spec> nar_lora;   // --nar-lora, a property of the model, not of a request
 };
 
 // What `yue2 batch` takes for the whole list; everything that differs per song
@@ -54,6 +56,7 @@ struct BatchParams
 	bool        guidance_trace = false;   // per job: only one with its own artifacts traces
 	bool        no_tags  = false;
 	int         opus_bitrate = opus::BITRATE_DEFAULT;
+	std::vector<lora::Spec> nar_lora;
 };
 
 SongParams  parse_song_args (const char * argv0, int argc, char ** argv);

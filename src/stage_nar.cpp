@@ -91,8 +91,14 @@ struct Model
 // through vec_dot_f16, which rounds the *activations* to F16 as well (~1.7e-4
 // relative per matmul). That costs ~25 dB against the f32 torch golden, so the
 // CPU acceptance runs widen. See src/STATUS_NAR.md (deviation 1).
+//
+// `merge` (the NAR file only) folds the --nar-lora adapters in on the way past:
+// a targeted tensor is widened to F32, takes every adapter's delta and is
+// narrowed back once. Tensors no adapter names keep the untouched path, which is
+// what makes a run without the flag bit-identical (SPEC_LORA.md §3.3).
 static ggml_backend_buffer_t load_gguf(const char * path, const char * arch, ggml_backend_t backend,
-                                       Model & model, bool widen_f16, gguf_context ** gc_out)
+                                       Model & model, bool widen_f16, lora::Merge * merge,
+                                       gguf_context ** gc_out)
 {
 	gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
 	gguf_context * gc = gguf_init_from_file(path, gp);
@@ -131,6 +137,13 @@ static ggml_backend_buffer_t load_gguf(const char * path, const char * arch, ggm
 		model.tensors[name] = t;
 	}
 
+	// Every adapter key has to land on a tensor of a mergeable type and shape,
+	// and that is known now — before a byte of weight goes to the device.
+	if (merge != nullptr)
+	{
+		merge->bind(model.tensors);
+	}
+
 	ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(model.ctx, backend);
 	if (buf == nullptr)
 	{
@@ -144,8 +157,9 @@ static ggml_backend_buffer_t load_gguf(const char * path, const char * arch, ggm
 	}
 	const size_t data_offset = gguf_get_data_offset(gc);
 
-	std::vector<uint8_t> raw;
-	std::vector<float>   conv;
+	std::vector<uint8_t>     raw;
+	std::vector<float>       conv;
+	std::vector<ggml_fp16_t> narrow;
 	for (int64_t i = 0; i < n_tensors; i++)
 	{
 		const char *  name   = gguf_get_tensor_name(gc, i);
@@ -153,6 +167,7 @@ static ggml_backend_buffer_t load_gguf(const char * path, const char * arch, ggm
 		const ggml_type type = gguf_get_tensor_type(gc, i);
 		ggml_tensor * t = model.tensors[name];
 		const bool    widened = type == GGML_TYPE_F16 && t->type == GGML_TYPE_F32;
+		const bool    merged  = merge != nullptr && merge->targets(name);
 		if (!widened && ggml_nbytes(t) != nbytes)
 		{
 			die("tensor '%s' size mismatch (%zu vs %zu)", name, ggml_nbytes(t), nbytes);
@@ -163,11 +178,27 @@ static ggml_backend_buffer_t load_gguf(const char * path, const char * arch, ggm
 		{
 			die("truncated tensor data for '%s' in '%s'", name, path);
 		}
-		if (widened)
+		if (merged || widened)
 		{
 			conv.resize((size_t) ggml_nelements(t));
-			ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), conv.data(), ggml_nelements(t));
-			ggml_backend_tensor_set(t, conv.data(), 0, conv.size() * sizeof(float));
+			if (type == GGML_TYPE_F16)
+			{
+				ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw.data(), conv.data(), ggml_nelements(t));
+			} else {
+				memcpy(conv.data(), raw.data(), nbytes);
+			}
+			if (merged)
+			{
+				merge->apply(name, conv.data(), t->ne[0], t->ne[1]);
+			}
+			if (t->type == GGML_TYPE_F16)
+			{
+				narrow.resize(conv.size());
+				ggml_fp32_to_fp16_row(conv.data(), narrow.data(), (int64_t) conv.size());
+				ggml_backend_tensor_set(t, narrow.data(), 0, narrow.size() * sizeof(ggml_fp16_t));
+			} else {
+				ggml_backend_tensor_set(t, conv.data(), 0, conv.size() * sizeof(float));
+			}
 		} else {
 			ggml_backend_tensor_set(t, raw.data(), 0, nbytes);
 		}
@@ -541,7 +572,7 @@ static void usage(const char * argv0)
 		"           [--steps 32] [--context 24576] [--query-chunk 1024] [--prefill-block 512]\n"
 		"           [--gpu N] [--cpu] [--threads N]\n"
 		"           [--frames N] [--flash-attn] [--kv-f16] [--dump-dir DIR] [--dump-kv-all]\n"
-		"           [--weights f16|f32] [--vk-f16-matmul]\n", argv0);
+		"           [--weights f16|f32] [--vk-f16-matmul] [--nar-lora LORA.safetensors[:S]]\n", argv0);
 }
 
 // modeling_yue2.py:603-606 with timestep_shift from the GGUF.
@@ -698,6 +729,8 @@ NarParams parse_nar_args(const char * argv0, int argc, char ** argv)
 			} else if (v != "f16") {
 				die("--weights must be f16 or f32");
 			}
+		} else if (a == "--nar-lora") {
+			p.nar_lora.push_back(lora::parse_arg(need(argc, argv, i)));
 		} else if (a == "--flash-attn" || a == "-fa") {
 			p.flash_attn = true;
 		} else if (a == "--kv-f16") {
@@ -805,8 +838,11 @@ int run_nar(const NarParams & p)
 	const int64_t t_load0 = now_us();
 	gguf_context * gc_ar  = nullptr;
 	gguf_context * gc_nar = nullptr;
-	model.abuf = load_gguf(p.ar_model.c_str(), "qwen3",    backend, model, p.widen_f16, &gc_ar);
-	model.nbuf = load_gguf(p.model.c_str(),    "yue2-nar", backend, model, p.widen_f16, &gc_nar);
+	lora::Merge    merge;
+	merge.load(p.nar_lora);
+	model.abuf = load_gguf(p.ar_model.c_str(), "qwen3",    backend, model, p.widen_f16, nullptr, &gc_ar);
+	model.nbuf = load_gguf(p.model.c_str(),    "yue2-nar", backend, model, p.widen_f16,
+	                       merge.empty() ? nullptr : &merge, &gc_nar);
 
 	const std::string sha_ar  = kv_str(gc_ar,  "yue2.source_sha256");
 	const std::string sha_nar = kv_str(gc_nar, "yue2.source_sha256");
@@ -838,6 +874,7 @@ int run_nar(const NarParams & p)
 	       (now_us() - t_load0) / 1e6, model.tensors.size(),
 	       ggml_backend_buffer_get_size(model.abuf) / 1024.0 / 1024.0,
 	       ggml_backend_buffer_get_size(model.nbuf) / 1024.0 / 1024.0);
+	merge.report();
 	printf("config:  %d layers, n_embd %d, heads %d/%d x %d, eps %g, rope %g, shift %g, vocab %lld\n",
 	       c.n_layer, c.n_embd, c.n_head, c.n_head_kv, c.head_dim,
 	       (double) c.eps, (double) c.rope_base, (double) c.t_shift, (long long) vocab);

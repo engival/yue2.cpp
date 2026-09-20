@@ -128,6 +128,7 @@ void usage(const char * argv0)
 	        "usage: %s --request R.json --out X.flac|X.opus [--artifacts DIR] [--seed N]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n"
+	        "        [--nar-lora LORA.safetensors[:S]]\n"
 	        "        [--guidance-trace] [--no-tags] [--opus-bitrate 160]\n", argv0);
 }
 
@@ -137,6 +138,7 @@ void usage_batch(const char * argv0)
 	        "usage: %s --jobs jobs.json [--parallel N] [--summary FILE]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf] [--seed N]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 32]\n"
+	        "        [--nar-lora LORA.safetensors[:S]]\n"
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
 	        "        [--continue-on-error] [--guidance-trace] [--no-tags]\n"
 	        "        [--opus-bitrate 160]\n"
@@ -302,6 +304,21 @@ void write_config(const std::string & dir, const BatchParams & p, const ArResult
 	cfg["device"]          = p.device == "vulkan" ? "vulkan:" + std::to_string(p.gpu) : "cpu";
 	cfg["card"]            = ar.card;
 	cfg["nar_precision"]   = p.nar_f32 ? "f32" : "f16-staged";
+	// SPEC_LORA §2: only present when adapters were merged, so a run without
+	// --nar-lora writes exactly the config.json it always did.
+	if (!p.nar_lora.empty())
+	{
+		json adapters = json::array();
+		for (const lora::Spec & s : p.nar_lora)
+		{
+			json one = json::object();
+			one["file"]     = s.file;
+			one["strength"] = s.strength;
+			one["sha256"]   = sha256_file_hex(s.file);
+			adapters.push_back(one);
+		}
+		cfg["nar_lora"] = adapters;
+	}
 	cfg["vae_decode"]      = "halo_crop";
 	cfg["vae_core_frames"] = 256;
 	cfg["vae_halo_frames"] = 16;
@@ -404,6 +421,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			p.steps = atoi(need(argc, argv, i));
 		} else if (a == "--nar-f32") {
 			p.nar_f32 = true;
+		} else if (a == "--nar-lora") {
+			p.nar_lora.push_back(lora::parse_arg(need(argc, argv, i)));
 		} else if (a == "--guidance-trace") {
 			p.guidance_trace = true;
 		} else if (a == "--no-tags") {
@@ -486,6 +505,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			}
 		} else if (a == "--nar-f32") {
 			p.nar_f32 = true;
+		} else if (a == "--nar-lora") {
+			p.nar_lora.push_back(lora::parse_arg(need(argc, argv, i)));
 		} else if (a == "--continue-on-error") {
 			p.continue_on_error = true;
 		} else if (a == "--guidance-trace") {
@@ -707,6 +728,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		nar.device    = p.device;
 		nar.gpu       = p.gpu;
 		nar.steps     = p.steps;
+		nar.nar_lora  = p.nar_lora;
 		nar.prefix_in = &ar[k].prefix_sem;
 		nar.codec_in  = &ar[k].codes;
 		nar.noise_in  = &noise_data;
@@ -795,6 +817,7 @@ int run_song(const SongParams & p)
 	bp.steps     = p.steps;
 	bp.parallel  = 1;          // the reproducible path, SPEC_BATCH §6
 	bp.nar_f32   = p.nar_f32;
+	bp.nar_lora  = p.nar_lora;
 	bp.guidance_trace = p.guidance_trace;
 	bp.no_tags   = p.no_tags;
 	bp.opus_bitrate = p.opus_bitrate;
