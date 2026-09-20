@@ -199,6 +199,8 @@ json json_timing(const GenStats & st)
 	out["branch_prefill_seconds"] = st.branch_prefill_seconds;
 	out["kept_frames"]            = st.kept_frames;
 	out["keep_prefill_seconds"]   = st.keep_prefill_seconds;
+	out["section_cuts"]           = st.section_cuts;
+	out["section_prefill_seconds"] = st.section_prefill_seconds;
 	out["execution"]       = "eager";
 	out["attention"]       = "llama.cpp";
 	return out;

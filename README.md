@@ -95,7 +95,8 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template`, `cfg_scale`, `guidance` and `semantic_keep` are optional.
+`abc`, `abc_template`, `cfg_scale`, `guidance`, `sections` and `semantic_keep`
+are optional.
 Lyrics carry `[Section]` tags on
 their own lines:
 
@@ -313,6 +314,67 @@ like as history and only changes what comes after the cut:
   what was kept (not the path — artifacts stay relocatable).
 - Combine it with `guidance` at `"frame": N` for "keep this take up to the cut,
   change the band from there". A `guidance` entry *below* `N` is a request error.
+
+**A style per section: `sections`.** `guidance` addresses semantic *frames*, and
+counting frames by hand to land on a section is tedious. `sections` names the
+score's own section labels instead and the engine works out the frame:
+
+```json
+"abc": "X:1\nM:3/4\n…the score…",
+"sections": [
+  { "section": "verse", "nth": 2,
+    "style": "uptempo ska, offbeat guitar, horn section, bright tenor vocal" },
+  { "section": "chorus", "nth": 2, "style": "marching band, snare, brass",
+    "lead_frames": 35,
+    "against": { "previous": [[0, 5]], "blank": [[0, 2]] } }
+]
+```
+
+The finding behind it: **in the semantic phase the score decides who sings.** A
+vocal line moved an octave down from one section on brought in a male singer at
+that bar on every seed tried, even with "female vocal" still in the tags — the
+tags then colour the voice the score has already chosen. So a tag change the
+score contradicts (a deep voice over a line written high) is a fight: coin-flip
+takeovers, wobble, garbled words under strong guidance. **Match the voice tag to
+the register the score actually writes**, and use
+[docs/SCORE_RECIPES.md](docs/SCORE_RECIPES.md) to move that register if you want
+a different singer.
+
+- `section` is a label as the score writes it after the `% `. Planner-written
+  scores use a closed vocabulary — `intro`, `verse`, `chorus`, `interlude`,
+  `bridge`, `outro` — and `nth` (1-based, default 1) picks the occurrence,
+  counted over every label of that name, so the `% interlude` the planner
+  inserts between two verses does not shift the count.
+- `style` is required and is the full tag string from that label on; it replaces
+  the request's `style`, which covers everything before the first entry.
+- `lead_frames` (default 35, `0..250`) moves the semantic swap that many frames
+  *before* the section's bar line: the render runs ahead of the score clock by
+  about a second, and the swap wants to land in the breath before the phrase.
+- `against` is exactly a `guidance` entry's, with the same presets. Left out, the
+  entry is a plain swap: the new prefix is prefilled, the old sequence is dropped,
+  and the song still owns one KV stream — so a plain-swap request decodes beside
+  others at `--parallel > 1`, where `guidance` and an `against` do not.
+- Entries are in the order the song plays them. They resolve against the score
+  that was actually written, and **a label the score never writes is reported,
+  not an error**: `sections.json` in the artifacts directory records each entry
+  with `reached`, its line number in `score.abc`, its bar, that bar's start in
+  seconds and the frame it became. The compiled entries are in `guidance.json`
+  as always, so `--guidance-trace` and the rest work unchanged; `request.json`
+  carries neither, so it stays loadable by the reference.
+- It combines with `semantic_keep` — "keep this take up to the second chorus,
+  change the band from there" — and an entry that lands inside the kept frames is
+  a request error, as a `guidance` frame there is. `abc_template`, `cot: "off"`,
+  a `guidance` block and a `cfg_scale` other than 1 are all errors beside it.
+- When the engine writes the score (no `"abc"`), the label line is written under
+  the old tags and the score is re-prefilled under the new ones from there. Do
+  not expect much of that: the score already written outvotes the tags much as
+  the audio history does in the semantic phase, so a swap late in a long score
+  conditions the rest of it only weakly — the same tags on a *fresh* score give a
+  different key, tempo and register entirely. The frame arithmetic is the point
+  of the score phase; the audible change is the semantic swap.
+- Frames per bar come from the score's `M:` and `Q:` (25 Hz, so 4/4 at
+  `Q:1/4=120` is 50 frames a bar); inline `[M:…]` changes are honoured, and the
+  bar clock follows the `V: Vocal` voice.
 
 Transposing a score, moving the singer's register, stripping the chords, resting
 out or re-writing the accompaniment, reading a seed's score before rendering it:

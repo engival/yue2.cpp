@@ -201,6 +201,174 @@ void run_trace_math()
 	}
 }
 
+// -------------------------------------------------------- the score clock ---
+// SPEC_SECTIONS §6 found the planner's label vocabulary to be a closed set of
+// bare `% name` lines, and §4 turns the bar a label sits on into a semantic
+// frame. The scores below are that shape, cut down to what the clock reads.
+
+// A header, a labelled section of `body` on the Vocal voice with an Ins line
+// under it, and a second label. `% intro` is line 9, the body line 11, `% verse`
+// line 14 — the numbers the cases below expect.
+std::string score_of(const char * meter, const char * tempo, const char * body)
+{
+	return std::string("X:1\nT:\nM:") + meter + "\nL:1/16\nQ:" + tempo +
+	       "\nV: Vocal clef=treble\nV: Ins clef=treble\nK:C\n"
+	       "% intro\nV: Vocal\n" + body + "\nV: Ins\nZ9|\n"
+	       "% verse\nV: Vocal\nC16|\n";
+}
+
+struct ClockCase
+{
+	std::string  score;
+	const char * section;
+	int          nth;
+	int          lead;
+	bool         found;
+	int          line;
+	int          bar;
+	double       seconds;
+	int          frame;
+	const char * why;
+};
+
+void run_clock()
+{
+	const ClockCase CASES[] =
+	{
+		{ score_of("4/4", "1/4=120", "z16|z16|"), "verse", 1, 35, true, 14, 2, 4.0,   65,
+		  "4/4 at Q=120 is 50 frames a bar" },
+		{ score_of("4/4", "1/4=120", "z16|z16|"), "intro", 1, 35, true,  9, 0, 0.0,    1,
+		  "the first label sits at bar 0, and the lead clamps to frame 1" },
+		{ score_of("3/4", "1/4=120", "z12|z12|"), "verse", 1, 35, true, 14, 2, 3.0,   40,
+		  "3/4 at Q=120 is 37.5 frames a bar" },
+		{ score_of("6/8", "1/4=120", "z12|z12|"), "verse", 1, 35, true, 14, 2, 3.0,   40,
+		  "6/8 counted in the quarters Q: names" },
+		{ score_of("4/4", "1/4=90",  "z16|z16|"), "verse", 1, 35, true, 14, 2, 8.0 / 1.5, 98,
+		  "Q=90 is 66.67 frames a bar, and the frame is rounded once" },
+		{ score_of("4/4", "1/4=120", "z16|[M:3/4]z12|z12|"), "verse", 1, 35, true, 14, 3, 5.0, 90,
+		  "an inline [M:3/4] changes the bars behind it" },
+		{ score_of("4/4", "1/4=120", "z16|z16|"), "verse", 1, 250, true, 14, 2, 4.0,   1,
+		  "a lead longer than the song so far clamps to frame 1" },
+		{ score_of("4/4", "1/4=120", "z16|z16|"), "verse", 2, 35, false, 0, 0, 0.0,    0,
+		  "a second verse the score never writes" },
+		{ score_of("4/4", "1/4=120", "z16|z16|"), "outro", 1, 35, false, 0, 0, 0.0,    0,
+		  "a label the score never writes" },
+		{ score_of("4/4", "1/4=120", "Z4|"),      "verse", 1, 35, true, 14, 4, 8.0,  165,
+		  "a multi-measure rest is four bars" },
+		{ std::string("X:1\nM:4/4\nL:1/16\nQ:1/4=120\nK:C\n%%yue2-gen bars=4\n% verse\nz16|\n"),
+		  "verse", 1, 0, true, 7, 0, 0.0, 1,
+		  "%%yue2-gen is a directive, not a label" },
+		{ std::string("X:1\nM:4/4\nL:1/16\nQ:1/4=120\nK:C\nz16|\n% verse\nz16|\n"),
+		  "verse", 1, 0, true, 7, 1, 2.0, 50,
+		  "a score with no V: line at all counts its body lines" },
+	};
+
+	for (size_t i = 0; i < sizeof(CASES) / sizeof(CASES[0]); i++)
+	{
+		const ClockCase &         c = CASES[i];
+		std::vector<SectionEntry> es(1);
+		es[0].section = c.section;
+		es[0].nth     = c.nth;
+		es[0].lead    = c.lead;
+		sections_locate(c.score, es);
+		sections_frames(es);
+
+		const bool ok = es[0].found == c.found &&
+		                (!c.found || (es[0].line == c.line && es[0].bar == c.bar &&
+		                              std::fabs(es[0].seconds - c.seconds) < 1e-9 &&
+		                              es[0].frame == c.frame));
+		check(ok, strf("clock(case %zu)", i + 1).c_str(),
+		      es[0].found ? strf("line %d, bar %d, %.4f s, frame %d",
+		                         es[0].line, es[0].bar, es[0].seconds, es[0].frame)
+		                  : std::string("not found"),
+		      c.found ? strf("line %d, bar %d, %.4f s, frame %d (%s)",
+		                     c.line, c.bar, c.seconds, c.frame, c.why)
+		              : strf("not found (%s)", c.why));
+	}
+}
+
+// Several entries over one score: the nth counted over every label line of that
+// name, the strictly-increasing clamp, and an entry the score orders the other
+// way round going unfound rather than moving the song (§2, §4).
+void run_sections_multi()
+{
+	// intro, verse 1, interlude, verse 2, chorus 1 — the shape §6's survey found,
+	// with the planner's own interlude between the verses. One bar each, 4/4 at
+	// Q=120, so every label sits two seconds after the one before it.
+	const std::string score =
+		"X:1\nM:4/4\nL:1/16\nQ:1/4=120\nV: Vocal\nV: Ins\nK:C\n"
+		"% intro\nV: Vocal\nz16|\nV: Ins\nZ1|\n"
+		"% verse\nV: Vocal\nz16|\nV: Ins\nZ1|\n"
+		"% interlude\nV: Vocal\nz16|\nV: Ins\nZ1|\n"
+		"% verse\nV: Vocal\nz16|\nV: Ins\nZ1|\n"
+		"% chorus\nV: Vocal\nz16|\n";
+
+	{
+		// The second verse is the *fourth* label: per-name counting steps over
+		// the interlude the planner put between them.
+		std::vector<SectionEntry> es(2);
+		es[0].section = "verse";
+		es[0].nth     = 2;
+		es[0].lead    = 0;
+		es[1].section = "chorus";
+		es[1].lead    = 0;
+		sections_locate(score, es);
+		sections_frames(es);
+		check(es[0].found && es[0].bar == 3 && es[0].frame == 150 &&
+		      es[1].found && es[1].bar == 4 && es[1].frame == 200,
+		      "sections(per-name nth)",
+		      strf("verse 2 bar %d frame %d, chorus 1 bar %d frame %d",
+		           es[0].bar, es[0].frame, es[1].bar, es[1].frame),
+		      "verse 2 bar 3 frame 150, chorus 1 bar 4 frame 200");
+	}
+	{
+		// Both leads are long enough to land on or before the entry ahead: the
+		// frames are pushed apart rather than allowed to collide.
+		std::vector<SectionEntry> es(2);
+		es[0].section = "verse";
+		es[0].nth     = 2;
+		es[0].lead    = 150;
+		es[1].section = "chorus";
+		es[1].lead    = 200;
+		sections_locate(score, es);
+		sections_frames(es);
+		check(es[0].frame == 1 && es[1].frame == 2, "sections(increasing clamp)",
+		      strf("%d %d", es[0].frame, es[1].frame),
+		      "1 2 (clamped to >= 1, then strictly increasing)");
+	}
+	{
+		// The score plays the verse before the chorus, so an entry list that asks
+		// for the chorus first leaves the verse unfound.
+		std::vector<SectionEntry> es(2);
+		es[0].section = "chorus";
+		es[1].section = "verse";
+		sections_locate(score, es);
+		sections_frames(es);
+		check(es[0].found && !es[1].found, "sections(order is the score's)",
+		      strf("chorus %s, verse %s", es[0].found ? "found" : "not found",
+		           es[1].found ? "found" : "not found"),
+		      "chorus found, verse not found");
+	}
+	{
+		// A plan is one guidance entry per section entry, compacted to the found
+		// ones by sections_compile; the plain-swap test is what decides whether
+		// the song needs a second KV stream at all (§4).
+		std::vector<SectionEntry> es(1);
+		es[0].section = "verse";
+		es[0].style   = "brass band";
+		const std::vector<GuidanceEntry> plan = sections_plan(es);
+		check(plan.size() == 1 && plan[0].has_style && plan[0].style == "brass band" &&
+		      !plan[0].has[BRANCH_PREVIOUS] && !plan[0].has[BRANCH_BLANK] &&
+		      sections_plain_swap(es), "sections(plan of a plain swap)",
+		      strf("%zu entries, plain swap %d", plan.size(), (int) sections_plain_swap(es)),
+		      "1 entry carrying the style, plain swap 1");
+		es[0].has[BRANCH_BLANK] = true;
+		check(!sections_plain_swap(es), "sections(plan with an against)",
+		      sections_plain_swap(es) ? "plain swap" : "needs a branch",
+		      "needs a branch");
+	}
+}
+
 // ------------------------------------------------------- the request form ---
 
 // The smallest request the parser accepts, with `extra` spliced in.
@@ -334,6 +502,74 @@ const RequestCase REQUEST_CASES[] =
 	  "unknown key \"from\"",  "an unknown key inside semantic_keep" },
 	{ KEEP_ABC ", \"semantic_keep\": \"r/semantic.npy\"",
 	  "must be an object",     "the block given as a bare path" },
+
+	// --- SPEC_SECTIONS §2 --------------------------------------------------
+	{ "\"sections\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}]",
+	  nullptr,                 "the plain swap of §2" },
+	{ "\"sections\": [{\"section\": \"chorus\", \"style\": \"brass band\", "
+	  "\"lead_frames\": 0, \"against\": {\"previous\": [[0, 4], [250, 2]], "
+	  "\"blank\": [[0, 2]]}}]",
+	  nullptr,                 "the worked example of §2, with curves" },
+	{ "\"sections\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}, "
+	  "{\"section\": \"verse\", \"nth\": 4, \"style\": \"marching band\"}]",
+	  nullptr,                 "two entries on the same label, in order" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"cfg_scale\": 1.0",    nullptr,
+	  "an explicit cfg_scale of 1 beside a sections block" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"guidance\": [{\"frame\": 10, \"against\": {\"blank\": [[0, 2]]}}]",
+	  "not both",              "sections beside the frames it compiles into" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], \"cfg_scale\": 3",
+	  "not in \"cfg_scale\"",  "sections beside a cfg_scale that is not 1" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"abc_template\": \"X:1\\nK:C\\n%%yue2-gen bars=4\\n\"",
+	  "not supported yet",     "sections with a score template" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"cot\": \"off\"",
+	  "cot=off has none",      "sections with no score phase to name labels in" },
+	{ "\"sections\": [{\"section\": \"verse\", \"nth\": 4, \"style\": \"brass band\"}, "
+	  "{\"section\": \"verse\", \"nth\": 2, \"style\": \"marching band\"}]",
+	  "cannot come after",     "two entries on one label, out of order" },
+	{ "\"sections\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}, "
+	  "{\"section\": \"verse\", \"nth\": 2, \"style\": \"marching band\"}]",
+	  "cannot come after",     "two entries on the same label occurrence" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"slow waltz, upright bass\", "
+	  "\"against\": {\"previous\": [[0, 5]]}}]",
+	  "already in force",      "the entry's style is the request's own" },
+	{ "\"sections\": [{\"section\": \"verse\", \"nth\": 1, \"style\": \"brass band\"}, "
+	  "{\"section\": \"chorus\", \"style\": \"brass band\", "
+	  "\"against\": {\"previous\": [[0, 5]]}}]",
+	  "already in force",      "the second entry repeats the first entry's tags" },
+	{ "\"sections\": [{\"section\": \"verse\"}]",
+	  "needs a \"style\"",     "an entry with no tags to change to" },
+	{ "\"sections\": [{\"style\": \"brass band\"}]",
+	  "needs a \"section\"",   "an entry that names no label" },
+	{ "\"sections\": [{\"section\": \"\", \"style\": \"brass band\"}]",
+	  "must be a label name",  "an empty label" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"\"}]",
+	  "must be the tag string","empty tags" },
+	{ "\"sections\": [{\"section\": \"verse\", \"nth\": 0, \"style\": \"brass band\"}]",
+	  "must be an integer in [1", "nth below 1" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\", "
+	  "\"lead_frames\": 251}]",
+	  "must be an integer in [0", "a lead past the 250-frame ceiling" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\", "
+	  "\"lead_frames\": -1}]",
+	  "must be an integer in [0", "a negative lead" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\", \"frame\": 100}]",
+	  "unknown key \"frame\"", "a guidance key inside a sections entry" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\", "
+	  "\"against\": {\"bank\": [[0, 2]]}}]",
+	  "unknown branch",        "a misspelt branch kind" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\", \"against\": {}}]",
+	  "non-empty object",      "an empty against" },
+	{ "\"sections\": []",
+	  "non-empty list",        "an empty sections block" },
+	{ "\"sections\": {\"section\": \"verse\", \"style\": \"brass band\"}",
+	  "non-empty list",        "the block given as one entry" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  KEEP_ABC ", \"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}",
+	  nullptr,                 "sections beside a semantic_keep (the frames are the score's)" },
 };
 
 void run_requests()
@@ -438,6 +674,8 @@ int main(int argc, char ** argv)
 
 	run_curves();
 	run_trace_math();
+	run_clock();
+	run_sections_multi();
 	run_requests();
 	run_plans();
 

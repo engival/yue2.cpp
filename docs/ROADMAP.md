@@ -29,6 +29,13 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   it from there" is a prefill (1000 frames in 0.4 s on the Arc, against 7.3 s to
   sample them) and combines with a `guidance` entry at that frame. Numbers in
   [src/STATUS_GUIDANCE.md](../src/STATUS_GUIDANCE.md) §"Stage 7b".
+- Stage 8: `sections` — a style per section. An entry names a score label
+  (`% verse`, `nth`) instead of a semantic frame; the engine walks the score's
+  bar clock (`M:`/`Q:`, inline `[M:…]`, the `V: Vocal` voice), turns the label's
+  bar into a frame `lead_frames` ahead of it, and compiles the entries into
+  guidance entries. Without an `against` it is a plain swap that owns one KV
+  stream, so it decodes at `--parallel > 1`. Numbers in
+  [src/STATUS_SECTIONS.md](../src/STATUS_SECTIONS.md).
 - The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
   Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
   exact) indistinguishable, and on the AMD the exact path is not faster — so
@@ -69,15 +76,26 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
    side by side; lifting that means slot bookkeeping for `3 x parallel` streams
    (and the VRAM for it). A template job re-prefills its slot when the score is
    done, which the branches would have to follow — neither is hard, both were
-   out of stage 7.
-6. **Regression harness in-tree.** `tests/regress.sh` decodes a directory of
+   out of stage 7. Stage 8's plain-swap `sections` job is the one case that does
+   run side by side — it opens no branch at all — so the remaining work is
+   genuinely the branch bookkeeping, not the cut.
+6. **Guidance in the *score* phase.** A `sections` entry's `against` curves are
+   carried through to the compiled guidance entry and only ever used in the
+   semantic phase; nothing in the design stops them driving the score phase too,
+   which is the only way to make a mid-score tag change bite (measured: a plain
+   swap after ~90 written lines barely moves the register, rhythm or chords — the
+   score history outvotes the tags). It would need the abc phase to decode beside
+   a branch, which today it never does. Two smaller follow-ups from stage 8:
+   `sections` with `abc_template`, and a label clock that does not depend on the
+   planner naming its voices `Vocal` / `Ins`.
+7. **Regression harness in-tree.** `tests/regress.sh` decodes a directory of
    the author's own renders (45 styles of one song, 63–117 dB against the
    reference audio, all passing); a public repo needs one that runs from the
    committed goldens alone (`convert/reference_*.py` regenerate them from the HF
    checkout on CPU). That means shipping a public reference `request.json` —
    today's goldens derive from a private one, so a stranger cannot reproduce the
    committed SHA-256s.
-7. **Converter ergonomics.** One `convert/convert.py` that writes all three GGUFs
+8. **Converter ergonomics.** One `convert/convert.py` that writes all three GGUFs
    and cross-checks `yue2.source_sha256`; document the HF snapshot layout it expects.
 
 ## Deliberately not planned

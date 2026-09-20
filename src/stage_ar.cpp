@@ -126,6 +126,33 @@ struct GuidanceEntry
 	bool                  reached   = false;   // the decode loop got this far
 };
 
+// The semantic codec's frame rate, and what SPEC_SECTIONS §2 allows a
+// "lead_frames" and an "nth" to be.
+static const double SEMANTIC_FPS      = 25.0;
+static const int    SECTIONS_LEAD     = 35;
+static const int    SECTIONS_MAX_LEAD = 250;
+static const int    SECTIONS_MAX_NTH  = 999;
+
+// SPEC_SECTIONS.md: one "sections" entry — the tags a named score label and
+// everything after it is written under. The `against` curves are exactly a
+// guidance entry's, so an entry compiles into one (sections_plan); the fields
+// below the blank line are what resolving it against the score fills in.
+struct SectionEntry
+{
+	std::string           section;                 // the label, as the score writes it after "% "
+	int                   nth     = 1;             // which occurrence of it, 1-based
+	std::string           style;                   // the tags from that label on
+	int                   lead    = SECTIONS_LEAD; // frames before its bar line to swap at
+	bool                  has[BRANCH_KINDS] = { false, false };
+	std::vector<Keyframe> curve[BRANCH_KINDS];
+
+	bool                  found   = false;   // the label turned up in the score
+	int                   line    = 0;       // its 1-based line number in score.abc
+	int                   bar     = 0;       // bars of Vocal written before it
+	double                seconds = 0;       // where that bar starts, in seconds
+	int                   frame   = 0;       // the semantic step the swap is at
+};
+
 // The curve's weight `off` frames into its entry: linear between keyframes, the
 // first weight before the first and the last weight after the last. Two
 // keyframes at one offset are a step, and the later one wins at that offset —
@@ -187,6 +214,8 @@ struct Request
 	bool        has_keep   = false;               // "semantic_keep": SPEC_KEEP.md
 	std::string keep_file;                        // a semantic.npy of an earlier render
 	int         keep_frames = 0;                  // N, how many of its leading codes to keep
+	bool        has_sections = false;             // "sections": SPEC_SECTIONS.md
+	std::vector<SectionEntry> sections;
 	std::string id         = "song";
 
 	std::string text() const
@@ -201,9 +230,28 @@ static double cfg_scalar(const Request & r)
 	return r.has_cfg ? r.cfg_scale : (r.cot == "off" ? 1.01 : 1.0);
 }
 
+// Every cut of a "sections" request is a plain swap when no entry names an
+// `against`: nothing is ever pushed against, so the song owns one KV stream all
+// the way through and needs no rule about --parallel (SPEC_SECTIONS §4).
+static bool sections_plain_swap(const std::vector<SectionEntry> & es)
+{
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		if (es[i].has[BRANCH_PREVIOUS] || es[i].has[BRANCH_BLANK])
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
 // Either request form asks for branches beside the positive sequence.
 static bool is_guided(const Request & r)
 {
+	if (r.has_sections)
+	{
+		return !sections_plain_swap(r.sections);
+	}
 	return r.has_guidance || cfg_scalar(r) != 1.0;
 }
 
@@ -226,6 +274,30 @@ static std::vector<GuidanceEntry> guidance_plan(const Request & r)
 		k.weight             = c - 1.0;
 		g.has[BRANCH_BLANK]  = true;
 		g.curve[BRANCH_BLANK].push_back(k);
+		out.push_back(g);
+	}
+	return out;
+}
+
+// The guidance entries a "sections" request compiles into: one per entry, in
+// order, the frame still unknown — the score phase fills it in when it finds the
+// label (SPEC_SECTIONS §3). Built before the score is written, so the context is
+// sized on every entry's prefix head like any guided song's, and compacted down
+// to the entries that were found once it is (sections_compile).
+static std::vector<GuidanceEntry> sections_plan(const std::vector<SectionEntry> & es)
+{
+	std::vector<GuidanceEntry> out;
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		GuidanceEntry g;
+		g.frame     = es[i].frame;
+		g.has_style = true;
+		g.style     = es[i].style;
+		for (int k = 0; k < BRANCH_KINDS; k++)
+		{
+			g.has[k]   = es[i].has[k];
+			g.curve[k] = es[i].curve[k];
+		}
 		out.push_back(g);
 	}
 	return out;
@@ -929,6 +1001,263 @@ static std::string parse_template(const std::string & text, std::vector<TplSeg> 
 	return "";
 }
 
+// --------------------------------------------------------- score sections ---
+
+// SPEC_SECTIONS.md. A planner-written score marks its sections with a comment
+// line of its own — `% intro`, `% verse`, `% chorus`, `% interlude`, `% bridge`,
+// `% outro` — and a "sections" entry names one of them. What the semantic phase
+// needs is *when* that label is, so the clock below walks the score line by line
+// and keeps the bar count and the elapsed seconds of the `V: Vocal` voice, which
+// is the one that carries the song's bars.
+//
+// Pure text work, like the template parser above it: the same clock runs over a
+// score as the model writes it (Runner::sections_token) and over a score the
+// request gave in "abc" (sections_locate), and it is table-tested on its own
+// (tests/guidance.cpp).
+struct ScoreClock
+{
+	Meter     meter;                  // M:/L: in force, inline [M:…] included
+	long long q_num   = 1;            // the note Q: counts, …
+	long long q_den   = 4;            // … as a fraction of a whole note, …
+	double    q_bpm   = 120;          // … and how many of them go by in a minute
+	bool      vocal   = true;         // the voice the body lines belong to
+	int       line    = 0;            // completed lines, the last one included
+	int       bars    = 0;            // bars of Vocal completed
+	double    seconds = 0;            // where the next bar starts
+	std::unordered_map<std::string, int> seen;   // label lines, by name
+};
+
+// Seconds of one bar of `m` at the tempo the clock carries: a bar is m_num/m_den
+// of a whole note, and `Q:` says how many q_num/q_den notes go by in a minute.
+static double bar_seconds(const ScoreClock & c, const Meter & m)
+{
+	if (c.q_bpm <= 0 || c.q_num <= 0 || c.q_den <= 0 || m.m_den <= 0)
+	{
+		return 0;
+	}
+	return 60.0 * ((double) m.m_num * c.q_den) / ((double) m.m_den * (double) c.q_num) / c.q_bpm;
+}
+
+// `Q:` as the planner writes it (`Q:1/4=120`), plus ABC's other forms: a bare
+// `Q:120` counts unit note lengths, and a quoted label is not a tempo.
+static void read_tempo_field(const std::string & line, ScoreClock & c)
+{
+	std::string  v = line.substr(2);
+	const size_t q = v.find('"');
+	if (q != std::string::npos)
+	{
+		v.erase(q);
+	}
+	long long num = 0;
+	long long den = 0;
+	double    bpm = 0;
+	if (sscanf(v.c_str(), " %lld/%lld = %lf", &num, &den, &bpm) == 3)
+	{
+		if (num > 0 && den > 0 && bpm > 0)
+		{
+			c.q_num = num;
+			c.q_den = den;
+			c.q_bpm = bpm;
+		}
+		return;
+	}
+	if (sscanf(v.c_str(), " %lf", &bpm) == 1 && bpm > 0)
+	{
+		c.q_num = c.meter.l_num;
+		c.q_den = c.meter.l_den;
+		c.q_bpm = bpm;
+	}
+}
+
+// The bars one body line holds and what they take, honouring an inline `[M:…]`:
+// the line is cut at the bar line the change follows and each piece counted
+// under the meter in force over it. A change that does not sit at a bar line
+// takes effect at the next one — the bar it is inside keeps the length it
+// started with — which is also what keeps a cut from counting one bar twice.
+static int body_line_clock(const std::string & line, ScoreClock & c, double & seconds)
+{
+	int    bars  = 0;
+	size_t start = 0;   // the piece being measured starts here
+	size_t open  = 0;   // and the bar inside it starts here
+	seconds = 0;
+
+	auto take = [&](const std::string & piece)
+	{
+		const BarCount bc = count_bars(piece, c.meter);
+		bars    += bc.bars;
+		seconds += bc.bars * bar_seconds(c, c.meter);
+	};
+
+	for (size_t i = 0; i < line.size(); i++)
+	{
+		const char ch = line[i];
+		if (ch == '%')
+		{
+			break;
+		}
+		// The two delimiters count_bars honours, so that a `|` inside a chord
+		// symbol or a decoration is not taken for a bar line here either.
+		if (ch == '"' || ch == '!')
+		{
+			const size_t end = ch == '"' ? line.find('"', i + 1)
+			                             : line.find_first_of("! |", i + 1);
+			if (end != std::string::npos && line[end] == ch)
+			{
+				i = end;
+			}
+			continue;
+		}
+		const size_t bl = bar_line_at(line, i);
+		if (bl > 0)
+		{
+			i    += bl - 1;
+			open  = i + 1;
+			continue;
+		}
+		if (ch != '[' || i + 3 >= line.size() || line[i + 1] != 'M' || line[i + 2] != ':')
+		{
+			continue;
+		}
+		const size_t end = line.find(']', i + 3);
+		if (end == std::string::npos)
+		{
+			continue;
+		}
+		take(line.substr(start, open - start));
+		start = open;
+		read_meter_field("M:" + line.substr(i + 3, end - i - 3), c.meter);
+		i = end;
+	}
+	take(line.substr(start));
+	return bars;
+}
+
+// One completed score line, without its newline. Returns the label it is —
+// `% verse` comes back as "verse" — or "" for anything else.
+static std::string clock_line(ScoreClock & c, const std::string & line)
+{
+	c.line++;
+	const size_t i = line.find_first_not_of(" \t\r");
+	if (i == std::string::npos)
+	{
+		return "";
+	}
+	if (line[i] == '%')
+	{
+		// `%%…` is a directive, not a label, and a label is a name and nothing
+		// else — the vocabulary of §6's survey.
+		if (i + 1 < line.size() && line[i + 1] == '%')
+		{
+			return "";
+		}
+		const size_t a = line.find_first_not_of(" \t", i + 1);
+		const size_t b = line.find_last_not_of(" \t\r");
+		if (a == std::string::npos || a > b)
+		{
+			return "";
+		}
+		const std::string name = line.substr(a, b - a + 1);
+		c.seen[name]++;
+		return name;
+	}
+	if (i + 1 < line.size() && isalpha((unsigned char) line[i]) && line[i + 1] == ':')
+	{
+		// A field line. The ones that move the clock are the meter, the unit note
+		// length, the tempo and the voice switch; a `V:` with fields behind it is
+		// the header's own definition and names the same voice.
+		if (line[i] == 'M' || line[i] == 'L')
+		{
+			read_meter_field(line.substr(i), c.meter);
+		} else if (line[i] == 'Q') {
+			read_tempo_field(line.substr(i), c);
+		} else if (line[i] == 'V') {
+			const size_t a = line.find_first_not_of(" \t", i + 2);
+			const size_t b = a == std::string::npos ? a : line.find_first_of(" \t\r", a);
+			c.vocal = a != std::string::npos &&
+			          line.substr(a, b == std::string::npos ? b : b - a) == "Vocal";
+		}
+		return "";
+	}
+	if (!c.vocal)
+	{
+		return "";
+	}
+	double seconds = 0;
+	c.bars    += body_line_clock(line, c, seconds);
+	c.seconds += seconds;
+	return "";
+}
+
+// Walks a score that is already written and fills in every entry it finds. The
+// entries are matched in the order the request lists them and `nth` is counted
+// over every label line of that name from the top of the score, which is what
+// makes an entry naming a label *before* the one already matched simply go
+// unfound rather than reorder the song (§2).
+static void sections_locate(const std::string & score, std::vector<SectionEntry> & es)
+{
+	ScoreClock c;
+	size_t     next = 0;
+	size_t     from = 0;
+	while (next < es.size())
+	{
+		const size_t      nl   = score.find('\n', from);
+		const std::string name = clock_line(c, score.substr(from, nl == std::string::npos
+		                                                          ? nl : nl - from));
+		if (name == es[next].section && c.seen[name] == es[next].nth)
+		{
+			es[next].found   = true;
+			es[next].line    = c.line;
+			es[next].bar     = c.bars;
+			es[next].seconds = c.seconds;
+			next++;
+		}
+		if (nl == std::string::npos)
+		{
+			break;
+		}
+		from = nl + 1;
+	}
+}
+
+// The semantic step each found entry swaps at: `lead_frames` before the bar line
+// it names, never before frame 1 and never at or before the entry ahead of it
+// (§4).
+static void sections_frames(std::vector<SectionEntry> & es)
+{
+	long long prev = 0;
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		if (!es[i].found)
+		{
+			continue;
+		}
+		const long long f = llround(es[i].seconds * SEMANTIC_FPS) - es[i].lead;
+		es[i].frame = (int) std::max(std::max(f, (long long) 1), prev + 1);
+		prev        = es[i].frame;
+	}
+}
+
+// SPEC_SECTIONS §4: `semantic_keep` combines, but an entry that lands inside the
+// kept frames is the error SPEC_KEEP §2 makes of a guidance frame there. A keep
+// request carries its score in "abc", so this is decided before the model loads.
+static std::string sections_keep_check(const Request & r, const std::vector<SectionEntry> & es)
+{
+	if (!r.has_keep)
+	{
+		return "";
+	}
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		if (es[i].found && es[i].frame < r.keep_frames)
+		{
+			return strf("\"sections\" entry %zu: %% %s %d lands on frame %d, inside the kept "
+			            "%d frames", i + 1, es[i].section.c_str(), es[i].nth, es[i].frame,
+			            r.keep_frames);
+		}
+	}
+	return "";
+}
+
 // ------------------------------------------------------------- generation ---
 
 // Sampling order for the candidate list: score descending, id ascending on ties.
@@ -1348,8 +1677,36 @@ static json json_timing(const GenStats & st)
 	// SPEC_KEEP §4: the leading codes this song did not sample, and their cost.
 	out["kept_frames"]             = st.kept_frames;
 	out["keep_prefill_seconds"]    = st.keep_prefill_seconds;
+	// SPEC_SECTIONS §3: the cuts the score phase made, and what they cost.
+	out["section_cuts"]             = st.section_cuts;
+	out["section_prefill_seconds"]  = st.section_prefill_seconds;
 	out["execution"]       = "eager";
 	out["attention"]       = "llama.cpp";
+	return out;
+}
+
+// The `against` curves of one entry, as a guidance.json / sections.json entry
+// carries them: nothing at all when the entry opens no branch.
+static json json_against(const bool has[BRANCH_KINDS],
+	const std::vector<Keyframe> curve[BRANCH_KINDS])
+{
+	json out = json::object();
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		if (!has[k])
+		{
+			continue;
+		}
+		json list = json::array();
+		for (size_t c = 0; c < curve[k].size(); c++)
+		{
+			json kf = json::array();
+			kf.push_back(curve[k][c].offset);
+			kf.push_back(curve[k][c].weight);
+			list.push_back(kf);
+		}
+		out[branch_name(k)] = list;
+	}
 	return out;
 }
 
@@ -1367,28 +1724,42 @@ static json json_guidance(const std::vector<GuidanceEntry> & guide)
 		{
 			e["style"] = g.style;
 		}
-		json against = json::object();
-		for (int k = 0; k < BRANCH_KINDS; k++)
-		{
-			if (!g.has[k])
-			{
-				continue;
-			}
-			json curve = json::array();
-			for (size_t c = 0; c < g.curve[k].size(); c++)
-			{
-				json kf = json::array();
-				kf.push_back(g.curve[k][c].offset);
-				kf.push_back(g.curve[k][c].weight);
-				curve.push_back(kf);
-			}
-			against[branch_name(k)] = curve;
-		}
+		const json against = json_against(g.has, g.curve);
 		if (!against.empty())
 		{
 			e["against"] = against;
 		}
 		e["reached"] = g.reached;
+		out.push_back(e);
+	}
+	return out;
+}
+
+// The sections block as resolved against the score (SPEC_SECTIONS §5).
+// `reached` here is "the label turned up in the written score"; whether the
+// decode then got as far as the frame it resolved to is guidance.json's own
+// `reached`, on the entry this one compiled into.
+static json json_sections(const std::vector<SectionEntry> & es)
+{
+	json out = json::array();
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		const SectionEntry & s = es[i];
+		json                 e = json::object();
+		e["section"]     = s.section;
+		e["nth"]         = s.nth;
+		e["style"]       = s.style;
+		e["lead_frames"] = s.lead;
+		const json against = json_against(s.has, s.curve);
+		if (!against.empty())
+		{
+			e["against"] = against;
+		}
+		e["reached"] = s.found;
+		e["line"]    = s.found ? json(s.line)    : json(nullptr);
+		e["bar"]     = s.found ? json(s.bar)     : json(nullptr);
+		e["seconds"] = s.found ? json(s.seconds) : json(nullptr);
+		e["frame"]   = s.found ? json(s.frame)   : json(nullptr);
 		out.push_back(e);
 	}
 	return out;
@@ -1429,6 +1800,10 @@ struct Artifacts
 	// null unless the request carried a "guidance" block; a plain `cfg_scale`
 	// is in request.json and needs no file of its own (SPEC_GUIDANCE §3).
 	const std::vector<GuidanceEntry> * guidance = nullptr;
+	// null unless the request carried a "sections" block: the entries as they
+	// resolved against the score, which is what says where the tags changed
+	// (SPEC_SECTIONS §5). The compiled entries stay in `guidance` above.
+	const std::vector<SectionEntry> *  sections = nullptr;
 	// null unless the request carried a "semantic_keep": the codes it kept, for
 	// the frame count and the digest plan.json records (SPEC_KEEP §4).
 	const std::vector<int32_t> *       keep     = nullptr;
@@ -1464,6 +1839,10 @@ static void write_artifacts(const Artifacts & a)
 	{
 		write_file_or_die(dir + "guidance.json", dump_py(json_guidance(*a.guidance)));
 	}
+	if (a.sections != nullptr)
+	{
+		write_file_or_die(dir + "sections.json", dump_py(json_sections(*a.sections)));
+	}
 	if (a.trace != nullptr)
 	{
 		const std::vector<int64_t> shape = { (int64_t) (a.trace->size() / TRACE_COLUMNS),
@@ -1493,6 +1872,10 @@ static void write_artifacts(const Artifacts & a)
 		{
 			plan["guidance"] = json_guidance(*a.guidance);
 		}
+		if (a.sections != nullptr)
+		{
+			plan["sections"] = json_sections(*a.sections);
+		}
 		// What of this song came from an earlier render, and enough of a digest
 		// to tell which. The path is deliberately not here: an artifacts
 		// directory has to stay relocatable and carry no local paths (§4).
@@ -1519,6 +1902,10 @@ static void write_artifacts(const Artifacts & a)
 		if (a.guidance != nullptr)
 		{
 			names.push_back("guidance.json");
+		}
+		if (a.sections != nullptr)
+		{
+			names.push_back("sections.json");
 		}
 		json manifest = json::object();
 		for (size_t i = 0; i < names.size(); i++)
@@ -1581,6 +1968,34 @@ static std::string parse_curve(const json & v, const char * what, std::vector<Ke
 	return "";
 }
 
+// The `against` object of a guidance or a sections entry: one curve per branch
+// kind and nothing else (SPEC_GUIDANCE §2.3).
+static std::string parse_against(const json & v, bool has[BRANCH_KINDS],
+	std::vector<Keyframe> curve[BRANCH_KINDS])
+{
+	if (!v.is_object() || v.empty())
+	{
+		return "\"against\" must be a non-empty object (previous, blank)";
+	}
+	for (json::const_iterator a = v.begin(); a != v.end(); ++a)
+	{
+		const int kind = a.key() == "previous" ? BRANCH_PREVIOUS
+		                 : a.key() == "blank"   ? BRANCH_BLANK : -1;
+		if (kind < 0)
+		{
+			return strf("\"against\": unknown branch \"%s\" (previous, blank)",
+			            a.key().c_str());
+		}
+		const std::string err = parse_curve(a.value(), a.key().c_str(), curve[kind]);
+		if (!err.empty())
+		{
+			return strf("\"against\": %s", err.c_str());
+		}
+		has[kind] = true;
+	}
+	return "";
+}
+
 // The "guidance" block. New in stage 7, so it is strict: an unknown key inside
 // an entry or inside "against" is an error rather than something ignored.
 static std::string parse_guidance(const json & v, std::vector<GuidanceEntry> & out)
@@ -1619,27 +2034,10 @@ static std::string parse_guidance(const json & v, std::vector<GuidanceEntry> & o
 				g.has_style = true;
 				g.style     = it.value().get<std::string>();
 			} else if (key == "against") {
-				if (!it.value().is_object() || it.value().empty())
+				const std::string err = parse_against(it.value(), g.has, g.curve);
+				if (!err.empty())
 				{
-					return strf("entry %zu: \"against\" must be a non-empty object "
-					            "(previous, blank)", i + 1);
-				}
-				for (json::const_iterator a = it.value().begin(); a != it.value().end(); ++a)
-				{
-					const int kind = a.key() == "previous" ? BRANCH_PREVIOUS
-					                 : a.key() == "blank"   ? BRANCH_BLANK : -1;
-					if (kind < 0)
-					{
-						return strf("entry %zu: \"against\": unknown branch \"%s\" "
-						            "(previous, blank)", i + 1, a.key().c_str());
-					}
-					const std::string err = parse_curve(a.value(), a.key().c_str(),
-					                                    g.curve[kind]);
-					if (!err.empty())
-					{
-						return strf("entry %zu: \"against\": %s", i + 1, err.c_str());
-					}
-					g.has[kind] = true;
+					return strf("entry %zu: %s", i + 1, err.c_str());
 				}
 			} else {
 				return strf("entry %zu: unknown key \"%s\" (frame, style, against)",
@@ -1651,6 +2049,82 @@ static std::string parse_guidance(const json & v, std::vector<GuidanceEntry> & o
 			return strf("entry %zu needs a \"frame\"", i + 1);
 		}
 		out.push_back(g);
+	}
+	return "";
+}
+
+// The "sections" block (SPEC_SECTIONS §2). Strict like "guidance": `section`
+// and `style` are both required, and an unknown key is an error.
+static std::string parse_sections(const json & v, std::vector<SectionEntry> & out)
+{
+	if (!v.is_array() || v.empty())
+	{
+		return "must be a non-empty list of entries";
+	}
+	for (size_t i = 0; i < v.size(); i++)
+	{
+		const json & e = v[i];
+		if (!e.is_object())
+		{
+			return strf("entry %zu is not an object", i + 1);
+		}
+		SectionEntry s;
+		bool         has_style = false;
+		for (json::const_iterator it = e.begin(); it != e.end(); ++it)
+		{
+			const std::string & key = it.key();
+			if (key == "section")
+			{
+				if (!it.value().is_string() || it.value().get<std::string>().empty())
+				{
+					return strf("entry %zu: \"section\" must be a label name, as the score "
+					            "writes it after the \"%% \"", i + 1);
+				}
+				s.section = it.value().get<std::string>();
+			} else if (key == "nth") {
+				if (!it.value().is_number_integer() || it.value().get<long long>() < 1 ||
+				    it.value().get<long long>() > SECTIONS_MAX_NTH)
+				{
+					return strf("entry %zu: \"nth\" must be an integer in [1, %d]",
+					            i + 1, SECTIONS_MAX_NTH);
+				}
+				s.nth = it.value().get<int>();
+			} else if (key == "style") {
+				if (!it.value().is_string() || it.value().get<std::string>().empty())
+				{
+					return strf("entry %zu: \"style\" must be the tag string that holds from "
+					            "this section on", i + 1);
+				}
+				s.style   = it.value().get<std::string>();
+				has_style = true;
+			} else if (key == "lead_frames") {
+				if (!it.value().is_number_integer() || it.value().get<long long>() < 0 ||
+				    it.value().get<long long>() > SECTIONS_MAX_LEAD)
+				{
+					return strf("entry %zu: \"lead_frames\" must be an integer in [0, %d] "
+					            "(25 frames = 1 s)", i + 1, SECTIONS_MAX_LEAD);
+				}
+				s.lead = it.value().get<int>();
+			} else if (key == "against") {
+				const std::string err = parse_against(it.value(), s.has, s.curve);
+				if (!err.empty())
+				{
+					return strf("entry %zu: %s", i + 1, err.c_str());
+				}
+			} else {
+				return strf("entry %zu: unknown key \"%s\" (section, nth, style, "
+				            "lead_frames, against)", i + 1, key.c_str());
+			}
+		}
+		if (s.section.empty())
+		{
+			return strf("entry %zu needs a \"section\"", i + 1);
+		}
+		if (!has_style)
+		{
+			return strf("entry %zu needs a \"style\": the tags from this section on", i + 1);
+		}
+		out.push_back(s);
 	}
 	return "";
 }
@@ -1800,6 +2274,15 @@ static std::string parse_request_json(const json & root, const std::string & whe
 			return strf("%s: \"guidance\": %s", path, err.c_str());
 		}
 		req.has_guidance = true;
+	}
+	if (root.contains("sections") && !root["sections"].is_null())
+	{
+		const std::string err = parse_sections(root["sections"], req.sections);
+		if (!err.empty())
+		{
+			return strf("%s: \"sections\": %s", path, err.c_str());
+		}
+		req.has_sections = true;
 	}
 	if (root.contains("semantic_keep") && !root["semantic_keep"].is_null())
 	{
@@ -1955,6 +2438,60 @@ static std::string validate_request(const Request & r)
 			{
 				style = g.style;
 			}
+		}
+	}
+	// SPEC_SECTIONS §2. One mechanism per request: "sections" *is* guidance, so
+	// it cannot be given beside the block or the scalar it compiles into.
+	if (r.has_sections)
+	{
+		if (r.has_guidance)
+		{
+			return "\"sections\" and \"guidance\" are two ways to ask for the same "
+			       "machinery: \"sections\" compiles into guidance entries, so give the "
+			       "sections or the frames, not both";
+		}
+		if (r.has_cfg && r.cfg_scale != 1.0)
+		{
+			return "\"sections\" and \"cfg_scale\" are two ways to ask for the same "
+			       "machinery: put the push under an entry's \"against\", not in "
+			       "\"cfg_scale\"";
+		}
+		if (r.has_tpl)
+		{
+			return "\"sections\" with \"abc_template\" is not supported yet: a template "
+			       "re-prefills the slot per hole, and a cut re-prefills it per section";
+		}
+		if (r.cot == "off")
+		{
+			return "\"sections\" names labels in a score, and cot=off has none — use "
+			       "cot=melody or cot=full";
+		}
+		// The tags in force before the entry being checked, as SPEC_GUIDANCE's
+		// own chain does it.
+		std::string style = r.style;
+		for (size_t i = 0; i < r.sections.size(); i++)
+		{
+			const SectionEntry & s = r.sections[i];
+			for (size_t k = 0; k < i; k++)
+			{
+				// Two entries on the same label are the only ordering the request
+				// can be held to before the score exists: across labels the order
+				// is the score's, and an entry the score puts too early is simply
+				// never found (§2).
+				if (r.sections[k].section == s.section && r.sections[k].nth >= s.nth)
+				{
+					return strf("\"sections\" entry %zu: %% %s %d cannot come after "
+					            "entry %zu's %% %s %d — entries are in the order the song "
+					            "plays them", i + 1, s.section.c_str(), s.nth, k + 1,
+					            r.sections[k].section.c_str(), r.sections[k].nth);
+				}
+			}
+			if (s.has[BRANCH_PREVIOUS] && s.style == style)
+			{
+				return strf("\"sections\" entry %zu: \"style\" is the one already in force, "
+				            "so \"against\".\"previous\" would push against itself", i + 1);
+			}
+			style = s.style;
 		}
 	}
 	// SPEC_KEEP §2. Everything here is decided without opening the file; the
@@ -2257,6 +2794,14 @@ struct JobState
 	std::string              keep_name;     // its basename, all the log line shows
 	double                   keep_seconds = 0;
 
+	// SPEC_SECTIONS.md, empty unless the request carried a "sections": the
+	// entries as they resolve against the score, which `guide` above is compiled
+	// from once they have (sections_compile). `plain_swap` says no entry opens a
+	// branch, so the song owns one KV stream and may decode beside others (§4).
+	std::vector<SectionEntry> sections;
+	bool                      plain_swap  = false;
+	double                    sec_seconds = 0;   // re-prefilling the score phase at a cut
+
 	GenStats                 st_abc;
 	GenStats                 st_sem;
 	bool                     ok    = true;   // false once the job is rejected
@@ -2323,7 +2868,40 @@ struct Seq
 	int                      g_entry   = -1;  // the entry in force, -1 before the first
 	Branch                   branch[BRANCH_KINDS];
 	std::vector<float>       blend;           // n_vocab floats: the blended row
+
+	// The sections walk (SPEC_SECTIONS §3), unused unless the job writes its own
+	// score and carries a "sections". `line_ids` are the tokens of the line being
+	// written; `line_pre` is the text a token left behind when it closed one.
+	ScoreClock               clock;
+	std::vector<llama_token> line_ids;
+	std::string              line_pre;
+	size_t                   sec_next  = 0;   // the next entry to look for
+	int                      sec_cuts  = 0;   // cuts this score phase made
 };
+
+// The resolved sections become the guidance plan: a frame each from the bar the
+// score phase recorded, and only the entries whose label turned up. `heads` is
+// compacted with them, so a cut still finds its prefix head where the plan says
+// (SPEC_SECTIONS §4).
+static void sections_compile(JobState & js)
+{
+	sections_frames(js.sections);
+
+	std::vector<GuidanceEntry>            guide;
+	std::vector<std::vector<llama_token>> heads;
+	for (size_t i = 0; i < js.sections.size(); i++)
+	{
+		if (!js.sections[i].found)
+		{
+			continue;
+		}
+		guide.push_back(js.guide[i]);
+		guide.back().frame = js.sections[i].frame;
+		heads.push_back(js.heads[i]);
+	}
+	js.guide = guide;
+	js.heads = heads;
+}
 
 // The shared decode loop: one llama_decode per step carrying one token for each
 // active slot, then one state-machine step per slot. SPEC_BATCH §4.4.
@@ -2395,6 +2973,11 @@ struct Runner
 
 	// SPEC_KEEP §3: the semantic phase entered on an earlier render's codes.
 	void        keep_enter(Seq & q);
+
+	// SPEC_SECTIONS §3: the score phase, watching the lines go by for the labels
+	// the request named and re-prefilling the slot at each one.
+	void        sections_token(Seq & q, llama_token token);
+	void        sections_cut(Seq & q, size_t idx);
 
 	// The template walk. give() feeds one forced stretch of score; the rest is
 	// the hole state machine. SPEC_TEMPLATE §3.
@@ -2600,7 +3183,10 @@ void Runner::take_entry(Seq & q, size_t idx)
 				    js.tag.c_str(), old_slot);
 			}
 		}
-		const int slot = free_slot(q);
+		// A plain swap has no branch to keep out of the way, and the slot it just
+		// cleared is the one to use: with one stream per song, free_slot's "lowest
+		// stream this song is not using" would hand out a neighbour's (§4).
+		const int slot = js.plain_swap ? old_slot : free_slot(q);
 		q.pos  = prefill_branch(q, slot, np, "new positive", q.i_batch);
 		q.slot = slot;
 	}
@@ -2846,6 +3432,13 @@ void Runner::apply(Seq & q, llama_token token)
 		if (q.step < s.max_tokens)
 		{
 			q.next = token;
+			// The score clock, and the cut when the line this token closed is a
+			// label an entry named (SPEC_SECTIONS §3). The slot it re-prefills
+			// still holds "prefix + history minus the token pending in q.next".
+			if (abc && !js.sections.empty())
+			{
+				sections_token(q, token);
+			}
 			return;
 		}
 	}
@@ -2884,6 +3477,13 @@ void Runner::apply(Seq & q, llama_token token)
 		    js.tag.c_str(), js.prefix_sem.size(), s_sem.max_tokens, n_ctx_seq);
 	}
 
+	// The labels this score turned out to hold become the guidance plan, with a
+	// frame each (SPEC_SECTIONS §4).
+	if (!js.sections.empty())
+	{
+		sections_compile(js);
+	}
+
 	q.phase    = PHASE_SEM;
 	q.history.clear();
 	q.step     = 0;
@@ -2893,13 +3493,31 @@ void Runner::apply(Seq & q, llama_token token)
 	// The cache already holds prefix_abc plus every abc id that was decoded; a
 	// truncated phase still has its last kept token in hand, so the bridge is
 	// two tokens or three. Its own decode call, not the lockstep batch: §4.4.
+	//
+	// Unless a section cut re-prefilled the slot under other tags: what it holds
+	// is then that entry's prefix and not this request's, and the semantic phase
+	// starts from the request's own style either way (SPEC_SECTIONS §3). That is
+	// a clear and a whole prefill — the hand-over a template makes.
 	std::vector<llama_token> bridge;
-	if (!eos)
+	if (q.sec_cuts > 0)
 	{
-		bridge.push_back(token);
+		llama_memory_seq_rm(mem, q.slot, -1, -1);
+		const llama_pos held = llama_memory_seq_pos_max(mem, q.slot);
+		if (held != -1)
+		{
+			die("%sslot %d still holds %d tokens after the score phase cleared it",
+			    js.tag.c_str(), q.slot, (int) held + 1);
+		}
+		q.pos  = 0;
+		bridge = js.prefix_sem;
+	} else {
+		if (!eos)
+		{
+			bridge.push_back(token);
+		}
+		bridge.push_back(ABC_END);
+		bridge.push_back(MUSIC_START);
 	}
-	bridge.push_back(ABC_END);
-	bridge.push_back(MUSIC_START);
 
 	js.st_sem.prefix_tokens = (int) js.prefix_sem.size();
 
@@ -3531,6 +4149,11 @@ void Runner::enter(Seq & q, int job)
 	q.tpl_full = false;
 	q.hole_ids.clear();
 	q.carry.clear();
+	q.clock    = ScoreClock();
+	q.line_ids.clear();
+	q.line_pre.clear();
+	q.sec_next = 0;
+	q.sec_cuts = 0;
 	active++;
 
 	if (js.do_abc)
@@ -3615,6 +4238,85 @@ void Runner::keep_enter(Seq & q)
 	guidance_enter(q);
 }
 
+// One abc token of a job that carries a "sections": the clock is fed whole
+// lines, and a completed label line the next entry names is a cut (§3). `nth` is
+// counted over every label line of that name, so the intro and interlude labels
+// the planner inserts on its own are stepped over rather than counted.
+void Runner::sections_token(Seq & q, llama_token token)
+{
+	JobState & js = (*states)[q.job];
+	q.line_ids.push_back(token);
+
+	// As the template's hole does it: the line is the detokenization of the ids
+	// drawn since the last newline, plus whatever the token that closed it left
+	// behind. One token can close a line and open the next.
+	std::string text = q.line_pre + detokenize(vocab, q.line_ids);
+	if (text.find('\n') == std::string::npos)
+	{
+		return;
+	}
+	for (size_t nl = text.find('\n'); nl != std::string::npos; nl = text.find('\n'))
+	{
+		const std::string name = clock_line(q.clock, text.substr(0, nl));
+		text.erase(0, nl + 1);
+		if (q.sec_next >= js.sections.size() || name != js.sections[q.sec_next].section ||
+		    q.clock.seen[name] != js.sections[q.sec_next].nth)
+		{
+			continue;
+		}
+		SectionEntry & s = js.sections[q.sec_next];
+		s.found   = true;
+		s.line    = q.clock.line;
+		s.bar     = q.clock.bars;
+		s.seconds = q.clock.seconds;
+		sections_cut(q, q.sec_next++);
+	}
+	q.line_ids.clear();
+	q.line_pre = text;
+}
+
+// The cut of SPEC_SECTIONS §3: the score so far is re-prefilled under the
+// entry's own tags and sampling goes on, so the label line was written under the
+// old tags and everything after it under the new ones. The slot is cleared and
+// refilled the way the template hand-over does it, and it keeps the invariant
+// every prefill in this file keeps — prefix + `history` minus the token still
+// pending in `q.next`. No RNG reset, no extra draw.
+void Runner::sections_cut(Seq & q, size_t idx)
+{
+	JobState &           js = (*states)[q.job];
+	const SectionEntry & s  = js.sections[idx];
+	const double         t0 = now_seconds();
+
+	std::vector<llama_token> feed = js.heads[idx];
+	const size_t             head = feed.size();
+	feed.insert(feed.end(), q.history.begin(), q.history.end() - 1);
+
+	// Unreachable once the sizing guard holds: n_ctx_want is built on the longest
+	// entry head plus the whole abc cap (§4.5). The backstop turns a sizing bug
+	// into a message instead of a -1 from llama_decode.
+	if (feed.size() + 1 > (size_t) n_ctx_seq)
+	{
+		die("%ssections: the cut at line %d needs %zu of the %u tokens this slot has",
+		    js.tag.c_str(), s.line, feed.size() + 1, n_ctx_seq);
+	}
+
+	llama_memory_seq_rm(mem, q.slot, -1, -1);
+	const llama_pos held = llama_memory_seq_pos_max(mem, q.slot);
+	if (held != -1)
+	{
+		die("%ssections: slot %d still holds %d tokens after the cut cleared it",
+		    js.tag.c_str(), q.slot, (int) held + 1);
+	}
+	q.pos = 0;
+	feed_tokens(q, feed, feed.size(), "sections cut");
+
+	q.sec_cuts++;
+	js.sec_seconds += now_seconds() - t0;
+	printf("%sabc: line %d: %% %s %d (bar %d, %.2f s): the score goes on under its own "
+	       "tags (%zu + %zu tokens, %.2f s)\n", js.tag.c_str(), s.line, s.section.c_str(),
+	       s.nth, s.bar, s.seconds, head, feed.size() - head, now_seconds() - t0);
+}
+
 void Runner::finish_job(Seq & q)
 {
 	JobState & js = (*states)[q.job];
@@ -3648,6 +4350,10 @@ void Runner::finish_job(Seq & q)
 	js.st_sem.kept_frames = (int) js.keep_codes.size();
 	js.st_abc.keep_prefill_seconds = js.keep_seconds;
 	js.st_sem.keep_prefill_seconds = js.keep_seconds;
+	js.st_abc.section_cuts = q.sec_cuts;
+	js.st_sem.section_cuts = q.sec_cuts;
+	js.st_abc.section_prefill_seconds = js.sec_seconds;
+	js.st_sem.section_prefill_seconds = js.sec_seconds;
 
 	{
 		Artifacts a;
@@ -3660,7 +4366,8 @@ void Runner::finish_job(Seq & q)
 		a.abc_text      = js.abc_text;
 		a.have_abc_text = js.have_abc_text;
 		a.template_text = js.is_template ? js.req.abc_template : std::string();
-		a.guidance      = js.req.has_guidance ? &js.guide : nullptr;
+		a.guidance      = js.req.has_guidance || js.req.has_sections ? &js.guide : nullptr;
+		a.sections      = js.req.has_sections ? &js.sections : nullptr;
 		a.keep          = js.keep_codes.empty() ? nullptr : &js.keep_codes;
 		a.trace         = (*jobs)[q.job].trace && !js.guide.empty() ? &js.trace : nullptr;
 		write_artifacts(a);
@@ -4350,6 +5057,26 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			reject(i, err);
 			continue;
 		}
+		// The sections a request names (SPEC_SECTIONS §2). A score the request
+		// gave is already written, so its labels are located here — which is what
+		// makes a section landing inside the kept frames a request error like any
+		// other, before anything touches the GPU (§4).
+		if (js.req.has_sections)
+		{
+			js.sections   = js.req.sections;
+			js.plain_swap = sections_plain_swap(js.req.sections);
+			if (js.req.has_abc)
+			{
+				sections_locate(js.req.abc, js.sections);
+				sections_frames(js.sections);
+				const std::string sec_err = sections_keep_check(js.req, js.sections);
+				if (!sec_err.empty())
+				{
+					reject(i, strf("%s: %s", jobs[i].request_path.c_str(), sec_err.c_str()));
+					continue;
+				}
+			}
+		}
 		// The earlier render's codes (SPEC_KEEP §2). Read here, so a bad file is
 		// one more rejected job rather than a death in the middle of a batch,
 		// and so nothing has touched the GPU yet.
@@ -4577,7 +5304,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 		// (SPEC_GUIDANCE §4.4/§4.5). Only the head differs between the positive
 		// sequence and a branch — the score and the two closing tokens are the
 		// same — so the longest head is what the context has to be sized on.
-		js.guide = guidance_plan(js.req);
+		js.guide = js.req.has_sections ? sections_plan(js.sections) : guidance_plan(js.req);
 		js.heads.assign(js.guide.size(), std::vector<llama_token>());
 		size_t head_max = js.prefix_abc.size();
 		if (!js.guide.empty())
@@ -4614,6 +5341,14 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 				// so n_batch stays where the unguided path put it.
 				max_feed = std::max(max_feed, longest);
 			}
+		}
+
+		// A score the request gave is located already, so the plan is final here
+		// — before the context exists. One the model writes is compiled at the
+		// end of its abc phase instead (Runner::apply).
+		if (js.req.has_sections && !js.do_abc)
+		{
+			sections_compile(js);
 		}
 
 		uint32_t want = (uint32_t) (head_max + js.abc_ids.size() +
@@ -4685,7 +5420,10 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	bool guided = false;
 	for (size_t i = 0; i < jobs.size(); i++)
 	{
-		guided = guided || (states[i].ok && !states[i].guide.empty());
+		// A plain-swap "sections" job is not one of them: its cut drops the old
+		// sequence and refills the slot it freed, so no branch is ever live and
+		// one stream is the whole of what it needs (SPEC_SECTIONS §4).
+		guided = guided || (states[i].ok && !states[i].guide.empty() && !states[i].plain_swap);
 	}
 	const int n_streams = guided ? BRANCH_KINDS + 1 : parallel;
 

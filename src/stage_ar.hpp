@@ -83,6 +83,10 @@ struct GenStats
 	// instead of sampling them, and what prefilling them cost.
 	int    kept_frames     = 0;
 	double keep_prefill_seconds = 0;
+	// SPEC_SECTIONS §3: the cuts the score phase made, and what re-prefilling
+	// the score under each entry's own tags cost.
+	int    section_cuts    = 0;
+	double section_prefill_seconds = 0;
 };
 
 // What the abc phase of a score-template job did with its holes. SPEC_TEMPLATE
