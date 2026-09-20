@@ -83,4 +83,12 @@ if(YUE2_BUILD_TESTS)
 	target_include_directories(yue2-guidance PRIVATE src)
 	target_link_libraries(yue2-guidance PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-guidance PRIVATE ${YUE2_WARN_FLAGS})
+
+	# Stage 9 (handover): the offset measurement of SPEC_HANDOVER.md §4, the
+	# forced history of §5 and every request error of §2 — synthetic streams
+	# and a score in a string, so no model and no device either.
+	add_executable(yue2-handover tests/handover.cpp)
+	target_include_directories(yue2-handover PRIVATE src)
+	target_link_libraries(yue2-handover PRIVATE llama ggml vendor::hash vendor::nlohmann)
+	target_compile_options(yue2-handover PRIVATE ${YUE2_WARN_FLAGS})
 endif()

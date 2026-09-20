@@ -36,6 +36,13 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   guidance entries. Without an `against` it is a plain swap that owns one KV
   stream, so it decodes at `--parallel > 1`. Numbers in
   [src/STATUS_SECTIONS.md](../src/STATUS_SECTIONS.md).
+- Stage 9: `handover` — one take per style from one score, and at each cut the
+  incoming style's renderer is forced through its own take up to a few seconds
+  before the cut and the song's last few seconds after it, then samples on. The
+  model is loaded once; every take and leg is its own generation, bit-identical
+  to rendering it by hand. The lag one take runs ahead of another is measured
+  from the tokens (`"offset": "auto"`). Numbers in
+  [src/STATUS_HANDOVER.md](../src/STATUS_HANDOVER.md).
 - The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
   Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
   exact) indistinguishable, and on the AMD the exact path is not faster — so

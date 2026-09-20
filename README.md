@@ -95,8 +95,8 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template`, `cfg_scale`, `guidance`, `sections` and `semantic_keep`
-are optional.
+`abc`, `abc_template`, `cfg_scale`, `guidance`, `sections`, `semantic_keep`,
+`handover` and `base_take` are optional.
 Lyrics carry `[Section]` tags on
 their own lines:
 
@@ -278,6 +278,9 @@ A `tv_blend` near 1 with a very negative `logp` is a step the guidance carried
 on its own — musically the interesting ones, and, if a whole run looks like
 that, the sign that the weights are too high for the lyrics to survive.
 
+`scripts/trace_summary.py DIR/guidance_trace.npy` prints the same trace as a
+per-5-seconds timeline with the hardest-pushed moments as timestamps.
+
 **Keep the start of an earlier render: `semantic_keep`.** A guided song is still
 sampled from frame 0, so feeding the same score back gives a *new* performance.
 `"semantic_keep"` does the opposite — it forces the codes of a render you already
@@ -376,6 +379,78 @@ a different singer.
   `Q:1/4=120` is 50 frames a bar); inline `[M:…]` changes are honoured, and the
   bar clock follows the `V: Vocal` voice.
 
+**Hand the song over to another style's take: `handover`.** Swapping the tags
+mid-song changes the singer when the score agrees, but a *genre* change needs the
+audio history to change too — and pushing tags against the history is
+seed-dependent. What works every time is to render **one full take per style from
+the same score** and hand the song from one take to the next at a cut:
+
+```json
+"base_take": "out/base",
+"handover": [
+  { "section": "chorus", "nth": 1, "style": "…tags…" },
+  { "section": "verse",  "nth": 3, "take": "takes/reggae", "seconds": 1 },
+  { "section": "verse",  "nth": 4 }
+]
+```
+
+At each cut the incoming style's renderer is run over a forced history — its own
+take up to a few seconds before the cut, then the last few seconds of the song so
+far — and samples on from there. Its long memory is already the new style, the
+short intrusion ties it to where the song is (phrase, beat, singer), and it
+recovers into its own style within a bar or two. Chains work (A→B→C→D→A).
+
+- **Audition the takes first.** The handover can only be as good as the take it
+  hands to: render each style on its own, listen, and hand over to the ones that
+  work. `--artifacts DIR` saves every take the engine renders as an ordinary
+  artifacts directory `DIR/take_<k>/`, so it can be auditioned with `yue2 nar` +
+  `yue2 vae` and reused later through `take`.
+- The two settings that matter: `"seconds"` (default 5) is how much of the song
+  so far the incoming renderer is shown. **5 s is a gradual blend** — the band
+  changes first, the singer at the next natural entry. **1 s on a section
+  boundary is a hard cut.** The range is 0.2–30.
+- Where: `section` + `nth` exactly as in `sections` (same labels, same
+  `lead_frames`), or `"frame": N` in the base take's own timeline. Cuts must be
+  strictly increasing, and the array is the order the song plays them in.
+- What takes over: `style` (the engine renders that take itself, once per
+  distinct style), `take` (an artifacts directory of an earlier render — its
+  `score.abc` must be byte-identical to the base score, and its tags are read
+  from its `request.json`), or neither, which is back to the request's own style
+  and its base take.
+- `"base_take": "dir"` uses an earlier render as the base instead of rendering
+  it, and supplies the score when the request has no `"abc"`. Without it the
+  engine renders the base take first, as `take_0`.
+- **Two takes of one score do not run at the same pace** — one leads the other by
+  up to a couple of seconds, and the lead drifts over the song — so the incoming
+  take is read at its own clock. `"offset"` is how many frames it runs ahead at
+  the cut; the default `"auto"` measures it from the tokens (at the right lag two
+  takes of one score share 2–3 % *identical* tokens over a 30 s window and next
+  to none at every other lag). `handover.json` records the offset, its z-score
+  and `confident: false` when no lag stood out.
+- `handover.json` also records, per entry, the label and bar it resolved to, the
+  cut frame, which take took over, the intrusion and how many frames of the final
+  song that leg contributed. An entry whose label the score never writes, or
+  whose cut is past the end of the song, is reported there rather than being an
+  error.
+- The model is loaded once and every take and leg decodes through it, but each
+  one is its own generation: a take is bit-identical to rendering that request
+  with `yue2 ar` by hand. Expect a take to cost a full song's sampling time and a
+  leg rather less (it starts from a forced history and stops after the next cut).
+- `guidance`, `sections`, `semantic_keep`, `abc_template`, `cot: "off"` and a
+  `cfg_scale` other than 1 are all errors beside it, and so is a batch of more
+  than one song (`yue2 batch --jobs` / `yue2 ar --requests`) — render a handover
+  on its own with `yue2 song` or `yue2 ar`.
+- Everything the request names is read and everything that can be decided by
+  arithmetic is decided **before the first take is rendered**: a take that is not
+  there, is not of this score or does not reach a cut, a cut with less than the
+  intrusion before it, a `--max-semantic` that would leave a leg nothing to
+  sample. A leg that cannot be played is an error, never a silently short song;
+  the one thing that is reported instead is a cut past the end of the song.
+
+A worked request is in [docs/examples/handover.json](docs/examples/handover.json);
+which styles to hand over to, and in what order, is
+[docs/COOKBOOK_STYLE_CHANGE.md](docs/COOKBOOK_STYLE_CHANGE.md).
+
 Transposing a score, moving the singer's register, stripping the chords, resting
 out or re-writing the accompaniment, reading a seed's score before rendering it:
 [docs/SCORE_RECIPES.md](docs/SCORE_RECIPES.md), with `scripts/abc_transpose.lua`.
@@ -429,6 +504,25 @@ is ~6 % faster (16.2 s vs 17.1 s fp16-staged, 191 s song), on the AMD the
 fp16-staged path is the quicker one (9.2 s vs 9.5 s). Details, the per-stage
 goldens and the Q8_0/F16 prefix measurement are in
 [src/STATUS_SINGLE.md](src/STATUS_SINGLE.md).
+
+**Tags in the FLAC.** A `.flac` from `song` or `batch` carries Vorbis comments
+(FLAC's native tags; players and `metaflac` read them). What goes in is what the
+request names, plus the words that are sung:
+
+```json
+"tags": { "TITLE": "My Song", "ARTIST": "Someone", "GENRE": "lullaby" }
+```
+
+- `tags` is free-form `NAME: "text"` (names printable ASCII without `=`, text
+  UTF-8); a bad block is a request error before anything renders.
+- Written without being asked: `LYRICS` (the request's lyrics, unless `tags` has
+  its own), `ENCODER=yue2.cpp`, and `YUE2_ID` — the first 16 hex digits of the
+  SHA-256 of `semantic.npy`, which finds the artifacts directory a file came from
+  without saying anything about it.
+- Never written: the style, the seed (it repeats a song only on the same card,
+  build and batch shape — `semantic.npy` is the durable record), `id`, paths.
+- `--no-tags` writes none: the file as earlier versions made it. The standalone
+  `yue2 vae` has no request and writes none.
 
 `yue2 noise --seed N --frames T -o noise.npy` exposes the NAR's noise generator
 (`std::mt19937_64` + Box–Muller, no `<random>` distribution, so one seed gives

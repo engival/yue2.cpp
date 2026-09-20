@@ -1,10 +1,11 @@
 -- abc_transpose.lua — transpose a YuE2 score.abc. Plain Lua 5.3+, no modules.
 --
---   lua scripts/abc_transpose.lua score.abc SEMITONES [VOCAL_OCTAVES] > new.abc
+--   lua scripts/abc_transpose.lua score.abc SEMITONES [VOCAL_OCTAVES [FROM]] > new.abc
 --   lua scripts/abc_transpose.lua score.abc 5 -1      Em -> Am, singer an octave down from that
+--   lua scripts/abc_transpose.lua score.abc 0 -1 verse:3   singer an octave down from the 3rd `% verse` on
 --
 -- Loaded with dofile()/require instead, it returns
---   transpose(abc, semitones, vocal_octaves) -> new abc, "Em -> Am" description
+--   transpose(abc, semitones, vocal_octaves, from) -> new abc, "Em -> Am" description
 --
 -- Every note of both voices moves `semitones`, the chord symbols and the K:
 -- field move with them, and the `V: Vocal` notes move a further
@@ -125,13 +126,16 @@ local function walk(line, from, to, shift, pitches)
 	return table.concat(out)
 end
 
--- Every body line of `abc` through fn(line, voice); header fields and comments pass.
-local function each_line(abc, fn)
+-- Every body line of `abc` through fn(line, voice); header fields and comments pass,
+-- a `% label` comment goes to on_label(label) first.
+local function each_line(abc, fn, on_label)
 	local out, voice = {}, nil
 	for text in (abc .. "\n"):gmatch("(.-)\n") do
 		local line = text
 		if line:match("^V:") then
 			voice = line:match("^V:%s*(%S+)")
+		elseif on_label and line:match("^%%%s*%S") then
+			on_label(line:match("^%%%s*(%S+)"))
 		elseif not line:match("^%a:") and not line:match("^%%") then
 			line = fn(line, voice)
 		end
@@ -140,11 +144,15 @@ local function each_line(abc, fn)
 	return table.concat(out, "\n")
 end
 
-local function transpose(abc, semitones, vocal_octaves)
+-- `from` = "label" or "label:nth": the vocal octaves apply from that section label on only.
+local function transpose(abc, semitones, vocal_octaves, from_label)
 	local field = assert(abc:match("\n(K:[^\n]*)"), "score has no K: field")
 	local from = parse_key(field)
 	local to = make_key((from.pc + semitones) % 12, from.minor)
-	local function shift_of(voice) return semitones + (voice == "Vocal" and 12 * vocal_octaves or 0) end
+	local label, nth = (from_label or ""):match("^([^:]+):?(%d*)$")
+	local left = from_label and (tonumber(nth) or 1) or 0		-- occurrences of the label still to pass
+	assert(not from_label or label, "FROM is label or label:nth")
+	local function shift_of(voice) return semitones + (voice == "Vocal" and left == 0 and 12 * vocal_octaves or 0) end
 
 	local before = {}
 	local result = each_line(abc, function(line, voice)
@@ -152,7 +160,8 @@ local function transpose(abc, semitones, vocal_octaves)
 		local new = walk(line, from, to, shift_of(voice), before)
 		for k = at + 1, #before do before[k] = before[k] + shift_of(voice) end
 		return new
-	end)
+	end, function(seen) if seen == label and left > 0 then left = left - 1 end end)
+	assert(left == 0, "score has no such section: " .. tostring(from_label))
 	result = result:gsub("\nK:[^\n]*", function() return "\nK:" .. to.name end, 1)
 
 	local after = {}
@@ -165,19 +174,19 @@ local function transpose(abc, semitones, vocal_octaves)
 end
 
 -- As a script `...` holds the command line; through dofile()/require it is empty.
-local path, semitones, vocal_octaves = ...
+local path, semitones, vocal_octaves, from_label = ...
 if not path then
 	return transpose
 end
 semitones     = tonumber(semitones)
 vocal_octaves = tonumber(vocal_octaves) or 0
 if not semitones then
-	io.stderr:write("usage: abc_transpose.lua SCORE.abc SEMITONES [VOCAL_OCTAVES] > new.abc\n")
+	io.stderr:write("usage: abc_transpose.lua SCORE.abc SEMITONES [VOCAL_OCTAVES [FROM]] > new.abc\n")
 	os.exit(2)
 end
 local file = assert(io.open(path, "r"))
 local abc = file:read("a")
 file:close()
-local result, moved = transpose(abc, semitones, vocal_octaves)
-io.stderr:write(moved .. ", vocal line " .. ("%+d"):format(semitones + 12 * vocal_octaves) .. " semitones (pitch-checked)\n")
+local result, moved = transpose(abc, semitones, vocal_octaves, from_label)
+io.stderr:write(moved .. ", vocal line " .. ("%+d"):format(semitones + 12 * vocal_octaves) .. " semitones" .. (from_label and " from " .. from_label or "") .. " (pitch-checked)\n")
 io.stdout:write(result)

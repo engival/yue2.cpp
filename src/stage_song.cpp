@@ -10,6 +10,7 @@
 
 #include "common/device.hpp"
 #include "common/fileio.hpp"
+#include "common/flac.hpp"
 #include "common/noise.hpp"
 #include "common/util.hpp"
 
@@ -65,13 +66,58 @@ std::string temp_artifacts_dir(size_t job)
 	return dir;
 }
 
+// The FLAC's Vorbis comments for one request: its "tags" block as given, the
+// words that are sung, the encoder. Nothing else of the request reaches the file
+// unless it is named in "tags". A request the AR stage will refuse anyway
+// (unreadable, not JSON) yields no tags and no error here.
+std::string request_tags(const std::string & request_path, flac::Tags & tags)
+{
+	std::string body;
+	if (!read_file(request_path, body).empty())
+	{
+		return "";
+	}
+	const json root = json::parse(body, nullptr, false);
+	if (!root.is_object())
+	{
+		return "";
+	}
+	if (root.contains("tags"))
+	{
+		if (!root["tags"].is_object())
+		{
+			return "\"tags\" must be an object of NAME: \"text\"";
+		}
+		for (const auto & item : root["tags"].items())
+		{
+			if (!item.value().is_string())
+			{
+				return "\"tags\": \"" + item.key() + "\" must be a string";
+			}
+			const std::string err = flac::check_tag(item.key(), item.value().get<std::string>());
+			if (!err.empty())
+			{
+				return "\"tags\": " + err;
+			}
+			tags.emplace_back(item.key(), item.value().get<std::string>());
+		}
+	}
+	if (root.contains("lyrics") && root["lyrics"].is_string() &&
+	    std::none_of(tags.begin(), tags.end(), [](const auto & t) { return t.first == "LYRICS"; }))
+	{
+		tags.emplace_back("LYRICS", root["lyrics"].get<std::string>());
+	}
+	tags.emplace_back("ENCODER", "yue2.cpp");
+	return "";
+}
+
 void usage(const char * argv0)
 {
 	fprintf(stderr,
 	        "usage: %s --request R.json --out X.flac [--artifacts DIR] [--seed N]\n"
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 32]\n"
-	        "        [--guidance-trace]\n", argv0);
+	        "        [--guidance-trace] [--no-tags]\n", argv0);
 }
 
 void usage_batch(const char * argv0)
@@ -81,7 +127,7 @@ void usage_batch(const char * argv0)
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf] [--seed N]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--steps 32]\n"
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
-	        "        [--continue-on-error] [--guidance-trace]\n"
+	        "        [--continue-on-error] [--guidance-trace] [--no-tags]\n"
 	        "\n"
 	        "jobs.json is an array of { \"request\", \"out\", \"artifacts\", \"seed\", \"noise\" };\n"
 	        "request and out are required and paths are relative to the working directory.\n",
@@ -348,6 +394,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			p.nar_f32 = true;
 		} else if (a == "--guidance-trace") {
 			p.guidance_trace = true;
+		} else if (a == "--no-tags") {
+			p.no_tags = true;
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
@@ -422,6 +470,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			p.continue_on_error = true;
 		} else if (a == "--guidance-trace") {
 			p.guidance_trace = true;
+		} else if (a == "--no-tags") {
+			p.no_tags = true;
 		} else if (a == "--seed") {
 			p.has_seed = true;
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
@@ -524,6 +574,17 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 	ar_params.max_abc           = p.max_abc;
 	ar_params.max_semantic      = p.max_semantic;
 	ar_params.continue_on_error = p.continue_on_error;
+
+	// A bad "tags" block is a request error, so it is one before anything renders.
+	std::vector<flac::Tags> tags(jobs.size());
+	for (size_t k = 0; k < jobs.size() && !p.no_tags; k++)
+	{
+		const std::string err = request_tags(jobs[k].request_path, tags[k]);
+		if (!err.empty())
+		{
+			die("%s: %s", jobs[k].request_path.c_str(), err.c_str());
+		}
+	}
 
 	std::vector<ArResult> ar(jobs.size());
 	run_ar_batch(ar_params, jobs, ar);
@@ -639,6 +700,12 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		vae.gpu           = p.gpu;
 		vae.threads       = p.threads;
 		vae.vk_f16_matmul = nar.vk_f16_matmul;
+		if (!p.no_tags)
+		{
+			// Finds the artifacts directory a FLAC came from without saying what is in it.
+			vae.tags = tags[k];
+			vae.tags.emplace_back("YUE2_ID", sha256_file_hex(dir + "semantic.npy").substr(0, 16));
+		}
 
 		const double t_vae0 = now_seconds();
 		run_vae(vae);
@@ -695,6 +762,7 @@ int run_song(const SongParams & p)
 	bp.parallel  = 1;          // the reproducible path, SPEC_BATCH §6
 	bp.nar_f32   = p.nar_f32;
 	bp.guidance_trace = p.guidance_trace;
+	bp.no_tags   = p.no_tags;
 
 	ArJob job;
 	job.request_path = p.request_path;

@@ -33,7 +33,29 @@ function bars(line,  n, i, m, seg) {
 { print "%%yue2-gen bars=" bars($0) }          # new_vocal; no_ins prints "Z" bars($0) "|" for voice == "Ins"
 ```
 
-Render any of them with the lyrics in a request:
+## A request: `handover.json`
+
+`handover.json` is a whole request rather than a score: one song handed from its
+own take to a eurodance take at the first chorus, to an earlier reggae render at
+the second verse (a 1 s hard cut), and back to its own style at the last chorus.
+See the `handover` part of the [README](../../README.md).
+
+`base_take` and `take` are artifacts directories of earlier renders of **one**
+score, and — like a `semantic_keep` file — they resolve **against the request
+file**, not the working directory. So the request has to sit where those
+directories are:
+
+```bash
+cp docs/examples/handover.json .        # beside out/base and out/reggae
+build/yue2 song --request handover.json --out song.flac \
+    --artifacts out/handover --gpu 0
+```
+
+`out/base` is a `--artifacts` directory of an earlier render of this request's
+lyrics and style, `out/reggae` one of the same score under other tags — every
+take's `score.abc` has to match the base's to the byte.
+
+Render any of the scores above with the lyrics in a request:
 
 ```bash
 jq --rawfile abc docs/examples/song_new_ins.tpl.abc '. + {abc_template: $abc}' song.json > tpl.json

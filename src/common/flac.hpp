@@ -2,15 +2,34 @@
 // PCM_24 produced for the reference pipeline. SPEC_SINGLE.md §2.5.
 #pragma once
 
+#include <FLAC/metadata.h>
 #include <FLAC/stream_encoder.h>
 
 #include <cmath>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace flac
 {
+
+// Vorbis comments, FLAC's native tags: NAME=value, the value UTF-8.
+using Tags = std::vector<std::pair<std::string, std::string>>;
+
+// "" when libFLAC will take the pair: the name printable ASCII without '=', the value UTF-8.
+inline std::string check_tag(const std::string & name, const std::string & value)
+{
+	if (name.empty() || !FLAC__format_vorbiscomment_entry_name_is_legal(name.c_str()))
+	{
+		return "tag name \"" + name + "\": printable ASCII without '='";
+	}
+	if (!FLAC__format_vorbiscomment_entry_value_is_legal((const FLAC__byte *) value.data(), (uint32_t) value.size()))
+	{
+		return "tag \"" + name + "\": the text is not UTF-8";
+	}
+	return "";
+}
 
 // planar: channels * samples, channel-major, as yue2-vae holds its audio.
 // Samples are clamped to [-1, 1], scaled and rounded to nearest (round-half-even,
@@ -25,7 +44,7 @@ const double SCALE_24 = 8388608.0;
 const double MAX_24   =  8388607.0;
 const double MIN_24   = -8388608.0;
 inline std::string save_f32_24(const char * path, const float * planar, int channels,
-	int64_t samples, int sample_rate)
+	int64_t samples, int sample_rate, const Tags & tags = {})
 {
 	if (channels <= 0 || samples < 0 || sample_rate <= 0)
 	{
@@ -50,8 +69,33 @@ inline std::string save_f32_24(const char * path, const float * planar, int chan
 		return "flac: the encoder rejected the stream parameters";
 	}
 
+	// The encoder keeps a pointer to the block until finish(); no tags = libFLAC's
+	// own empty block, the file as it always was. libFLAC checks name and value.
+	FLAC__StreamMetadata * block = tags.empty() ? nullptr : FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT);
+	for (const auto & tag : tags)
+	{
+		FLAC__StreamMetadata_VorbisComment_Entry entry;
+		if (!FLAC__metadata_object_vorbiscomment_entry_from_name_value_pair(&entry, tag.first.c_str(), tag.second.c_str()) ||
+		    !FLAC__metadata_object_vorbiscomment_append_comment(block, entry, false))
+		{
+			FLAC__metadata_object_delete(block);
+			FLAC__stream_encoder_delete(enc);
+			return "flac: cannot store the tag \"" + tag.first + "\" (name printable ASCII without '=', value UTF-8)";
+		}
+	}
+	if (block != nullptr && !FLAC__stream_encoder_set_metadata(enc, &block, 1))
+	{
+		FLAC__metadata_object_delete(block);
+		FLAC__stream_encoder_delete(enc);
+		return "flac: the encoder rejected the tags";
+	}
+
 	if (FLAC__stream_encoder_init_file(enc, path, nullptr, nullptr) != FLAC__STREAM_ENCODER_INIT_STATUS_OK)
 	{
+		if (block != nullptr)
+		{
+			FLAC__metadata_object_delete(block);
+		}
 		FLAC__stream_encoder_delete(enc);
 		return std::string("cannot write ") + path;
 	}
@@ -91,6 +135,10 @@ inline std::string save_f32_24(const char * path, const float * planar, int chan
 
 	ok = FLAC__stream_encoder_finish(enc) && ok;
 	FLAC__stream_encoder_delete(enc);
+	if (block != nullptr)
+	{
+		FLAC__metadata_object_delete(block);
+	}
 	if (!ok)
 	{
 		return std::string("short write on ") + path;

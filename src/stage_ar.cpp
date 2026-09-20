@@ -153,6 +153,71 @@ struct SectionEntry
 	int                   frame   = 0;       // the semantic step the swap is at
 };
 
+// SPEC_HANDOVER §2/§4. What a "handover" entry may ask for, and the window the
+// offset is measured over: two takes of one score share 2-3 % identical tokens
+// at the lag one runs ahead of the other and next to none at every other lag.
+static const double HANDOVER_SECONDS     = 5.0;   // the intrusion X, in seconds
+static const double HANDOVER_MIN_SECONDS = 0.2;
+static const double HANDOVER_MAX_SECONDS = 30.0;
+static const int    HANDOVER_RANGE       = 100;   // lags tried either way
+static const int    HANDOVER_SPAN        = 750;   // frames of song a rate is measured over
+static const int    HANDOVER_LO          = 150;   // and never before this frame
+static const double HANDOVER_MIN_Z       = 6.0;   // under this the peak is not believed
+static const int    HANDOVER_MIN_HITS    = 6;     // nor under this many agreeing frames
+static const int    HANDOVER_TAIL        = 25;    // frames a leg runs past the next cut
+
+// SPEC_HANDOVER.md: one "handover" entry — where the song changes hands, and to
+// which take of the same score. The fields below the blank line are filled in
+// as the song is rendered, and are what handover.json records (§6).
+struct HandoverEntry
+{
+	bool        has_frame = false;             // "frame": the base take's own timeline
+	int         frame     = 0;
+	std::string section;                       // or a label, through stage 8's resolver
+	int         nth       = 1;
+	int         lead      = SECTIONS_LEAD;
+	bool        has_style = false;             // the engine renders this style's take
+	std::string style;
+	std::string take;                          // or an earlier render's artifacts directory
+	double      seconds   = HANDOVER_SECONDS;  // the intrusion X
+	bool        auto_off  = true;              // "offset": "auto"
+	int         offset    = 0;
+
+	bool        found     = false;   // the label turned up in the base score
+	int         line      = 0;       // its 1-based line number there
+	int         bar       = 0;       // bars of Vocal written before it
+	double      at        = 0;       // where that bar starts, in seconds
+	int         cut       = 0;       // the frame the song changes hands at
+	int         x         = 0;       // the intrusion, in frames
+	size_t      idx       = 0;       // which take takes over
+	double      z         = 0;       // how far the offset's peak stands out
+	int         hits      = 0;       // frames of the window that agree at it
+	bool        has_z     = false;   // a given offset is not measured
+	bool        confident = true;
+	bool        reached   = false;   // the song got as far as the cut
+	int         gave      = 0;       // frames of the final song this leg contributed
+	std::string note;                // why it was skipped, "" when it was not
+};
+
+// One take: a full render of one score under one style, and the stream a leg is
+// forced through. `label` is the `take_<k>` the engine wrote it to, or the
+// directory an entry named (SPEC_HANDOVER §2).
+struct HandoverTake
+{
+	std::string          style;
+	std::string          label;
+	std::string          dir;      // "" for a take the engine renders
+	std::string          score;    // its score.abc, held for the §2 comparison
+	std::vector<int32_t> codes;    // empty until the engine has rendered it
+
+	// What the log calls it: the last element of the path, as the keep line of
+	// SPEC_KEEP §4 shows a file. handover.json carries the whole label.
+	std::string name() const
+	{
+		return std::filesystem::path(label).filename().string();
+	}
+};
+
 // The curve's weight `off` frames into its entry: linear between keyframes, the
 // first weight before the first and the last weight after the last. Two
 // keyframes at one offset are a step, and the later one wins at that offset —
@@ -216,6 +281,10 @@ struct Request
 	int         keep_frames = 0;                  // N, how many of its leading codes to keep
 	bool        has_sections = false;             // "sections": SPEC_SECTIONS.md
 	std::vector<SectionEntry> sections;
+	bool        has_handover = false;             // "handover": SPEC_HANDOVER.md
+	std::vector<HandoverEntry> handover;
+	json        handover_json;                    // the block as the request wrote it (§6)
+	std::string base_take;                        // an earlier render to use as the base take
 	std::string id         = "song";
 
 	std::string text() const
@@ -1258,6 +1327,213 @@ static std::string sections_keep_check(const Request & r, const std::vector<Sect
 	return "";
 }
 
+// -------------------------------------------------------- style handover ---
+
+// SPEC_HANDOVER.md. One score, one full take per style: at a cut the incoming
+// style's renderer is forced through its OWN take up to x frames before the cut
+// and then through the last x frames of the song so far, and samples on from
+// there. Two takes of one score do not run at the same pace, so the incoming
+// one is read at its own clock — `off` frames ahead of the song — and that
+// offset is measurable from the tokens alone (§4).
+//
+// Everything in this block is pure integer work on the two streams: no model,
+// no audio, and table-tested on its own (tests/handover.cpp).
+struct OffsetFit
+{
+	int    offset    = 0;
+	double z         = 0;   // how far the peak stands out of the 201 rates
+	int    hits      = 0;   // frames that agree at it, not the share of them
+	bool   confident = false;
+};
+
+// The frames in [lo, cut) at which the song and the take agree when the take is
+// read `k` frames ahead, and how many were compared at all: frames the take
+// does not reach are skipped rather than counted as a miss.
+static int offset_hits(const std::vector<int32_t> & song, const std::vector<int32_t> & take,
+	int lo, int cut, int k, int & counted)
+{
+	int hit = 0;
+	counted = 0;
+	for (int t = lo; t < cut; t++)
+	{
+		const long long u = (long long) t - k;
+		if (u < 0 || u >= (long long) take.size())
+		{
+			continue;
+		}
+		counted++;
+		hit += song[(size_t) t] == take[(size_t) u] ? 1 : 0;
+	}
+	return hit;
+}
+
+// The best lag over -HANDOVER_RANGE…HANDOVER_RANGE and how far it stands out:
+// z = (max - mean) / std over every rate tried. Ties go to the smallest |k|,
+// and at equal |k| to the negative one — a take that agrees at no lag at all
+// agrees at lag 0, and a tie between +k and -k is read as the take running
+// behind rather than ahead.
+//
+// z alone is not enough to believe a lag. Over a short window one coincidental
+// hit at one lag and none at the others is a z of 14, so the peak also has to
+// hold at least HANDOVER_MIN_HITS frames that agree — an absolute count, which
+// noise does not reach and two takes of one score pass several times over
+// (2-3 % of a 750-frame window is ~20).
+static OffsetFit offset_scan(const std::vector<int32_t> & song, const std::vector<int32_t> & take,
+	int lo, int cut)
+{
+	std::vector<double> rate;
+	std::vector<int>    hits;
+	rate.reserve((size_t) (2 * HANDOVER_RANGE + 1));
+	hits.reserve((size_t) (2 * HANDOVER_RANGE + 1));
+	for (int k = -HANDOVER_RANGE; k <= HANDOVER_RANGE; k++)
+	{
+		int       counted = 0;
+		const int hit     = offset_hits(song, take, lo, cut, k, counted);
+		hits.push_back(hit);
+		rate.push_back(counted > 0 ? (double) hit / (double) counted : 0.0);
+	}
+
+	size_t best = 0;
+	for (size_t i = 1; i < rate.size(); i++)
+	{
+		const int k = (int) i - HANDOVER_RANGE;
+		const int b = (int) best - HANDOVER_RANGE;
+		if (rate[i] > rate[best] ||
+		    (rate[i] == rate[best] && (std::abs(k) < std::abs(b) ||
+		                               (std::abs(k) == std::abs(b) && k < b))))
+		{
+			best = i;
+		}
+	}
+
+	double mean = 0;
+	for (size_t i = 0; i < rate.size(); i++)
+	{
+		mean += rate[i];
+	}
+	mean /= (double) rate.size();
+	double var = 0;
+	for (size_t i = 0; i < rate.size(); i++)
+	{
+		var += (rate[i] - mean) * (rate[i] - mean);
+	}
+	var /= (double) rate.size();
+
+	OffsetFit fit;
+	fit.offset    = (int) best - HANDOVER_RANGE;
+	fit.z         = var > 0 ? (rate[best] - mean) / std::sqrt(var) : 0;
+	fit.hits      = hits[best];
+	fit.confident = fit.z >= HANDOVER_MIN_Z && fit.hits >= HANDOVER_MIN_HITS;
+	return fit;
+}
+
+// §4: the last HANDOVER_SPAN frames before the cut, and the whole song from
+// HANDOVER_LO on when that window is too flat to believe. A fit that is still
+// flat is used anyway and says so.
+static OffsetFit handover_offset(const std::vector<int32_t> & song,
+	const std::vector<int32_t> & take, int cut)
+{
+	const int lo  = std::max(HANDOVER_LO, cut - HANDOVER_SPAN);
+	OffsetFit fit = offset_scan(song, take, lo, cut);
+	if (!fit.confident && lo > HANDOVER_LO)
+	{
+		fit = offset_scan(song, take, HANDOVER_LO, cut);
+	}
+	return fit;
+}
+
+// The intrusion X of §2, in frames.
+static int handover_x(double seconds)
+{
+	return (int) llround(seconds * SEMANTIC_FPS);
+}
+
+// The forced history of one leg (§5): the incoming take up to x frames before
+// the cut, in its own clock, then the last x frames of the song so far. `cut -
+// off` codes all told, which is the leg's "semantic_keep" frame count. Returns
+// "" or the reason this entry cannot be played.
+static std::string handover_keep(const std::vector<int32_t> & song,
+	const std::vector<int32_t> & take, int cut, int x, int off, std::vector<int32_t> & out)
+{
+	if ((size_t) cut > song.size())
+	{
+		return strf("the song ended at frame %zu, before the cut at %d", song.size(), cut);
+	}
+	if (cut - x - off < 1 || cut - x < 1)
+	{
+		return strf("a cut at frame %d with a %d-frame intrusion at offset %+d leaves "
+		            "nothing before it", cut, x, off);
+	}
+	if ((size_t) (cut - off) > take.size())
+	{
+		return strf("frame %d of the take (cut %d, offset %+d) is past its %zu frames",
+		            cut - off, cut, off, take.size());
+	}
+	out.assign(take.begin(), take.begin() + (cut - x - off));
+	out.insert(out.end(), song.begin() + (cut - x), song.begin() + cut);
+	return "";
+}
+
+// Where each entry cuts (§2). A "frame" is the base take's own timeline and
+// needs no score; a label goes through stage 8's resolver and clock against the
+// base score, the entries that name one in the order they are given.
+static void handover_locate(const std::string & score, std::vector<HandoverEntry> & es)
+{
+	std::vector<SectionEntry> secs;
+	std::vector<size_t>       which;
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		if (es[i].has_frame)
+		{
+			es[i].found = true;
+			es[i].cut   = es[i].frame;
+			continue;
+		}
+		SectionEntry s;
+		s.section = es[i].section;
+		s.nth     = es[i].nth;
+		s.lead    = es[i].lead;
+		secs.push_back(s);
+		which.push_back(i);
+	}
+	sections_locate(score, secs);
+	sections_frames(secs);
+	for (size_t k = 0; k < secs.size(); k++)
+	{
+		HandoverEntry & e = es[which[k]];
+		e.found = secs[k].found;
+		e.line  = secs[k].line;
+		e.bar   = secs[k].bar;
+		e.at    = secs[k].seconds;
+		e.cut   = secs[k].frame;
+	}
+}
+
+// §2: "Cuts must be strictly increasing; order in the array = order in the
+// song." Across the two forms only the resolved frames can say so, which is why
+// this is checked once the score has been walked.
+static std::string handover_cuts_check(const std::vector<HandoverEntry> & es)
+{
+	int    prev = 0;
+	size_t at   = 0;
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		if (!es[i].found)
+		{
+			continue;
+		}
+		if (prev > 0 && es[i].cut <= prev)
+		{
+			return strf("\"handover\" entry %zu cuts at frame %d, which is not after entry "
+			            "%zu's frame %d — entries are in the order the song plays them",
+			            i + 1, es[i].cut, at, prev);
+		}
+		prev = es[i].cut;
+		at   = i + 1;
+	}
+	return "";
+}
+
 // ------------------------------------------------------------- generation ---
 
 // Sampling order for the candidate list: score descending, id ascending on ties.
@@ -1655,6 +1931,20 @@ static json json_request(const Request & r)
 	// key. A template job records its template as `template.abc` beside this
 	// file, and lands the score it wrote in `abc` — so the artifacts directory
 	// is a plain request that reproduces the song (SPEC_TEMPLATE §5).
+	//
+	// A handover is the exception SPEC_HANDOVER §6 asks for: the block is copied
+	// in as the request wrote it, because the song is the legs and nothing else
+	// in the directory would reproduce them. Such a request.json is the one form
+	// the reference's SongRequest(**request.json) cannot load — it describes a
+	// song only this engine renders.
+	if (r.has_handover)
+	{
+		out["handover"] = r.handover_json;
+		if (!r.base_take.empty())
+		{
+			out["base_take"] = r.base_take;
+		}
+	}
 	out["id"]        = r.id;
 	return out;
 }
@@ -1765,6 +2055,42 @@ static json json_sections(const std::vector<SectionEntry> & es)
 	return out;
 }
 
+// The handover as it was played (SPEC_HANDOVER §6): where each entry cut, which
+// take took over, how far ahead that take was running and how much of the final
+// song it contributed. `take` is the directory an entry named or the `take_<k>`
+// the engine rendered; `note` is there only when the entry was skipped.
+static json json_handover(const std::vector<HandoverEntry> & es,
+	const std::vector<HandoverTake> & takes)
+{
+	json out = json::array();
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		const HandoverEntry & h = es[i];
+		json                  e = json::object();
+		e["section"] = h.has_frame ? json(nullptr) : json(h.section);
+		e["nth"]     = h.has_frame ? json(nullptr) : json(h.nth);
+		e["line"]    = h.has_frame || !h.found ? json(nullptr) : json(h.line);
+		e["bar"]     = h.has_frame || !h.found ? json(nullptr) : json(h.bar);
+		e["seconds"] = h.has_frame || !h.found ? json(nullptr) : json(h.at);
+		e["frame"]   = h.found ? json(h.cut) : json(nullptr);
+		e["take"]    = takes[h.idx].label;
+		e["style"]   = takes[h.idx].style;
+		e["x"]       = h.x;
+		e["offset"]  = h.offset;
+		e["z"]       = h.has_z ? json(h.z) : json(nullptr);
+		e["hits"]      = h.has_z ? json(h.hits) : json(nullptr);
+		e["confident"] = h.confident;
+		e["reached"] = h.reached;
+		e["frames"]  = h.gave;
+		if (!h.note.empty())
+		{
+			e["note"] = h.note;
+		}
+		out.push_back(e);
+	}
+	return out;
+}
+
 static json json_int_array(const std::vector<llama_token> & ids)
 {
 	json out = json::array();
@@ -1807,6 +2133,9 @@ struct Artifacts
 	// null unless the request carried a "semantic_keep": the codes it kept, for
 	// the frame count and the digest plan.json records (SPEC_KEEP §4).
 	const std::vector<int32_t> *       keep     = nullptr;
+	// null unless the request carried a "handover": the entries as they were
+	// played, which is what says where the song changed hands (SPEC_HANDOVER §6).
+	const json *                       handover = nullptr;
 	// null unless --guidance-trace traced this song: TRACE_COLUMNS floats per
 	// traced step, written as guidance_trace.npy. A diagnostic, so it is not in
 	// plan.json and not in the manifest.
@@ -1843,6 +2172,10 @@ static void write_artifacts(const Artifacts & a)
 	{
 		write_file_or_die(dir + "sections.json", dump_py(json_sections(*a.sections)));
 	}
+	if (a.handover != nullptr)
+	{
+		write_file_or_die(dir + "handover.json", dump_py(*a.handover));
+	}
 	if (a.trace != nullptr)
 	{
 		const std::vector<int64_t> shape = { (int64_t) (a.trace->size() / TRACE_COLUMNS),
@@ -1876,6 +2209,10 @@ static void write_artifacts(const Artifacts & a)
 		{
 			plan["sections"] = json_sections(*a.sections);
 		}
+		if (a.handover != nullptr)
+		{
+			plan["handover"] = *a.handover;
+		}
 		// What of this song came from an earlier render, and enough of a digest
 		// to tell which. The path is deliberately not here: an artifacts
 		// directory has to stay relocatable and carry no local paths (§4).
@@ -1906,6 +2243,10 @@ static void write_artifacts(const Artifacts & a)
 		if (a.sections != nullptr)
 		{
 			names.push_back("sections.json");
+		}
+		if (a.handover != nullptr)
+		{
+			names.push_back("handover.json");
 		}
 		json manifest = json::object();
 		for (size_t i = 0; i < names.size(); i++)
@@ -2129,6 +2470,122 @@ static std::string parse_sections(const json & v, std::vector<SectionEntry> & ou
 	return "";
 }
 
+// The "handover" block (SPEC_HANDOVER §2). Strict like "sections": an entry
+// says where the song changes hands, in one of the two forms, and what takes
+// over, in one of the three. Unknown keys are errors.
+static std::string parse_handover(const json & v, std::vector<HandoverEntry> & out)
+{
+	if (!v.is_array() || v.empty())
+	{
+		return "must be a non-empty list of entries";
+	}
+	for (size_t i = 0; i < v.size(); i++)
+	{
+		const json & e = v[i];
+		if (!e.is_object())
+		{
+			return strf("entry %zu is not an object", i + 1);
+		}
+		HandoverEntry h;
+		for (json::const_iterator it = e.begin(); it != e.end(); ++it)
+		{
+			const std::string & key = it.key();
+			if (key == "frame")
+			{
+				if (!it.value().is_number_integer() || it.value().get<long long>() < 1 ||
+				    it.value().get<long long>() > CONTEXT)
+				{
+					return strf("entry %zu: \"frame\" must be an integer in [1, %d]",
+					            i + 1, CONTEXT);
+				}
+				h.frame     = it.value().get<int>();
+				h.has_frame = true;
+			} else if (key == "section") {
+				if (!it.value().is_string() || it.value().get<std::string>().empty())
+				{
+					return strf("entry %zu: \"section\" must be a label name, as the score "
+					            "writes it after the \"%% \"", i + 1);
+				}
+				h.section = it.value().get<std::string>();
+			} else if (key == "nth") {
+				if (!it.value().is_number_integer() || it.value().get<long long>() < 1 ||
+				    it.value().get<long long>() > SECTIONS_MAX_NTH)
+				{
+					return strf("entry %zu: \"nth\" must be an integer in [1, %d]",
+					            i + 1, SECTIONS_MAX_NTH);
+				}
+				h.nth = it.value().get<int>();
+			} else if (key == "lead_frames") {
+				if (!it.value().is_number_integer() || it.value().get<long long>() < 0 ||
+				    it.value().get<long long>() > SECTIONS_MAX_LEAD)
+				{
+					return strf("entry %zu: \"lead_frames\" must be an integer in [0, %d] "
+					            "(25 frames = 1 s)", i + 1, SECTIONS_MAX_LEAD);
+				}
+				h.lead = it.value().get<int>();
+			} else if (key == "style") {
+				if (!it.value().is_string() || it.value().get<std::string>().empty())
+				{
+					return strf("entry %zu: \"style\" must be the tag string the engine "
+					            "renders this take under", i + 1);
+				}
+				h.style     = it.value().get<std::string>();
+				h.has_style = true;
+			} else if (key == "take") {
+				if (!it.value().is_string() || it.value().get<std::string>().empty())
+				{
+					return strf("entry %zu: \"take\" must be the artifacts directory of an "
+					            "earlier render of this score", i + 1);
+				}
+				h.take = it.value().get<std::string>();
+			} else if (key == "seconds") {
+				if (!it.value().is_number() ||
+				    it.value().get<double>() < HANDOVER_MIN_SECONDS ||
+				    it.value().get<double>() > HANDOVER_MAX_SECONDS)
+				{
+					return strf("entry %zu: \"seconds\" must be a number in [%g, %g] — the "
+					            "intrusion, 5 s blends and 1 s cuts", i + 1,
+					            HANDOVER_MIN_SECONDS, HANDOVER_MAX_SECONDS);
+				}
+				h.seconds = it.value().get<double>();
+			} else if (key == "offset") {
+				if (it.value().is_string() && it.value().get<std::string>() == "auto")
+				{
+					h.auto_off = true;
+				} else if (it.value().is_number_integer() &&
+				           std::abs(it.value().get<long long>()) <= HANDOVER_RANGE) {
+					h.auto_off = false;
+					h.offset   = it.value().get<int>();
+				} else {
+					return strf("entry %zu: \"offset\" must be \"auto\" or an integer in "
+					            "[-%d, %d] — frames the incoming take runs ahead of the song",
+					            i + 1, HANDOVER_RANGE, HANDOVER_RANGE);
+				}
+			} else {
+				return strf("entry %zu: unknown key \"%s\" (section, nth, lead_frames, frame, "
+				            "style, take, seconds, offset)", i + 1, key.c_str());
+			}
+		}
+		if (h.has_frame && !h.section.empty())
+		{
+			return strf("entry %zu: a \"section\" and a \"frame\" are two ways to say where "
+			            "the cut is — name the label or the frame, not both", i + 1);
+		}
+		if (!h.has_frame && h.section.empty())
+		{
+			return strf("entry %zu needs a \"section\" (with an optional \"nth\") or a "
+			            "\"frame\": where the song changes hands", i + 1);
+		}
+		if (h.has_style && !h.take.empty())
+		{
+			return strf("entry %zu: \"style\" and \"take\" are two ways to name what takes "
+			            "over — the tags to render, or a render to read", i + 1);
+		}
+		out.push_back(h);
+	}
+	return "";
+}
+
 // The "semantic_keep" block (SPEC_KEEP §2): the start of an earlier render,
 // forced as history instead of being sampled. Strict like "guidance" — both
 // keys are required and an unknown one is an error rather than something
@@ -2283,6 +2740,25 @@ static std::string parse_request_json(const json & root, const std::string & whe
 			return strf("%s: \"sections\": %s", path, err.c_str());
 		}
 		req.has_sections = true;
+	}
+	if (root.contains("handover") && !root["handover"].is_null())
+	{
+		const std::string err = parse_handover(root["handover"], req.handover);
+		if (!err.empty())
+		{
+			return strf("%s: \"handover\": %s", path, err.c_str());
+		}
+		req.has_handover  = true;
+		req.handover_json = root["handover"];
+	}
+	if (root.contains("base_take") && !root["base_take"].is_null())
+	{
+		if (!root["base_take"].is_string() || root["base_take"].get<std::string>().empty())
+		{
+			return strf("%s: \"base_take\" must be the artifacts directory of an earlier "
+			            "render to use as the base take", path);
+		}
+		req.base_take = root["base_take"].get<std::string>();
 	}
 	if (root.contains("semantic_keep") && !root["semantic_keep"].is_null())
 	{
@@ -2494,6 +2970,79 @@ static std::string validate_request(const Request & r)
 			style = s.style;
 		}
 	}
+	// SPEC_HANDOVER §2. One mechanism per request, as for "sections": a handover
+	// drives the tags by rendering whole takes and forcing their codes, so it
+	// has no use for a branch, a curve or a keep of its own — every one of them
+	// would be a second answer to the same question.
+	if (r.has_handover)
+	{
+		if (r.has_guidance || r.has_sections)
+		{
+			return strf("\"handover\" and %s are two ways to change the tags mid-song: a "
+			            "handover swaps the whole history, not the prefix",
+			            r.has_guidance ? "\"guidance\"" : "\"sections\"");
+		}
+		if (r.has_cfg && r.cfg_scale != 1.0)
+		{
+			return "\"handover\" with \"cfg_scale\": the legs are rendered as plain takes, "
+			       "with no branch to push against";
+		}
+		if (r.has_keep)
+		{
+			return "\"handover\" with \"semantic_keep\": a handover forces the history of "
+			       "every leg itself, so the keep would be overwritten";
+		}
+		if (r.has_tpl)
+		{
+			return "\"handover\" with \"abc_template\" is not supported yet: every take has "
+			       "to sing one score, and a template writes some of its lines per render";
+		}
+		if (r.cot == "off")
+		{
+			return "\"handover\" needs the score every take sings, and cot=off has none — "
+			       "use cot=melody or cot=full";
+		}
+		// What can be held to §2's "cuts must be strictly increasing" before the
+		// score exists: the entries that name a frame, which are in order among
+		// themselves whatever the labels between them resolve to. The rest is
+		// checked once the base score has been walked (handover_cuts_check).
+		int    prev = 0;
+		size_t at   = 0;
+		for (size_t i = 0; i < r.handover.size(); i++)
+		{
+			const HandoverEntry & h = r.handover[i];
+			if (!h.has_frame)
+			{
+				continue;
+			}
+			if (prev > 0 && h.frame <= prev)
+			{
+				return strf("\"handover\" entry %zu: frame %d is not after entry %zu's "
+				            "frame %d — entries are in the order the song plays them",
+				            i + 1, h.frame, at, prev);
+			}
+			prev = h.frame;
+			at   = i + 1;
+			// The intrusion has to fit before the cut. Against the song that is
+			// arithmetic on the frame alone; against the take it needs the
+			// offset, which only a given one is (§5).
+			const int x = handover_x(h.seconds);
+			if (h.frame - x < 1)
+			{
+				return strf("\"handover\" entry %zu: a cut at frame %d has less than the "
+				            "%d-frame intrusion before it", i + 1, h.frame, x);
+			}
+			if (!h.auto_off && h.frame - x - h.offset < 1)
+			{
+				return strf("\"handover\" entry %zu: a cut at frame %d with a %d-frame "
+				            "intrusion at offset %+d leaves nothing of the take before it",
+				            i + 1, h.frame, x, h.offset);
+			}
+		}
+	} else if (!r.base_take.empty()) {
+		return "\"base_take\" is the take a \"handover\" hands over from; without one there "
+		       "is nothing for it to do";
+	}
 	// SPEC_KEEP §2. Everything here is decided without opening the file; the
 	// rules that need its contents are checked where it is read, still before
 	// the model loads.
@@ -2567,6 +3116,19 @@ static std::string dir_of(const std::string & path)
 	return std::filesystem::path(path).parent_path().string();
 }
 
+// A path a request names, resolved against the file the request was read out
+// of — the rule "semantic_keep" follows and "handover" follows with it
+// (SPEC_KEEP §2, SPEC_HANDOVER §2).
+static std::string request_relative(const std::string & base, const std::string & rel)
+{
+	std::filesystem::path path = rel;
+	if (path.is_relative() && !base.empty())
+	{
+		path = std::filesystem::path(base) / path;
+	}
+	return path.string();
+}
+
 // The kept codes of SPEC_KEEP §2, through the NAR's `--codec` reader: a 1-D
 // int32 .npy, every value a codec index. `max_steps` is the semantic phase's
 // own cap, which kept steps count against like any other (§3), so a request
@@ -2576,11 +3138,7 @@ static std::string dir_of(const std::string & path)
 static std::string load_keep_codes(const Request & r, const std::string & base, int max_steps,
 	std::vector<int32_t> & out, std::string & name)
 {
-	std::filesystem::path path = r.keep_file;
-	if (path.is_relative() && !base.empty())
-	{
-		path = std::filesystem::path(base) / path;
-	}
+	const std::filesystem::path path = request_relative(base, r.keep_file);
 	name = path.filename().string();
 
 	npy::ArrayI32     codec;
@@ -2801,6 +3359,10 @@ struct JobState
 	std::vector<SectionEntry> sections;
 	bool                      plain_swap  = false;
 	double                    sec_seconds = 0;   // re-prefilling the score phase at a cut
+
+	// SPEC_HANDOVER §5: a leg's codes are handed back in memory and spliced into
+	// the song, so it writes no artifacts directory of its own.
+	bool                     no_files = false;
 
 	GenStats                 st_abc;
 	GenStats                 st_sem;
@@ -4355,6 +4917,7 @@ void Runner::finish_job(Seq & q)
 	js.st_abc.section_prefill_seconds = js.sec_seconds;
 	js.st_sem.section_prefill_seconds = js.sec_seconds;
 
+	if (!js.no_files)
 	{
 		Artifacts a;
 		a.dir           = (*jobs)[q.job].artifacts;
@@ -4371,9 +4934,11 @@ void Runner::finish_job(Seq & q)
 		a.keep          = js.keep_codes.empty() ? nullptr : &js.keep_codes;
 		a.trace         = (*jobs)[q.job].trace && !js.guide.empty() ? &js.trace : nullptr;
 		write_artifacts(a);
+		printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
+		       (*jobs)[q.job].artifacts.c_str(), js.abc_ids.size(), codes.size());
+	} else {
+		printf("%s%zu codes, handed over in memory\n", js.tag.c_str(), codes.size());
 	}
-	printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
-	       (*jobs)[q.job].artifacts.c_str(), js.abc_ids.size(), codes.size());
 	if ((*jobs)[q.job].trace)
 	{
 		const size_t rows = js.trace.size() / TRACE_COLUMNS;
@@ -4794,220 +5359,11 @@ static int run_ar_dump(const ArParams & p)
 	return 0;
 }
 
-static void usage(const char * argv0)
+// The per-phase sampling limits the command line asks for: the caps count kept
+// and forced steps like any other (SPEC_KEEP §3), so they are settled before
+// anything is validated against them.
+static void sampling_caps(const ArBatchParams & p, Sampling & s_abc, Sampling & s_sem)
 {
-	fprintf(stderr,
-	        "usage: %s -m MODEL.gguf --request song.json --artifacts DIR\n"
-	        "       %s -m MODEL.gguf --requests jobs.json [--parallel N]\n"
-	        "        [--seed N] [--cot full|melody|off] [--gpu N] [--cpu]\n"
-	        "        [--threads N] [--dump-logits FILE.npy] [--greedy]\n"
-	        "        [--max-abc N] [--max-semantic N] [--continue-on-error]\n"
-	        "        [--verify-sampler] [--guidance-trace]\n"
-	        "        [--prefix-only]   the request carries its \"abc\": write prefix.npy, decode nothing\n", argv0, argv0);
-}
-
-} // namespace
-
-std::string load_jobs_file(const std::string & path, bool need_out, std::vector<ArJob> & jobs)
-{
-	std::string text;
-	{
-		const std::string err = read_file(path, text);
-		if (!err.empty())
-		{
-			return err;
-		}
-	}
-	json root;
-	try
-	{
-		root = json::parse(text);
-	}
-	catch (const std::exception & e)
-	{
-		return strf("%s: %s", path.c_str(), e.what());
-	}
-	if (!root.is_array() || root.empty())
-	{
-		return strf("%s: expected a non-empty JSON array of jobs", path.c_str());
-	}
-
-	for (size_t i = 0; i < root.size(); i++)
-	{
-		const json & e = root[i];
-		if (!e.is_object())
-		{
-			return strf("%s: job %zu is not an object", path.c_str(), i + 1);
-		}
-		ArJob job;
-		for (json::const_iterator it = e.begin(); it != e.end(); ++it)
-		{
-			const std::string & key = it.key();
-			if (key == "seed")
-			{
-				if (!it.value().is_number_unsigned() ||
-				    it.value().get<uint64_t>() >= (uint64_t) 1 << 63)
-				{
-					return strf("%s: job %zu: \"seed\" must be an integer in [0, 2**63)",
-					            path.c_str(), i + 1);
-				}
-				job.has_seed = true;
-				job.seed     = it.value().get<uint64_t>();
-				continue;
-			}
-			if (!it.value().is_string())
-			{
-				return strf("%s: job %zu: \"%s\" must be a string",
-				            path.c_str(), i + 1, key.c_str());
-			}
-			const std::string value = it.value().get<std::string>();
-			if (key == "request")
-			{
-				job.request_path = value;
-			} else if (key == "out") {
-				job.out = value;
-			} else if (key == "artifacts") {
-				job.artifacts = value;
-			} else if (key == "noise") {
-				job.noise_path = value;
-			} else {
-				return strf("%s: job %zu: unknown key \"%s\" (request, out, artifacts, "
-				            "seed, noise)", path.c_str(), i + 1, key.c_str());
-			}
-		}
-		if (job.request_path.empty())
-		{
-			return strf("%s: job %zu needs a \"request\"", path.c_str(), i + 1);
-		}
-		// SPEC_KEEP §2: for a batch, a relative path inside a request resolves
-		// against the batch file, which is the one the paths around it are
-		// written beside.
-		job.base_dir = dir_of(path);
-		if (need_out && job.out.empty())
-		{
-			return strf("%s: job %zu needs an \"out\"", path.c_str(), i + 1);
-		}
-		if (!need_out && job.artifacts.empty())
-		{
-			return strf("%s: job %zu needs an \"artifacts\" directory", path.c_str(), i + 1);
-		}
-		jobs.push_back(job);
-	}
-
-	// Two jobs writing one path would race in the AR loop and silently overwrite
-	// each other's artifacts — a usage error, caught before anything loads.
-	for (size_t i = 0; i < jobs.size(); i++)
-	{
-		for (size_t k = i + 1; k < jobs.size(); k++)
-		{
-			if (!jobs[i].out.empty() && jobs[i].out == jobs[k].out)
-			{
-				return strf("%s: jobs %zu and %zu share the output \"%s\"",
-				            path.c_str(), i + 1, k + 1, jobs[i].out.c_str());
-			}
-			if (!jobs[i].artifacts.empty() && jobs[i].artifacts == jobs[k].artifacts)
-			{
-				return strf("%s: jobs %zu and %zu share the artifacts directory \"%s\"",
-				            path.c_str(), i + 1, k + 1, jobs[i].artifacts.c_str());
-			}
-		}
-	}
-	return "";
-}
-
-ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
-{
-	ArParams p;
-	for (int i = 1; i < argc; i++)
-	{
-		const std::string a = argv[i];
-		if (a == "-m" || a == "--model")
-		{
-			p.model = need(argc, argv, i);
-		} else if (a == "--request") {
-			p.request_path = need(argc, argv, i);
-		} else if (a == "--requests") {
-			p.requests = need(argc, argv, i);
-		} else if (a == "--artifacts") {
-			p.artifacts = need(argc, argv, i);
-		} else if (a == "--dump-logits") {
-			p.dump_logits = need(argc, argv, i);
-		} else if (a == "--device") {
-			p.device = need(argc, argv, i);
-		} else if (a == "--cpu") {
-			p.device = "cpu";
-		} else if (a == "--gpu") {
-			p.gpu = atoi(need(argc, argv, i));
-		} else if (a == "--threads") {
-			p.threads = atoi(need(argc, argv, i));
-		} else if (a == "--parallel") {
-			p.parallel = atoi(need(argc, argv, i));
-		} else if (a == "--seed") {
-			p.has_seed = true;
-			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
-		} else if (a == "--cot") {
-			p.cot = need(argc, argv, i);
-		} else if (a == "--greedy") {
-			p.greedy = true;
-		} else if (a == "--continue-on-error") {
-			p.continue_on_error = true;
-		} else if (a == "--verify-sampler") {
-			p.verify_sampler = true;
-		} else if (a == "--guidance-trace") {
-			p.guidance_trace = true;
-		} else if (a == "--prefix-only") {
-			p.prefix_only = true;
-		} else if (a == "--max-abc") {
-			p.max_abc = parse_positive_arg("--max-abc", need(argc, argv, i));
-		} else if (a == "--max-semantic") {
-			p.max_semantic = parse_positive_arg("--max-semantic", need(argc, argv, i));
-		} else if (a == "-h" || a == "--help") {
-			usage(argv0);
-			exit(0);
-		} else {
-			usage(argv0);
-			die("unknown argument %s", a.c_str());
-		}
-	}
-
-	if (p.model.empty() || (p.request_path.empty() == p.requests.empty()))
-	{
-		usage(argv0);
-		die("-m and exactly one of --request / --requests are required");
-	}
-	if (p.requests.empty() && p.artifacts.empty() && p.dump_logits.empty())
-	{
-		usage(argv0);
-		die("give --artifacts DIR, or --dump-logits FILE.npy");
-	}
-	if (!p.requests.empty() && !p.dump_logits.empty())
-	{
-		usage(argv0);
-		die("--dump-logits is a single-request path; use --request");
-	}
-	return p;
-}
-
-int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
-	std::vector<ArResult> & results)
-{
-	if (jobs.empty())
-	{
-		die("run_ar_batch: no jobs");
-	}
-	if (p.parallel < 1 || p.parallel > 256)
-	{
-		die("--parallel must be in [1, 256] (llama caps sequences at LLAMA_MAX_SEQ)");
-	}
-
-	std::vector<JobState> states(jobs.size());
-	results.assign(jobs.size(), ArResult());
-
-	// The per-phase limits, before validation rather than after it: the kept
-	// frames of SPEC_KEEP count against the semantic cap, and that is a
-	// request error like any other (§2).
-	Sampling s_abc = sampling_abc();
-	Sampling s_sem = sampling_semantic();
 	if (p.max_abc > 0)
 	{
 		s_abc.max_tokens = p.max_abc;
@@ -5023,116 +5379,31 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 		s_abc.temperature = 0;
 		s_sem.temperature = 0;
 	}
+}
 
-	// ---- validation, before anything loads (SPEC_BATCH §3.1) ----------------
+// The semantic phase's effective frame cap: what the command line asked for, or
+// the protocol's own when it asked for nothing. What a "semantic_keep" and a
+// handover leg are held to before anything is decoded.
+static int semantic_cap(const ArBatchParams & p)
+{
+	return p.max_semantic > 0 ? p.max_semantic : sampling_semantic().max_tokens;
+}
 
-	int rejected = 0;
-	auto reject = [&](size_t i, const std::string & err)
-	{
-		if (!p.continue_on_error)
-		{
-			die("%s", err.c_str());
-		}
-		fprintf(stderr, "error: %s%s\n", states[i].tag.c_str(), err.c_str());
-		states[i].ok     = false;
-		results[i].ok    = false;
-		results[i].error = err;
-		rejected++;
-	};
-
-	for (size_t i = 0; i < jobs.size(); i++)
-	{
-		JobState & js = states[i];
-		if (jobs.size() > 1)
-		{
-			const std::string & shown = jobs[i].out.empty() ? jobs[i].artifacts : jobs[i].out;
-			const size_t        slash = shown.find_last_of('/');
-			js.tag = strf("[%zu/%zu %s] ", i + 1, jobs.size(),
-			              slash == std::string::npos ? shown.c_str() : shown.c_str() + slash + 1);
-		}
-		const std::string err = prepare_request(jobs[i].request_path, p.cot,
-			jobs[i].has_seed, jobs[i].has_seed ? jobs[i].seed : 0, js.req, js.guidance);
-		if (!err.empty())
-		{
-			reject(i, err);
-			continue;
-		}
-		// The sections a request names (SPEC_SECTIONS §2). A score the request
-		// gave is already written, so its labels are located here — which is what
-		// makes a section landing inside the kept frames a request error like any
-		// other, before anything touches the GPU (§4).
-		if (js.req.has_sections)
-		{
-			js.sections   = js.req.sections;
-			js.plain_swap = sections_plain_swap(js.req.sections);
-			if (js.req.has_abc)
-			{
-				sections_locate(js.req.abc, js.sections);
-				sections_frames(js.sections);
-				const std::string sec_err = sections_keep_check(js.req, js.sections);
-				if (!sec_err.empty())
-				{
-					reject(i, strf("%s: %s", jobs[i].request_path.c_str(), sec_err.c_str()));
-					continue;
-				}
-			}
-		}
-		// The earlier render's codes (SPEC_KEEP §2). Read here, so a bad file is
-		// one more rejected job rather than a death in the middle of a batch,
-		// and so nothing has touched the GPU yet.
-		if (js.req.has_keep)
-		{
-			const std::string keep_err = load_keep_codes(js.req, jobs[i].base_dir,
-				s_sem.max_tokens, js.keep_codes, js.keep_name);
-			if (!keep_err.empty())
-			{
-				js.keep_codes.clear();
-				reject(i, strf("%s: %s", jobs[i].request_path.c_str(), keep_err.c_str()));
-			}
-		}
-	}
-
-	// SPEC_GUIDANCE §2.4: a guided job needs the whole context to itself, since
-	// its shadow branches are the other KV streams. The decode runs at the
-	// *clamped* parallel — one job of a `yue2 batch --parallel 4` is still a
-	// single song — so that is what the jobs are held to.
-	int parallel = std::min<int>(p.parallel, (int) jobs.size() - rejected);
-	if (parallel > 1)
-	{
-		for (size_t i = 0; i < jobs.size(); i++)
-		{
-			if (states[i].ok && is_guided(states[i].req))
-			{
-				reject(i, strf("%s: guidance needs --parallel 1 (this batch decodes %d songs "
-				               "side by side)", jobs[i].request_path.c_str(), parallel));
-			}
-		}
-		parallel = std::min<int>(parallel, (int) jobs.size() - rejected);
-	}
-
-	if (rejected == (int) jobs.size())
-	{
-		fprintf(stderr, "error: every job was rejected; nothing to decode\n");
-		return 1;
-	}
-
-	// ---- model -------------------------------------------------------------
-
-	llama_log_set(quiet_log, nullptr);
-	llama_backend_init();
-
-	ggml_backend_dev_t devices[2] = {nullptr, nullptr};
-	std::string        backend_name;
-	llama_model *      model = load_model(p.model, p.device, p.gpu, backend_name, devices, p.prefix_only);
-
-	const llama_vocab * vocab   = llama_model_get_vocab(model);
-	const int           n_vocab = llama_vocab_n_tokens(vocab);
-	if (n_vocab != VOCAB_SIZE)
-	{
-		// sample_step indexes MUSIC_END and the codec range directly; a smaller
-		// vocab would read and write out of bounds.
-		die("vocab is %d, the protocol requires exactly %d — wrong GGUF?", n_vocab, VOCAB_SIZE);
-	}
+// Everything after validation: the prefixes, the context sized on them, and the
+// decode loop. The model is a parameter and is neither loaded nor freed here,
+// so one process can run several generations through one copy of the weights —
+// which is what a handover does with its takes and legs (SPEC_HANDOVER §3).
+// `states` is already prepared: requests parsed, kept codes read, jobs that
+// were rejected marked. Every generation builds its own context, so a run
+// through this function is exactly what `yue2 ar` does for the same jobs.
+static int ar_decode_jobs(const ArBatchParams & p, const std::vector<ArJob> & jobs,
+	std::vector<JobState> & states, std::vector<ArResult> & results, llama_model * model,
+	const llama_vocab * vocab, const std::string & card, int parallel, int rejected)
+{
+	const int n_vocab = llama_vocab_n_tokens(vocab);
+	Sampling  s_abc   = sampling_abc();
+	Sampling  s_sem   = sampling_semantic();
+	sampling_caps(p, s_abc, s_sem);
 
 	// ---- prefixes ----------------------------------------------------------
 
@@ -5406,8 +5677,6 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			printf("%swrote:   %s/prefix.npy [%zu] (text %zu, abc %zu ids)\n", js.tag.c_str(),
 			       jobs[i].artifacts.c_str(), js.prefix_sem.size(), js.prefix_abc.size() - 2, js.abc_ids.size());
 		}
-		llama_model_free(model);
-		llama_backend_free();
 		return rejected == 0 ? 0 : 1;
 	}
 
@@ -5479,7 +5748,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 	r.n_ctx_seq = n_ctx_seq;
 	r.parallel  = parallel;
 	r.n_streams = n_streams;
-	r.card      = backend_name;
+	r.card      = card;
 	r.verify    = p.verify_sampler;
 	r.jobs      = &jobs;
 	r.states    = &states;
@@ -5525,9 +5794,956 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 
 	llama_batch_free(r.batch);
 	llama_free(ctx);
+	return ok_jobs == (int) jobs.size() ? 0 : 1;
+}
+
+// ----------------------------------------------------------- the handover ---
+
+// An earlier render's artifacts as §2 reads them: the semantic stream, the
+// score it sang, and the tags it sang them under. Every message names the file
+// it is about, because a handover reads several directories and a bare "not a
+// .npy file" would not say which.
+static std::string load_take(const std::string & dir, HandoverTake & take)
+{
+	std::string err = read_file(dir + "/score.abc", take.score);
+	if (!err.empty())
+	{
+		return err;
+	}
+	npy::ArrayI32 sem;
+	err = npy::load_i32((dir + "/semantic.npy").c_str(), sem);
+	if (!err.empty())
+	{
+		return strf("%s/semantic.npy: %s", dir.c_str(), err.c_str());
+	}
+	if (sem.shape.size() != 1)
+	{
+		return strf("%s/semantic.npy must be a 1-D int32 array, as the NAR's --codec is",
+		            dir.c_str());
+	}
+	for (size_t i = 0; i < sem.data.size(); i++)
+	{
+		if (sem.data[i] < 0 || sem.data[i] >= CODEC_SIZE)
+		{
+			return strf("%s/semantic.npy[%zu] = %d is not a codec index in [0, %d)",
+			            dir.c_str(), i, (int) sem.data[i], CODEC_SIZE);
+		}
+	}
+	take.codes = sem.data;
+
+	std::string text;
+	err = read_file(dir + "/request.json", text);
+	if (!err.empty())
+	{
+		return err;
+	}
+	json root;
+	try
+	{
+		root = json::parse(text);
+	}
+	catch (const std::exception & e)
+	{
+		return strf("%s/request.json: %s", dir.c_str(), e.what());
+	}
+	const char * key = root.contains("style") && root["style"].is_string() ? "style"
+	                 : root.contains("tags")  && root["tags"].is_string()  ? "tags" : nullptr;
+	if (key == nullptr)
+	{
+		return strf("%s/request.json has no \"style\": a take's tags are what it hands over",
+		            dir.c_str());
+	}
+	take.style = root[key].get<std::string>();
+	return "";
+}
+
+// §2: every take has to sing the base score to the byte — alignment and the
+// whole premise depend on it. Run as soon as the base score is known.
+static std::string takes_score_check(const std::vector<HandoverTake> & takes,
+	const std::string & score, const char * base_name)
+{
+	for (size_t k = 0; k < takes.size(); k++)
+	{
+		if (takes[k].dir.empty() || takes[k].score == score)
+		{
+			continue;
+		}
+		return strf("%s/score.abc is not the base score (%s) — the two takes have to sing "
+		            "the same notes, which is what lets one hand over to the other",
+		            takes[k].dir.c_str(), base_name);
+	}
+	return "";
+}
+
+// One take or one leg, through the model this process has already loaded. The
+// sub-run is a single job with its own context, so what comes back is bit for
+// bit what `yue2 ar` would have produced for that request on its own (§3).
+// `js` goes in prepared and comes back with what the run made of it — the score
+// it wrote, its prefix, its timings.
+static ArResult handover_render(const ArBatchParams & p, const ArJob & job,
+	llama_model * model, const llama_vocab * vocab, const std::string & card,
+	JobState & js, int max_semantic)
+{
+	ArBatchParams sub = p;
+	sub.parallel      = 1;
+	sub.max_semantic  = max_semantic;
+
+	std::vector<ArJob>    jobs(1, job);
+	std::vector<JobState> states(1);
+	std::vector<ArResult> out(1);
+	states[0] = js;
+	ar_decode_jobs(sub, jobs, states, out, model, vocab, card, 1, 0);
+	js = states[0];
+	if (!out[0].ok)
+	{
+		die("%s%s", js.tag.c_str(), out[0].error.empty() ? "the take did not render"
+		                                                 : out[0].error.c_str());
+	}
+	return out[0];
+}
+
+// The semantic cap one take or leg decodes under: the request's own, and never
+// more than the command line asked for. A leg needs only to reach the next cut
+// (§5); the last one runs to its natural end, which `want` 0 asks for.
+static int handover_cap(const ArBatchParams & p, int want)
+{
+	if (want <= 0)
+	{
+		return p.max_semantic;
+	}
+	return p.max_semantic > 0 ? std::min(p.max_semantic, want) : want;
+}
+
+// How far this entry's leg has to decode: 25 frames past the next resolved cut
+// in the leg's own clock, or 0 — its natural end — when nothing follows it.
+static int handover_want(const std::vector<HandoverEntry> & es, size_t i, int off)
+{
+	for (size_t k = i + 1; k < es.size(); k++)
+	{
+		if (es[k].found)
+		{
+			return es[k].cut - off + HANDOVER_TAIL;
+		}
+	}
+	return 0;
+}
+
+// What can be known about an entry before its leg runs (§5): a cut with less
+// than the intrusion before it, a take that does not reach the cut at any lag
+// the scan could pick, and a leg whose forced history would leave nothing to
+// sample under the cap. An `"offset": "auto"` is not measured yet, so each
+// check is made at the offset that would suit it best: only a certain failure
+// is one here. Takes the engine has not rendered yet are skipped, so this runs
+// once before anything is rendered and again once every take is in memory.
+static std::string handover_preflight(const std::vector<HandoverEntry> & es,
+	const std::vector<HandoverTake> & takes, const ArBatchParams & p, int cap_default)
+{
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		const HandoverEntry & h = es[i];
+		if (!h.found)
+		{
+			continue;
+		}
+		if (h.cut - h.x < 1)
+		{
+			return strf("\"handover\" entry %zu: a cut at frame %d has less than the "
+			            "%d-frame intrusion before it", i + 1, h.cut, h.x);
+		}
+		// Least of the take before the intrusion: the smallest offset it could get.
+		const int left = h.cut - h.x + (h.auto_off ? HANDOVER_RANGE : -h.offset);
+		if (left < 1)
+		{
+			return strf("\"handover\" entry %zu: a cut at frame %d with a %d-frame intrusion "
+			            "at offset %+d leaves nothing of the take before it", i + 1, h.cut,
+			            h.x, h.offset);
+		}
+		// The frame of the take the cut lands on at the largest offset the entry
+		// could end up with. It is both how far into the take the leg reads and
+		// how long its forced history is, so it answers two questions: whether
+		// the take is long enough, and whether anything is left to sample under
+		// the cap. The cap is the longest this leg could run to.
+		const int deep = h.cut - (h.auto_off ? HANDOVER_RANGE : h.offset);
+		const int cap  = handover_cap(p, handover_want(es, i,
+			h.auto_off ? -HANDOVER_RANGE : h.offset));
+		if (deep >= (cap > 0 ? cap : cap_default))
+		{
+			return strf("\"handover\" entry %zu: its %d forced frames leave nothing to sample "
+			            "under the %d-step semantic cap", i + 1, deep,
+			            cap > 0 ? cap : cap_default);
+		}
+		// The only check that needs the take itself, so it is also the only one
+		// that waits for a take the engine has still to render.
+		const HandoverTake & t = takes[h.idx];
+		if (!t.codes.empty() && deep > (int) t.codes.size())
+		{
+			return strf("\"handover\" entry %zu: %s has %zu frames, and the cut at %d needs "
+			            "frame %d of it%s", i + 1, t.name().c_str(), t.codes.size(), h.cut,
+			            deep, h.auto_off ? " even at the largest offset the scan can pick"
+			                             : "");
+		}
+	}
+	return "";
+}
+
+// SPEC_HANDOVER: render one take per style from one score, then at each cut run
+// the incoming style's renderer over a forced history — its own take up to x
+// frames before the cut, then the last x frames of the song so far — and keep
+// what it samples from the cut on. The model is loaded once; every take and
+// every leg is a single-job decode through it.
+//
+// Order matters: every file the request names is read, and every check that can
+// be made without decoding is made, before anything is rendered (§3). The one
+// exception is a request that writes its own score — then the base take has to
+// exist before a label can be resolved or a take's score compared.
+static int run_handover(const ArBatchParams & p, const ArJob & job, JobState & top,
+	ArResult & result, llama_model * model, const llama_vocab * vocab, const std::string & card)
+{
+	const double                 t0 = now_seconds();
+	std::vector<HandoverEntry> & es = top.req.handover;
+	std::vector<HandoverTake>    takes;
+	double                       spent = 0;   // semantic decode seconds, takes and legs
+
+	// The cap a leg is held to when neither the command line nor the next cut
+	// gives one: the same one load_keep_codes holds a "semantic_keep" to.
+	const int sem_cap = semantic_cap(p);
+
+	// The base request is the request as it stands without the handover; the
+	// takes and the legs are it with another `style`, and it is what the
+	// artifacts of the whole run record (§3, §6).
+	JobState base;
+	base.req              = top.req;
+	base.req.has_handover = false;
+	base.req.handover.clear();
+	base.req.handover_json = json();
+	base.req.base_take.clear();
+	base.tag              = "[take_0] ";
+	if (job.trace)
+	{
+		printf("--guidance-trace: a handover decodes no guidance branches; nothing traced\n");
+	}
+
+	// ---- every file the request names, before anything is rendered ----------
+
+	{
+		HandoverTake t;
+		t.style = top.req.style;
+		t.label = top.req.base_take.empty() ? "take_0" : top.req.base_take;
+		t.dir   = top.req.base_take.empty()
+		          ? std::string() : request_relative(job.base_dir, top.req.base_take);
+		takes.push_back(t);
+	}
+	std::string          score;   // "" until the base score is known
+	std::vector<int32_t> song;
+	if (!top.req.base_take.empty())
+	{
+		const std::string err = load_take(takes[0].dir, takes[0]);
+		if (!err.empty())
+		{
+			die("%s: \"base_take\": %s", job.request_path.c_str(), err.c_str());
+		}
+		score = takes[0].score;
+		song  = takes[0].codes;
+		// The tags the base take was rendered under are not necessarily the
+		// request's: a leg that hands back to the base renders under the
+		// request's `style` over that take's history, which is what §2 means by
+		// "back to the request's own style". Worth saying out loud.
+		if (takes[0].style != top.req.style)
+		{
+			fprintf(stderr, "warning: \"base_take\" was rendered under other tags than this "
+			        "request's, so a leg that hands back to it sings the request's:\n"
+			        "  base_take: %s\n  request:   %s\n", takes[0].style.c_str(),
+			        top.req.style.c_str());
+		}
+		takes[0].style = top.req.style;
+	}
+	// What the engine would write as score.abc for this request, which is what a
+	// take's own score.abc is: the comparison is of scores, not of request text,
+	// so the request that produced the base take is never refused over a stray
+	// newline (§2).
+	if (top.req.has_abc)
+	{
+		base.abc_ids  = tokenize(vocab, top.req.abc, "external abc");
+		base.abc_text = detokenize(vocab, base.abc_ids);
+		if (!score.empty() && base.abc_text != score)
+		{
+			die("%s: \"base_take\": %s/score.abc is not the score the request gives in "
+			    "\"abc\" — a handover has one score", job.request_path.c_str(),
+			    takes[0].dir.c_str());
+		}
+		score = base.abc_text;
+	}
+
+	// Which take takes over at each entry, and the directories they name.
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		HandoverEntry & h = es[i];
+		h.x = handover_x(h.seconds);
+		if (!h.take.empty())
+		{
+			const std::string dir = request_relative(job.base_dir, h.take);
+			size_t            at  = takes.size();
+			for (size_t k = 0; k < takes.size(); k++)
+			{
+				at = takes[k].dir == dir ? k : at;
+			}
+			if (at == takes.size())
+			{
+				HandoverTake t;
+				t.label               = h.take;
+				t.dir                 = dir;
+				const std::string err = load_take(dir, t);
+				if (!err.empty())
+				{
+					die("%s: \"handover\" entry %zu: %s", job.request_path.c_str(),
+					    i + 1, err.c_str());
+				}
+				takes.push_back(t);
+			}
+			h.idx = at;
+			continue;
+		}
+		if (!h.has_style || h.style == top.req.style)
+		{
+			// Back to the request's own style is the base take, which is also
+			// what an entry naming that style word for word asks for (§2).
+			h.idx = 0;
+			continue;
+		}
+		size_t at = takes.size();
+		for (size_t k = 0; k < takes.size(); k++)
+		{
+			at = takes[k].dir.empty() && takes[k].style == h.style ? k : at;
+		}
+		if (at == takes.size())
+		{
+			HandoverTake t;
+			t.style = h.style;
+			t.label = strf("take_%zu", takes.size());
+			takes.push_back(t);
+		}
+		h.idx = at;
+	}
+
+	// ---- the base take: the song up to the first cut ------------------------
+
+	const char * base_name = top.req.base_take.empty() ? "the one this run wrote"
+	                                                   : top.req.base_take.c_str();
+	if (!score.empty())
+	{
+		// Everything is knowable: the takes are of one score, and so are the
+		// cuts, before a single token is decoded.
+		const std::string err = takes_score_check(takes, score, base_name);
+		if (!err.empty())
+		{
+			die("%s: %s", job.request_path.c_str(), err.c_str());
+		}
+	}
+	if (song.empty())
+	{
+		ArJob bj      = job;
+		bj.artifacts  = job.artifacts + "/take_0";
+		bj.trace      = false;
+		const ArResult r = handover_render(p, bj, model, vocab, card, base,
+		                                   handover_cap(p, 0));
+		song           = r.codes;
+		score          = base.abc_text;
+		takes[0].codes = song;             // the base take, which the legs read
+		takes[0].score = score;
+		spent         += r.semantic.seconds;
+		printf("handover: take_0 (the request's own style): %zu frames in %.1f s = "
+		       "%.1f tok/s\n", song.size(), r.semantic.seconds, r.semantic.output_tps);
+		const std::string err = takes_score_check(takes, score, base_name);
+		if (!err.empty())
+		{
+			die("%s: %s", job.request_path.c_str(), err.c_str());
+		}
+	} else {
+		// The prefix the NAR reads is the base request's, not the take's (§5),
+		// so it is built here exactly as a given-score job builds it.
+		base.req.abc       = score;
+		base.req.has_abc   = true;
+		base.abc_ids       = tokenize(vocab, score, "base take score");
+		base.abc_text      = detokenize(vocab, base.abc_ids);
+		base.have_abc_text = true;
+		base.prefix_abc    = prefix_head(vocab, base.req.text());
+		base.prefix_sem    = semantic_prefix(base.prefix_abc, base.abc_ids);
+		printf("handover: base take %s: %zu frames of an earlier render, %zu abc ids\n",
+		       takes[0].label.c_str(), song.size(), base.abc_ids.size());
+	}
+	base.req.abc     = score;
+	base.req.has_abc = true;
+
+	// ---- where the cuts are, and whether the legs can be played -------------
+
+	handover_locate(score, es);
+	{
+		std::string err = handover_cuts_check(es);
+		if (err.empty())
+		{
+			err = handover_preflight(es, takes, p, sem_cap);
+		}
+		if (!err.empty())
+		{
+			die("%s: %s", job.request_path.c_str(), err.c_str());
+		}
+	}
+
+	// ---- the takes the engine renders itself, in order of first use ---------
+
+	for (size_t k = 1; k < takes.size(); k++)
+	{
+		if (!takes[k].dir.empty())
+		{
+			printf("handover: %s: %zu frames of an earlier render\n",
+			       takes[k].label.c_str(), takes[k].codes.size());
+			continue;
+		}
+		JobState js;
+		js.req       = base.req;       // one score, one seed: only the tags differ
+		js.req.style = takes[k].style;
+		js.tag       = strf("[%s] ", takes[k].name().c_str());
+
+		ArJob tj     = job;
+		tj.artifacts = job.artifacts + "/" + takes[k].label;
+		tj.trace     = false;
+		const ArResult r = handover_render(p, tj, model, vocab, card, js, handover_cap(p, 0));
+		takes[k].codes = r.codes;
+		takes[k].score = score;
+		spent         += r.semantic.seconds;
+		printf("handover: %s: %zu frames in %.1f s = %.1f tok/s\n", takes[k].name().c_str(),
+		       r.codes.size(), r.semantic.seconds, r.semantic.output_tps);
+	}
+	{
+		// Every take is in memory now, so the checks that needed one are made
+		// before the first leg rather than being found half way through the song.
+		const std::string err = handover_preflight(es, takes, p, sem_cap);
+		if (!err.empty())
+		{
+			die("%s: %s", job.request_path.c_str(), err.c_str());
+		}
+	}
+
+	// ---- the legs -----------------------------------------------------------
+
+	bool   ended = false;    // the song ended before a cut; every later entry too
+	bool   lost  = false;    // a label before this one was not found
+	size_t prev  = 0;        // the entry the last leg was decoded for, 1-based
+	for (size_t i = 0; i < es.size(); i++)
+	{
+		HandoverEntry & h = es[i];
+		if (!h.found)
+		{
+			h.note = lost ? std::string("not resolved: an earlier entry's label was not found")
+			              : strf("the base score has no %% %s %d", h.section.c_str(), h.nth);
+			lost   = true;
+			printf("handover: entry %zu: %s — skipped\n", i + 1, h.note.c_str());
+			continue;
+		}
+		if (ended || (size_t) h.cut > song.size())
+		{
+			ended  = true;
+			h.note = strf("the song ends at frame %zu, before the cut at %d",
+			              song.size(), h.cut);
+			printf("handover: entry %zu: %s — skipped\n", i + 1, h.note.c_str());
+			continue;
+		}
+		const HandoverTake & t = takes[h.idx];
+		if (h.auto_off)
+		{
+			const OffsetFit fit = handover_offset(song, t.codes, h.cut);
+			h.offset    = fit.offset;
+			h.z         = fit.z;
+			h.hits      = fit.hits;
+			h.has_z     = true;
+			h.confident = fit.confident;
+			if (!fit.confident)
+			{
+				fprintf(stderr, "warning: \"handover\" entry %zu: the offset of %s at frame "
+				        "%d is %+d, but no lag stands out (z %.1f of %.0f wanted, %d frames "
+				        "agree of %d) — the two takes may not be of one score\n", i + 1,
+				        t.name().c_str(), h.cut, h.offset, fit.z, HANDOVER_MIN_Z, fit.hits,
+				        HANDOVER_MIN_HITS);
+			}
+		}
+
+		// How far this leg decodes, and what it is forced through. A failure
+		// here is an error, not a skip: the leg before this one was cut short to
+		// reach this entry, so skipping it would end the song there in silence.
+		const int   cap = handover_cap(p, handover_want(es, i, h.offset));
+		std::vector<int32_t> keep;
+		std::string err = handover_keep(song, t.codes, h.cut, h.x, h.offset, keep);
+		if (err.empty() && (int) keep.size() >= (cap > 0 ? cap : sem_cap))
+		{
+			err = strf("its %zu forced frames leave nothing to sample under the %d-step "
+			           "semantic cap", keep.size(), cap > 0 ? cap : sem_cap);
+		}
+		if (!err.empty())
+		{
+			if (prev > 0)
+			{
+				die("%s: \"handover\" entry %zu cannot be played at the offset measured for "
+				    "it (%+d): %s — and entry %zu's leg was already cut short to reach it, "
+				    "so the song would end there", job.request_path.c_str(), i + 1, h.offset,
+				    err.c_str(), prev);
+			}
+			die("%s: \"handover\" entry %zu cannot be played at the offset measured for it "
+			    "(%+d): %s", job.request_path.c_str(), i + 1, h.offset, err.c_str());
+		}
+
+		JobState js;
+		js.req             = base.req;   // same lyrics, same score, same seed
+		js.req.style       = t.style;
+		js.req.has_keep    = true;
+		js.req.keep_frames = (int) keep.size();
+		js.keep_codes      = keep;
+		js.keep_name       = t.name();
+		js.no_files        = true;       // the codes are handed back in memory (§5)
+		js.tag             = strf("[leg %zu] ", i + 1);
+
+		ArJob lj     = job;
+		lj.trace     = false;
+		const ArResult r = handover_render(p, lj, model, vocab, card, js, cap);
+		if (r.codes.size() < keep.size())
+		{
+			die("%sthe leg came back with %zu frames, fewer than the %zu it was given",
+			    js.tag.c_str(), r.codes.size(), keep.size());
+		}
+
+		h.reached = true;
+		h.gave    = (int) (r.codes.size() - keep.size());
+		song.resize((size_t) h.cut);
+		song.insert(song.end(), r.codes.begin() + (long) keep.size(), r.codes.end());
+		spent += r.semantic.seconds;
+		prev   = i + 1;
+		printf("handover: leg %zu: frame %d <- %s, offset %+d", i + 1, h.cut, t.name().c_str(),
+		       h.offset);
+		if (h.has_z)
+		{
+			printf(" (z %.1f, %d frames agree)", h.z, h.hits);
+		}
+		// The leg's own tok/s counts the forced frames as steps (SPEC_KEEP §3);
+		// what this line reports is the frames it sampled, over the same wall
+		// time, so a leg and a take can be compared.
+		printf(", x %d, %d new frames in %.1f s = %.1f frames/s, song %zu frames\n",
+		       h.x, h.gave, r.semantic.seconds,
+		       r.semantic.seconds > 0 ? h.gave / r.semantic.seconds : 0, song.size());
+	}
+
+	// ---- the song, and what became of every entry ---------------------------
+
+	const json handover = json_handover(es, takes);
+
+	// The abc phase is the base take's; the semantic numbers describe the song
+	// that came out of it, over every take and leg this run decoded.
+	GenStats st_sem       = base.st_sem;
+	st_sem.output_tokens  = (int) song.size();
+	st_sem.content_tokens = (int) song.size();
+	st_sem.prefix_tokens  = (int) base.prefix_sem.size();
+	st_sem.seconds        = spent;
+	st_sem.output_tps     = spent > 0 ? song.size() / spent : 0;
+
+	{
+		// request.json is the request as it was given, the handover block and
+		// the base take included, so the song reproduces from its own artifacts
+		// directory (§6).
+		Request art       = base.req;
+		art.has_handover  = true;
+		art.handover_json = top.req.handover_json;
+		art.base_take     = top.req.base_take;
+
+		Artifacts a;
+		a.dir           = job.artifacts;
+		a.req           = &art;
+		a.st_abc        = &base.st_abc;
+		a.abc_ids       = base.abc_ids;
+		a.prefix_sem    = base.prefix_sem;
+		a.codes         = song;
+		a.abc_text      = base.abc_text;
+		a.have_abc_text = true;
+		a.handover      = &handover;
+		write_artifacts(a);
+	}
+	printf("handover: %zu take%s, %zu leg%s, %zu frames in %.1f s (%.1f s of decode)\n",
+	       takes.size(), takes.size() == 1 ? "" : "s", es.size(), es.size() == 1 ? "" : "s",
+	       song.size(), now_seconds() - t0, spent);
+	printf("artifacts: %s (abc %zu ids, semantic %zu codes)\n", job.artifacts.c_str(),
+	       base.abc_ids.size(), song.size());
+
+	result.prefix_sem.assign(base.prefix_sem.begin(), base.prefix_sem.end());
+	result.codes      = song;
+	result.abc        = base.st_abc;
+	result.semantic   = st_sem;
+	result.seed       = base.req.seed;
+	result.cot        = base.req.cot;
+	result.cfg_scale  = 1.0;
+	result.card       = card;
+	result.ok         = true;
+	result.parallel   = 1;
+	result.batch_jobs = 1;
+	return 0;
+}
+
+static void usage(const char * argv0)
+{
+	fprintf(stderr,
+	        "usage: %s -m MODEL.gguf --request song.json --artifacts DIR\n"
+	        "       %s -m MODEL.gguf --requests jobs.json [--parallel N]\n"
+	        "        [--seed N] [--cot full|melody|off] [--gpu N] [--cpu]\n"
+	        "        [--threads N] [--dump-logits FILE.npy] [--greedy]\n"
+	        "        [--max-abc N] [--max-semantic N] [--continue-on-error]\n"
+	        "        [--verify-sampler] [--guidance-trace]\n"
+	        "        [--prefix-only]   the request carries its \"abc\": write prefix.npy, decode nothing\n", argv0, argv0);
+}
+
+} // namespace
+
+std::string load_jobs_file(const std::string & path, bool need_out, std::vector<ArJob> & jobs)
+{
+	std::string text;
+	{
+		const std::string err = read_file(path, text);
+		if (!err.empty())
+		{
+			return err;
+		}
+	}
+	json root;
+	try
+	{
+		root = json::parse(text);
+	}
+	catch (const std::exception & e)
+	{
+		return strf("%s: %s", path.c_str(), e.what());
+	}
+	if (!root.is_array() || root.empty())
+	{
+		return strf("%s: expected a non-empty JSON array of jobs", path.c_str());
+	}
+
+	for (size_t i = 0; i < root.size(); i++)
+	{
+		const json & e = root[i];
+		if (!e.is_object())
+		{
+			return strf("%s: job %zu is not an object", path.c_str(), i + 1);
+		}
+		ArJob job;
+		for (json::const_iterator it = e.begin(); it != e.end(); ++it)
+		{
+			const std::string & key = it.key();
+			if (key == "seed")
+			{
+				if (!it.value().is_number_unsigned() ||
+				    it.value().get<uint64_t>() >= (uint64_t) 1 << 63)
+				{
+					return strf("%s: job %zu: \"seed\" must be an integer in [0, 2**63)",
+					            path.c_str(), i + 1);
+				}
+				job.has_seed = true;
+				job.seed     = it.value().get<uint64_t>();
+				continue;
+			}
+			if (!it.value().is_string())
+			{
+				return strf("%s: job %zu: \"%s\" must be a string",
+				            path.c_str(), i + 1, key.c_str());
+			}
+			const std::string value = it.value().get<std::string>();
+			if (key == "request")
+			{
+				job.request_path = value;
+			} else if (key == "out") {
+				job.out = value;
+			} else if (key == "artifacts") {
+				job.artifacts = value;
+			} else if (key == "noise") {
+				job.noise_path = value;
+			} else {
+				return strf("%s: job %zu: unknown key \"%s\" (request, out, artifacts, "
+				            "seed, noise)", path.c_str(), i + 1, key.c_str());
+			}
+		}
+		if (job.request_path.empty())
+		{
+			return strf("%s: job %zu needs a \"request\"", path.c_str(), i + 1);
+		}
+		// SPEC_KEEP §2: for a batch, a relative path inside a request resolves
+		// against the batch file, which is the one the paths around it are
+		// written beside.
+		job.base_dir = dir_of(path);
+		if (need_out && job.out.empty())
+		{
+			return strf("%s: job %zu needs an \"out\"", path.c_str(), i + 1);
+		}
+		if (!need_out && job.artifacts.empty())
+		{
+			return strf("%s: job %zu needs an \"artifacts\" directory", path.c_str(), i + 1);
+		}
+		jobs.push_back(job);
+	}
+
+	// Two jobs writing one path would race in the AR loop and silently overwrite
+	// each other's artifacts — a usage error, caught before anything loads.
+	for (size_t i = 0; i < jobs.size(); i++)
+	{
+		for (size_t k = i + 1; k < jobs.size(); k++)
+		{
+			if (!jobs[i].out.empty() && jobs[i].out == jobs[k].out)
+			{
+				return strf("%s: jobs %zu and %zu share the output \"%s\"",
+				            path.c_str(), i + 1, k + 1, jobs[i].out.c_str());
+			}
+			if (!jobs[i].artifacts.empty() && jobs[i].artifacts == jobs[k].artifacts)
+			{
+				return strf("%s: jobs %zu and %zu share the artifacts directory \"%s\"",
+				            path.c_str(), i + 1, k + 1, jobs[i].artifacts.c_str());
+			}
+		}
+	}
+	return "";
+}
+
+ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
+{
+	ArParams p;
+	for (int i = 1; i < argc; i++)
+	{
+		const std::string a = argv[i];
+		if (a == "-m" || a == "--model")
+		{
+			p.model = need(argc, argv, i);
+		} else if (a == "--request") {
+			p.request_path = need(argc, argv, i);
+		} else if (a == "--requests") {
+			p.requests = need(argc, argv, i);
+		} else if (a == "--artifacts") {
+			p.artifacts = need(argc, argv, i);
+		} else if (a == "--dump-logits") {
+			p.dump_logits = need(argc, argv, i);
+		} else if (a == "--device") {
+			p.device = need(argc, argv, i);
+		} else if (a == "--cpu") {
+			p.device = "cpu";
+		} else if (a == "--gpu") {
+			p.gpu = atoi(need(argc, argv, i));
+		} else if (a == "--threads") {
+			p.threads = atoi(need(argc, argv, i));
+		} else if (a == "--parallel") {
+			p.parallel = atoi(need(argc, argv, i));
+		} else if (a == "--seed") {
+			p.has_seed = true;
+			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
+		} else if (a == "--cot") {
+			p.cot = need(argc, argv, i);
+		} else if (a == "--greedy") {
+			p.greedy = true;
+		} else if (a == "--continue-on-error") {
+			p.continue_on_error = true;
+		} else if (a == "--verify-sampler") {
+			p.verify_sampler = true;
+		} else if (a == "--guidance-trace") {
+			p.guidance_trace = true;
+		} else if (a == "--prefix-only") {
+			p.prefix_only = true;
+		} else if (a == "--max-abc") {
+			p.max_abc = parse_positive_arg("--max-abc", need(argc, argv, i));
+		} else if (a == "--max-semantic") {
+			p.max_semantic = parse_positive_arg("--max-semantic", need(argc, argv, i));
+		} else if (a == "-h" || a == "--help") {
+			usage(argv0);
+			exit(0);
+		} else {
+			usage(argv0);
+			die("unknown argument %s", a.c_str());
+		}
+	}
+
+	if (p.model.empty() || (p.request_path.empty() == p.requests.empty()))
+	{
+		usage(argv0);
+		die("-m and exactly one of --request / --requests are required");
+	}
+	if (p.requests.empty() && p.artifacts.empty() && p.dump_logits.empty())
+	{
+		usage(argv0);
+		die("give --artifacts DIR, or --dump-logits FILE.npy");
+	}
+	if (!p.requests.empty() && !p.dump_logits.empty())
+	{
+		usage(argv0);
+		die("--dump-logits is a single-request path; use --request");
+	}
+	return p;
+}
+
+int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
+	std::vector<ArResult> & results)
+{
+	if (jobs.empty())
+	{
+		die("run_ar_batch: no jobs");
+	}
+	if (p.parallel < 1 || p.parallel > 256)
+	{
+		die("--parallel must be in [1, 256] (llama caps sequences at LLAMA_MAX_SEQ)");
+	}
+
+	std::vector<JobState> states(jobs.size());
+	results.assign(jobs.size(), ArResult());
+
+	// The semantic limit, before validation rather than after it: the kept
+	// frames of SPEC_KEEP count against it, and a keep that leaves nothing to
+	// sample is a request error like any other (§2). The abc limit is the decode
+	// loop's own business and is settled there.
+	const int sem_cap = semantic_cap(p);
+
+	// ---- validation, before anything loads (SPEC_BATCH §3.1) ----------------
+
+	int rejected = 0;
+	auto reject = [&](size_t i, const std::string & err)
+	{
+		if (!p.continue_on_error)
+		{
+			die("%s", err.c_str());
+		}
+		fprintf(stderr, "error: %s%s\n", states[i].tag.c_str(), err.c_str());
+		states[i].ok     = false;
+		results[i].ok    = false;
+		results[i].error = err;
+		rejected++;
+	};
+
+	for (size_t i = 0; i < jobs.size(); i++)
+	{
+		JobState & js = states[i];
+		if (jobs.size() > 1)
+		{
+			const std::string & shown = jobs[i].out.empty() ? jobs[i].artifacts : jobs[i].out;
+			const size_t        slash = shown.find_last_of('/');
+			js.tag = strf("[%zu/%zu %s] ", i + 1, jobs.size(),
+			              slash == std::string::npos ? shown.c_str() : shown.c_str() + slash + 1);
+		}
+		const std::string err = prepare_request(jobs[i].request_path, p.cot,
+			jobs[i].has_seed, jobs[i].has_seed ? jobs[i].seed : 0, js.req, js.guidance);
+		if (!err.empty())
+		{
+			reject(i, err);
+			continue;
+		}
+		// SPEC_HANDOVER §2: not in a batch for now. A handover is several
+		// generations of its own, each with the context to itself, so it has
+		// nothing to share with the songs beside it.
+		if (js.req.has_handover && jobs.size() > 1)
+		{
+			reject(i, strf("%s: \"handover\" is not supported in a batch of %zu songs — "
+			               "render it on its own", jobs[i].request_path.c_str(), jobs.size()));
+			continue;
+		}
+		// --prefix-only asks for the NAR's view of the request and decodes
+		// nothing, which for a handover is the base request's prefix (§5). The
+		// base take's score stands in for the "abc" it would otherwise need.
+		if (p.prefix_only && js.req.has_handover && !js.req.base_take.empty() && !js.req.has_abc)
+		{
+			const std::string dir  = request_relative(jobs[i].base_dir, js.req.base_take);
+			const std::string read = read_file(dir + "/score.abc", js.req.abc);
+			if (!read.empty())
+			{
+				reject(i, strf("%s: \"base_take\": %s", jobs[i].request_path.c_str(),
+				               read.c_str()));
+				continue;
+			}
+			js.req.has_abc = true;
+		}
+		// The sections a request names (SPEC_SECTIONS §2). A score the request
+		// gave is already written, so its labels are located here — which is what
+		// makes a section landing inside the kept frames a request error like any
+		// other, before anything touches the GPU (§4).
+		if (js.req.has_sections)
+		{
+			js.sections   = js.req.sections;
+			js.plain_swap = sections_plain_swap(js.req.sections);
+			if (js.req.has_abc)
+			{
+				sections_locate(js.req.abc, js.sections);
+				sections_frames(js.sections);
+				const std::string sec_err = sections_keep_check(js.req, js.sections);
+				if (!sec_err.empty())
+				{
+					reject(i, strf("%s: %s", jobs[i].request_path.c_str(), sec_err.c_str()));
+					continue;
+				}
+			}
+		}
+		// The earlier render's codes (SPEC_KEEP §2). Read here, so a bad file is
+		// one more rejected job rather than a death in the middle of a batch,
+		// and so nothing has touched the GPU yet.
+		if (js.req.has_keep)
+		{
+			const std::string keep_err = load_keep_codes(js.req, jobs[i].base_dir,
+				sem_cap, js.keep_codes, js.keep_name);
+			if (!keep_err.empty())
+			{
+				js.keep_codes.clear();
+				reject(i, strf("%s: %s", jobs[i].request_path.c_str(), keep_err.c_str()));
+			}
+		}
+	}
+
+	// SPEC_GUIDANCE §2.4: a guided job needs the whole context to itself, since
+	// its shadow branches are the other KV streams. The decode runs at the
+	// *clamped* parallel — one job of a `yue2 batch --parallel 4` is still a
+	// single song — so that is what the jobs are held to.
+	int parallel = std::min<int>(p.parallel, (int) jobs.size() - rejected);
+	if (parallel > 1)
+	{
+		for (size_t i = 0; i < jobs.size(); i++)
+		{
+			if (states[i].ok && is_guided(states[i].req))
+			{
+				reject(i, strf("%s: guidance needs --parallel 1 (this batch decodes %d songs "
+				               "side by side)", jobs[i].request_path.c_str(), parallel));
+			}
+		}
+		parallel = std::min<int>(parallel, (int) jobs.size() - rejected);
+	}
+
+	if (rejected == (int) jobs.size())
+	{
+		fprintf(stderr, "error: every job was rejected; nothing to decode\n");
+		return 1;
+	}
+
+	// ---- model -------------------------------------------------------------
+
+	llama_log_set(quiet_log, nullptr);
+	llama_backend_init();
+
+	ggml_backend_dev_t devices[2] = {nullptr, nullptr};
+	std::string        backend_name;
+	llama_model *      model = load_model(p.model, p.device, p.gpu, backend_name, devices, p.prefix_only);
+
+	const llama_vocab * vocab   = llama_model_get_vocab(model);
+	const int           n_vocab = llama_vocab_n_tokens(vocab);
+	if (n_vocab != VOCAB_SIZE)
+	{
+		// sample_step indexes MUSIC_END and the codec range directly; a smaller
+		// vocab would read and write out of bounds.
+		die("vocab is %d, the protocol requires exactly %d — wrong GGUF?", n_vocab, VOCAB_SIZE);
+	}
+
+	// SPEC_HANDOVER: a handover is a driver of its own — it renders a take per
+	// style and a leg per cut through the model just loaded, and the artifacts
+	// it writes are the song those legs add up to.
+	const int rc = !p.prefix_only && states[0].ok && states[0].req.has_handover
+		? run_handover(p, jobs[0], states[0], results[0], model, vocab, backend_name)
+		: ar_decode_jobs(p, jobs, states, results, model, vocab, backend_name,
+		                 parallel, rejected);
+
 	llama_model_free(model);
 	llama_backend_free();
-	return ok_jobs == (int) jobs.size() ? 0 : 1;
+	return rc;
 }
 
 int run_ar(const ArParams & p, ArResult * out)

@@ -732,7 +732,7 @@ int run_vae(const VaeParams & p)
 		// reference pipeline); anything else stays float WAV.
 		const std::string e = ends_with(p.output, ".flac")
 			? flac::save_f32_24(path.c_str(), audio.data(),
-				model.cfg.out_channels, total, model.cfg.sample_rate)
+				model.cfg.out_channels, total, model.cfg.sample_rate, p.tags)
 			: wav::save_f32(path.c_str(), audio.data(),
 				model.cfg.out_channels, total, model.cfg.sample_rate);
 		if (!e.empty())

@@ -1,0 +1,25 @@
+{
+ "style": "animated film musical, storybook, minor key, string section answering the vocal, pizzicato strings, female vocal, dramatic",
+ "lyrics": "[Verse]\nThe kettle sings a flat blue note\n\n[Chorus]\nStay a while, the rain is warm\n\n[Verse]\nThe window keeps the evening out\n\n[Chorus]\nStay a while, the rain is warm\n",
+ "cot": "full",
+ "seed": 1,
+ "base_take": "out/base",
+ "handover": [
+  {
+   "section": "chorus",
+   "nth": 1,
+   "style": "90s eurodance, 140 BPM, four-on-the-floor beat, supersaw synth riffs, big anthem chorus, powerful female diva vocal"
+  },
+  {
+   "section": "verse",
+   "nth": 2,
+   "take": "out/reggae",
+   "seconds": 1
+  },
+  {
+   "section": "chorus",
+   "nth": 2,
+   "offset": "auto"
+  }
+ ]
+}
