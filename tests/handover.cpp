@@ -111,6 +111,34 @@ void run_offsets()
 		      "none confident");
 	}
 
+	// --- §4's fallback: a lag nobody believes is dropped for 0 ---------------
+	// The peak the retry scan found is what `measured` has to carry, and the
+	// offset the leg is played at is 0 whatever that peak was.
+	{
+		int zeroed = 0;
+		int kept   = 0;
+		for (uint64_t seed = 100; seed < 130; seed++)
+		{
+			const std::vector<int32_t> take = stream(seed, 4000);
+			const OffsetFit fit  = handover_offset(song, take, 3415);
+			const OffsetFit scan = offset_scan(song, take, HANDOVER_LO, 3415);
+			zeroed += fit.offset == 0 && !fit.confident ? 1 : 0;
+			kept   += fit.measured == scan.offset ? 1 : 0;
+		}
+		check(zeroed == 30 && kept == 30, "offset: an unbelieved fit falls back to 0",
+		      strf("%d at offset 0, %d keeping the peak in measured", zeroed, kept),
+		      "all 30, and measured is the peak the retry scan found");
+	}
+	{
+		// A believed lag is untouched by the fallback: offset and measured agree.
+		std::vector<int32_t> take = stream(2, 4000);
+		plant(song, take, 11, 150, 3500, 32);
+		const OffsetFit fit = handover_offset(song, take, 3415);
+		check(fit.offset == 11 && fit.measured == 11 && fit.confident,
+		      "offset: a believed lag is not dropped",
+		      strf("%+d (measured %+d)", fit.offset, fit.measured), "+11, measured +11");
+	}
+
 	// --- one coincidental hit is a huge z and still not a lag ---------------
 	{
 		std::vector<int32_t> take = stream(77, 4000);
@@ -314,7 +342,8 @@ void run_cuts()
 		}
 		handover_locate(SCORE, es);
 		check(es[0].found == c.found && (!c.found || es[0].cut == c.cut), what.c_str(),
-		      es[0].found ? strf("frame %d (bar %d, %.2f s)", es[0].cut, es[0].bar, es[0].at)
+		      es[0].found ? strf("frame %d (bar %d, %.2f s)", es[0].cut, es[0].bar,
+		                         es[0].bar_seconds)
 		                  : std::string("not found"),
 		      c.found ? strf("frame %d (%s)", c.cut, c.why) : strf("not found (%s)", c.why));
 	}
@@ -484,6 +513,62 @@ const RequestCase REQUEST_CASES[] =
 	{ "\"cfg_scale\": 1.0, " HAND_ONE,                                nullptr,
 	  "cfg_scale 1 is no guidance at all" },
 
+	// --- "at": a time in the base take's audio ------------------------------
+	{ "\"handover\": [{\"at\": 78.6, \"style\": \"roots reggae\"}]",  nullptr,
+	  "seconds as a number" },
+	{ "\"handover\": [{\"at\": \"78.6\"}]",                           nullptr,
+	  "and as a string" },
+	{ "\"handover\": [{\"at\": \"1:18.6\"}]",                         nullptr,
+	  "minutes and seconds" },
+	{ "\"handover\": [{\"at\": \"1:18\"}]",                           nullptr,
+	  "without the fraction" },
+	{ "\"handover\": [{\"at\": 79}]",                                 nullptr,
+	  "a whole number of seconds" },
+	{ "\"handover\": [{\"at\": \"1:00\"}, {\"frame\": 2000}]",        nullptr,
+	  "an \"at\" and a \"frame\" are one timeline, and these are in order" },
+	{ "\"handover\": [{\"at\": \"2:00\"}, {\"frame\": 2000}]",        "not after",
+	  "and out of order they are caught before anything renders" },
+	{ "\"handover\": [{\"at\": 0.02}]",                               "less than the",
+	  "0.02 s is frame 1, which has nothing before it" },
+	{ "\"handover\": [{\"at\": -1}]",                                 "\"at\"",
+	  "a time before the song" },
+	{ "\"handover\": [{\"at\": \"-5\"}]",                             "\"at\"",
+	  "a sign is not part of a clock" },
+	{ "\"handover\": [{\"at\": 0}]",                                  "\"at\"",
+	  "frame 0 is before the first sampled step" },
+	{ "\"handover\": [{\"at\": 100000}]",                             "\"at\"",
+	  "a time past the longest song" },
+	{ "\"handover\": [{\"at\": 1e30}]",                               "\"at\"",
+	  "a finite time whose frame no integer holds" },
+	{ "\"handover\": [{\"at\": \"1:75\"}]",                           "\"at\"",
+	  "75 seconds is not a clock" },
+	{ "\"handover\": [{\"at\": \"1:2:3\"}]",                          "\"at\"",
+	  "hours are not a form" },
+	{ "\"handover\": [{\"at\": \"\"}]",                               "\"at\"",
+	  "an empty time" },
+	{ "\"handover\": [{\"at\": \"abc\"}]",                            "\"at\"",
+	  "not a number at all" },
+	{ "\"handover\": [{\"at\": \"78.6s\"}]",                          "\"at\"",
+	  "trailing junk" },
+	{ "\"handover\": [{\"at\": \" 78.6\"}]",                          "\"at\"",
+	  "nor leading space" },
+	{ "\"handover\": [{\"at\": \"1:.6\"}]",                           "\"at\"",
+	  "a point needs a digit on both sides" },
+	{ "\"handover\": [{\"at\": true}]",                               "\"at\"",
+	  "a JSON type that is neither number nor string" },
+	{ "\"handover\": [{\"at\": [78.6]}]",                             "\"at\"",
+	  "nor a list of one" },
+	{ "\"handover\": [{\"at\": 78.6, \"frame\": 2000}]",              "not both",
+	  "a time and a frame are two ways to say where" },
+	{ "\"handover\": [{\"section\": \"verse\", \"at\": 78.6}]",       "not both",
+	  "and so are a label and a time" },
+	{ "\"handover\": [{\"at\": 78.6, \"nth\": 2}]",                   "belong to a \"section\"",
+	  "nth says which label, and a time names none" },
+	{ "\"handover\": [{\"at\": 78.6, \"lead_frames\": 0}]",           "belong to a \"section\"",
+	  "the lead is a label's too" },
+	{ "\"handover\": [{\"frame\": 2000, \"nth\": 2}]",                "belong to a \"section\"",
+	  "nor does a frame have an nth" },
+
 	// --- one mechanism per request ------------------------------------------
 	{ "\"guidance\": [{\"frame\": 400, \"style\": \"x\"}], " HAND_ONE, "\"guidance\"",
 	  "handover beside guidance" },
@@ -603,6 +688,26 @@ void run_requests()
 		}
 		check(err.find("cot=off") != std::string::npos, "request: cot=off has no labels",
 		      err.empty() ? "accepted" : err, "an error naming cot=off");
+	}
+	{
+		// §2: frame = round(seconds × 25), no lead, and the three string forms
+		// mean what the number does. What the request wrote is kept as it wrote
+		// it, for handover.json (§6) and for the error messages.
+		Request           req;
+		const std::string err = parse_request_json(json::parse(request_with(
+			"\"handover\": [{\"at\": 78.6}, {\"at\": \"78.6\"}, {\"at\": \"1:18.6\"}, "
+			"{\"at\": \"1:18\"}]")), "R", req);
+		const HandoverEntry & h = req.handover[0];
+		check(err.empty() && h.has_frame && h.has_at && h.frame == 1965 &&
+		      req.handover[1].frame == 1965 && req.handover[2].frame == 1965 &&
+		      req.handover[3].frame == 1950 && handover_where(h, h.frame) == "78.6 (frame 1965)" &&
+		      handover_where(req.handover[2], 1965) == "1:18.6 (frame 1965)",
+		      "request: \"at\" to a frame",
+		      err.empty() ? strf("%d, %d, %d, %d — %s", h.frame, req.handover[1].frame,
+		                         req.handover[2].frame, req.handover[3].frame,
+		                         handover_where(h, h.frame).c_str())
+		                  : err,
+		      "1965, 1965, 1965, 1950, named by the text the request wrote");
 	}
 	{
 		// The intrusion in frames, rounded once (§2).

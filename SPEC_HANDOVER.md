@@ -37,7 +37,15 @@ SPEC_SECTIONS.md). Opt-in; a request without `handover` is bit-identical to befo
 ```
 
 - Where: `section` + `nth` exactly as in `sections` (same resolver, same
-  `lead_frames`, default 35), or `"frame": N` instead (the base take's timeline).
+  `lead_frames`, default 35), or `"frame": N` instead (the base take's timeline),
+  or `"at"` = the same place as a time in the base take's AUDIO, the thing a
+  listener reads off a player: a number of seconds (`78.6`) or a string
+  `"78.6"`, `"1:18.6"`, `"1:18"` (minutes:seconds, seconds < 60, at most one
+  colon, decimals optional, nothing else). frame = round(seconds × 25); no
+  `lead_frames` is applied (the listener already heard where it is). Exactly one
+  of `section` / `frame` / `at` per entry; `nth` and `lead_frames` only beside
+  `section`. From there on an `at` entry IS a `frame` entry — same ordering rule,
+  same arithmetic checks, same errors (naming the entry by its `at` text).
   Cuts must be strictly increasing; order in the array = order in the song. The
   entries that name a frame are held to that before anything else happens,
   whatever the labels between them resolve to.
@@ -96,8 +104,13 @@ an absolute count, because over a short window a single coincidental hit at one
 lag and none at the others is a z of 14, and roughly seven in ten unrelated
 stream pairs pass a z test alone. Two takes of one score clear both by a wide
 margin (2–3 % of a 750-frame window is ~20 tokens). If the fit is not believed,
-retry with lo = 150; if it is still not, warn, use that best k anyway and record
-`"confident": false`.
+retry with lo = 150; if it is still not, warn, **use offset 0** and record
+`"confident": false` plus `"measured": k` (the best k that was not believed).
+Why 0 and not k: the song so far is always re-indexed onto its own clock (§5),
+so 0 is the neutral guess, and a wrong k is worse than none — measured: a cut
+18 s into a song (300 frames to match) took an unbelieved +18, skipped 0.7 s of
+song, and every later cut then measured ~+18 against every take. An explicit
+integer `offset` is never second-guessed.
 
 ## 5. A leg
 
@@ -118,7 +131,7 @@ For entry i with cut `c`, offset `off`, intrusion `x`:
 
 ## 6. Artifacts / logging
 
-- `handover.json`: per entry — label, nth, bar, seconds, cut frame, take (path or
+- `handover.json`: per entry — label, nth, bar, seconds, `at` (verbatim, when the entry had one), cut frame, take (path or
   `take_<k>`), style, x, offset, z, confident, reached, frames contributed.
 - `semantic.npy` = the final S. `request.json` verbatim as always — the
   `handover` block and `base_take` included, so the song reproduces from its own
@@ -130,7 +143,10 @@ For entry i with cut `c`, offset `off`, intrusion `x`:
 ## 7. Tests
 
 - Table test (no model) for §4 on synthetic streams: planted lag recovered,
-  ties, short streams, low-z fallback; and for §2 validation errors.
+  ties, short streams, low-z fallback (offset 0 + `measured`); and for §2
+  validation errors, the `at` forms included (number, the three string forms,
+  rounding, and every malformed one: negative, "1:75", "1:2:3", "", "abc",
+  `at` beside `frame` or `section`, `nth` beside `at`).
 - Model test (Arc): a one-entry and a four-entry request reproduce, bit for bit,
   the streams the reference driver script produces from the same takes with the
   same offsets (the coordinator supplies takes + reference streams outside the

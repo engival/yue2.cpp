@@ -51,6 +51,11 @@ build/yue2 song --request handover.json --out song.flac \
     --artifacts out/handover --gpu 0
 ```
 
+Every entry here says where it cuts by label. The same place can be said as a
+frame (`{ "frame": 1965, … }`) or as a time in the base take's audio
+(`{ "at": "1:18.6", … }` — what a player shows while it is playing); one of the
+three per entry, and the cuts come in the order the song plays them.
+
 `out/base` is a `--artifacts` directory of an earlier render of this request's
 lyrics and style, `out/reggae` one of the same score under other tags — every
 take's `score.abc` has to match the base's to the byte.

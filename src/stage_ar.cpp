@@ -173,6 +173,8 @@ struct HandoverEntry
 {
 	bool        has_frame = false;             // "frame": the base take's own timeline
 	int         frame     = 0;
+	bool        has_at    = false;             // or "at": a time in the base take's audio
+	json        at_json;                       // as the request wrote it (§6)
 	std::string section;                       // or a label, through stage 8's resolver
 	int         nth       = 1;
 	int         lead      = SECTIONS_LEAD;
@@ -186,7 +188,7 @@ struct HandoverEntry
 	bool        found     = false;   // the label turned up in the base score
 	int         line      = 0;       // its 1-based line number there
 	int         bar       = 0;       // bars of Vocal written before it
-	double      at        = 0;       // where that bar starts, in seconds
+	double      bar_seconds = 0;     // where that bar starts, in seconds
 	int         cut       = 0;       // the frame the song changes hands at
 	int         x         = 0;       // the intrusion, in frames
 	size_t      idx       = 0;       // which take takes over
@@ -194,6 +196,7 @@ struct HandoverEntry
 	int         hits      = 0;       // frames of the window that agree at it
 	bool        has_z     = false;   // a given offset is not measured
 	bool        confident = true;
+	int         measured  = 0;       // the lag that was not believed, when it was not
 	bool        reached   = false;   // the song got as far as the cut
 	int         gave      = 0;       // frames of the final song this leg contributed
 	std::string note;                // why it was skipped, "" when it was not
@@ -1344,6 +1347,7 @@ struct OffsetFit
 	double z         = 0;   // how far the peak stands out of the 201 rates
 	int    hits      = 0;   // frames that agree at it, not the share of them
 	bool   confident = false;
+	int    measured  = 0;   // the peak itself, which a fit that is not believed drops
 };
 
 // The frames in [lo, cut) at which the song and the take agree when the take is
@@ -1424,12 +1428,16 @@ static OffsetFit offset_scan(const std::vector<int32_t> & song, const std::vecto
 	fit.z         = var > 0 ? (rate[best] - mean) / std::sqrt(var) : 0;
 	fit.hits      = hits[best];
 	fit.confident = fit.z >= HANDOVER_MIN_Z && fit.hits >= HANDOVER_MIN_HITS;
+	fit.measured  = fit.offset;
 	return fit;
 }
 
 // §4: the last HANDOVER_SPAN frames before the cut, and the whole song from
 // HANDOVER_LO on when that window is too flat to believe. A fit that is still
-// flat is used anyway and says so.
+// flat is dropped for offset 0 — the song so far is re-indexed onto its own
+// clock either way (§5), so 0 is the neutral guess and a lag that was measured
+// out of noise is worse than none. The peak stays in `measured` and the entry
+// says it was not believed.
 static OffsetFit handover_offset(const std::vector<int32_t> & song,
 	const std::vector<int32_t> & take, int cut)
 {
@@ -1438,6 +1446,10 @@ static OffsetFit handover_offset(const std::vector<int32_t> & song,
 	if (!fit.confident && lo > HANDOVER_LO)
 	{
 		fit = offset_scan(song, take, HANDOVER_LO, cut);
+	}
+	if (!fit.confident)
+	{
+		fit.offset = 0;
 	}
 	return fit;
 }
@@ -1475,8 +1487,9 @@ static std::string handover_keep(const std::vector<int32_t> & song,
 }
 
 // Where each entry cuts (§2). A "frame" is the base take's own timeline and
-// needs no score; a label goes through stage 8's resolver and clock against the
-// base score, the entries that name one in the order they are given.
+// needs no score — nor does an "at", which became a frame as it was parsed; a
+// label goes through stage 8's resolver and clock against the base score, the
+// entries that name one in the order they are given.
 static void handover_locate(const std::string & score, std::vector<HandoverEntry> & es)
 {
 	std::vector<SectionEntry> secs;
@@ -1501,12 +1514,26 @@ static void handover_locate(const std::string & score, std::vector<HandoverEntry
 	for (size_t k = 0; k < secs.size(); k++)
 	{
 		HandoverEntry & e = es[which[k]];
-		e.found = secs[k].found;
-		e.line  = secs[k].line;
-		e.bar   = secs[k].bar;
-		e.at    = secs[k].seconds;
-		e.cut   = secs[k].frame;
+		e.found       = secs[k].found;
+		e.line        = secs[k].line;
+		e.bar         = secs[k].bar;
+		e.bar_seconds = secs[k].seconds;
+		e.cut         = secs[k].frame;
 	}
+}
+
+// How an error names where an entry cuts (§2): an entry that wrote an "at" is
+// named by that text — the time the reader typed — with the frame it came to
+// beside it; anything else by the frame alone.
+static std::string handover_where(const HandoverEntry & h, int frame)
+{
+	if (!h.has_at)
+	{
+		return strf("frame %d", frame);
+	}
+	const std::string at = h.at_json.is_string() ? h.at_json.get<std::string>()
+	                                             : h.at_json.dump();
+	return strf("%s (frame %d)", at.c_str(), frame);
 }
 
 // §2: "Cuts must be strictly increasing; order in the array = order in the
@@ -1514,8 +1541,9 @@ static void handover_locate(const std::string & score, std::vector<HandoverEntry
 // this is checked once the score has been walked.
 static std::string handover_cuts_check(const std::vector<HandoverEntry> & es)
 {
-	int    prev = 0;
-	size_t at   = 0;
+	int         prev = 0;
+	size_t      at   = 0;
+	std::string where;
 	for (size_t i = 0; i < es.size(); i++)
 	{
 		if (!es[i].found)
@@ -1524,12 +1552,13 @@ static std::string handover_cuts_check(const std::vector<HandoverEntry> & es)
 		}
 		if (prev > 0 && es[i].cut <= prev)
 		{
-			return strf("\"handover\" entry %zu cuts at frame %d, which is not after entry "
-			            "%zu's frame %d — entries are in the order the song plays them",
-			            i + 1, es[i].cut, at, prev);
+			return strf("\"handover\" entry %zu cuts at %s, which is not after entry "
+			            "%zu's %s — entries are in the order the song plays them",
+			            i + 1, handover_where(es[i], es[i].cut).c_str(), at, where.c_str());
 		}
-		prev = es[i].cut;
-		at   = i + 1;
+		prev  = es[i].cut;
+		at    = i + 1;
+		where = handover_where(es[i], es[i].cut);
 	}
 	return "";
 }
@@ -2071,7 +2100,8 @@ static json json_handover(const std::vector<HandoverEntry> & es,
 		e["nth"]     = h.has_frame ? json(nullptr) : json(h.nth);
 		e["line"]    = h.has_frame || !h.found ? json(nullptr) : json(h.line);
 		e["bar"]     = h.has_frame || !h.found ? json(nullptr) : json(h.bar);
-		e["seconds"] = h.has_frame || !h.found ? json(nullptr) : json(h.at);
+		e["seconds"] = h.has_frame || !h.found ? json(nullptr) : json(h.bar_seconds);
+		e["at"]      = h.has_at ? h.at_json : json(nullptr);
 		e["frame"]   = h.found ? json(h.cut) : json(nullptr);
 		e["take"]    = takes[h.idx].label;
 		e["style"]   = takes[h.idx].style;
@@ -2080,6 +2110,7 @@ static json json_handover(const std::vector<HandoverEntry> & es,
 		e["z"]       = h.has_z ? json(h.z) : json(nullptr);
 		e["hits"]      = h.has_z ? json(h.hits) : json(nullptr);
 		e["confident"] = h.confident;
+		e["measured"]  = h.confident ? json(nullptr) : json(h.measured);
 		e["reached"] = h.reached;
 		e["frames"]  = h.gave;
 		if (!h.note.empty())
@@ -2470,8 +2501,72 @@ static std::string parse_sections(const json & v, std::vector<SectionEntry> & ou
 	return "";
 }
 
+// Digits and nothing else, at least one of them.
+static bool all_digits(const std::string & s)
+{
+	for (size_t i = 0; i < s.size(); i++)
+	{
+		if (s[i] < '0' || s[i] > '9')
+		{
+			return false;
+		}
+	}
+	return !s.empty();
+}
+
+// Seconds as a player writes them: "78.6", "1:18.6", "1:18" — at most one
+// colon, seconds under 60 when there is one, the fraction optional and a digit
+// on both sides of the point when there is one. No sign, no space, nothing
+// before or after (§2). Returns false on anything else.
+static bool parse_clock(const std::string & s, double & out)
+{
+	const size_t      colon = s.find(':');
+	const std::string mins  = colon == std::string::npos ? std::string() : s.substr(0, colon);
+	const std::string secs  = colon == std::string::npos ? s : s.substr(colon + 1);
+	const size_t      dot   = secs.find('.');
+	// A second colon makes the seconds part "2:3", which is not digits either.
+	// The lengths are what keeps the conversions below in range; a cut is at
+	// most CONTEXT frames into the song anyway.
+	if (secs.size() > 24 || mins.size() > 9 ||
+	    (colon != std::string::npos && !all_digits(mins)))
+	{
+		return false;
+	}
+	if (dot == std::string::npos ? !all_digits(secs)
+	                             : !(all_digits(secs.substr(0, dot)) &&
+	                                 all_digits(secs.substr(dot + 1))))
+	{
+		return false;
+	}
+	out = std::atof(secs.c_str());
+	if (colon == std::string::npos)
+	{
+		return true;
+	}
+	if (out >= 60)
+	{
+		return false;
+	}
+	out += (double) std::atoi(mins.c_str()) * 60;
+	return true;
+}
+
+// "at" (§2): a time in the base take's audio, as a number of seconds or as one
+// of the string forms. Returns false on anything else — a JSON type that is
+// neither, a number that is negative or not finite, or a string that is not a
+// clock.
+static bool parse_at(const json & v, double & seconds)
+{
+	if (v.is_number())
+	{
+		seconds = v.get<double>();
+		return std::isfinite(seconds) && seconds >= 0;
+	}
+	return v.is_string() && parse_clock(v.get<std::string>(), seconds);
+}
+
 // The "handover" block (SPEC_HANDOVER §2). Strict like "sections": an entry
-// says where the song changes hands, in one of the two forms, and what takes
+// says where the song changes hands, in one of the three forms, and what takes
 // over, in one of the three. Unknown keys are errors.
 static std::string parse_handover(const json & v, std::vector<HandoverEntry> & out)
 {
@@ -2487,11 +2582,17 @@ static std::string parse_handover(const json & v, std::vector<HandoverEntry> & o
 			return strf("entry %zu is not an object", i + 1);
 		}
 		HandoverEntry h;
+		// Which of the three ways of saying where, and whether the two keys
+		// that belong to a label were written: both are rules of their own, and
+		// a "frame" and an "at" are the same field once parsed.
+		bool key_frame = false;
+		bool key_label = false;
 		for (json::const_iterator it = e.begin(); it != e.end(); ++it)
 		{
 			const std::string & key = it.key();
 			if (key == "frame")
 			{
+				key_frame = true;
 				if (!it.value().is_number_integer() || it.value().get<long long>() < 1 ||
 				    it.value().get<long long>() > CONTEXT)
 				{
@@ -2500,6 +2601,26 @@ static std::string parse_handover(const json & v, std::vector<HandoverEntry> & o
 				}
 				h.frame     = it.value().get<int>();
 				h.has_frame = true;
+			} else if (key == "at") {
+				double seconds = 0;
+				if (!parse_at(it.value(), seconds))
+				{
+					return strf("entry %zu: \"at\" must be a time in the base take's audio — "
+					            "seconds as a number (78.6) or as a string (\"78.6\", "
+					            "\"1:18.6\", \"1:18\")", i + 1);
+				}
+				// Rounded as a double: a number like 1e30 is a finite time, and
+				// no integer holds its frame.
+				const double frame = std::round(seconds * SEMANTIC_FPS);
+				if (frame < 1 || frame > CONTEXT)
+				{
+					return strf("entry %zu: \"at\" is frame %.0f, and a cut must be in "
+					            "[1, %d] — 25 frames = 1 s", i + 1, frame, CONTEXT);
+				}
+				h.frame     = (int) frame;
+				h.has_frame = true;
+				h.has_at    = true;
+				h.at_json   = it.value();
 			} else if (key == "section") {
 				if (!it.value().is_string() || it.value().get<std::string>().empty())
 				{
@@ -2508,6 +2629,7 @@ static std::string parse_handover(const json & v, std::vector<HandoverEntry> & o
 				}
 				h.section = it.value().get<std::string>();
 			} else if (key == "nth") {
+				key_label = true;
 				if (!it.value().is_number_integer() || it.value().get<long long>() < 1 ||
 				    it.value().get<long long>() > SECTIONS_MAX_NTH)
 				{
@@ -2516,6 +2638,7 @@ static std::string parse_handover(const json & v, std::vector<HandoverEntry> & o
 				}
 				h.nth = it.value().get<int>();
 			} else if (key == "lead_frames") {
+				key_label = true;
 				if (!it.value().is_number_integer() || it.value().get<long long>() < 0 ||
 				    it.value().get<long long>() > SECTIONS_MAX_LEAD)
 				{
@@ -2563,18 +2686,38 @@ static std::string parse_handover(const json & v, std::vector<HandoverEntry> & o
 				}
 			} else {
 				return strf("entry %zu: unknown key \"%s\" (section, nth, lead_frames, frame, "
-				            "style, take, seconds, offset)", i + 1, key.c_str());
+				            "at, style, take, seconds, offset)", i + 1, key.c_str());
 			}
 		}
-		if (h.has_frame && !h.section.empty())
+		std::vector<std::string> where;
+		if (!h.section.empty())
 		{
-			return strf("entry %zu: a \"section\" and a \"frame\" are two ways to say where "
-			            "the cut is — name the label or the frame, not both", i + 1);
+			where.push_back("\"section\"");
 		}
-		if (!h.has_frame && h.section.empty())
+		if (key_frame)
 		{
-			return strf("entry %zu needs a \"section\" (with an optional \"nth\") or a "
-			            "\"frame\": where the song changes hands", i + 1);
+			where.push_back("\"frame\"");
+		}
+		if (h.has_at)
+		{
+			where.push_back("\"at\"");
+		}
+		if (where.size() > 1)
+		{
+			return strf("entry %zu: %s and %s are two ways to say where the cut is — "
+			            "name the label, the frame or the time, not both", i + 1,
+			            where[0].c_str(), where[1].c_str());
+		}
+		if (where.empty())
+		{
+			return strf("entry %zu needs a \"section\" (with an optional \"nth\"), a "
+			            "\"frame\" or an \"at\": where the song changes hands", i + 1);
+		}
+		if (key_label && h.section.empty())
+		{
+			return strf("entry %zu: \"nth\" and \"lead_frames\" say which %% label the cut "
+			            "is at — they belong to a \"section\", not to a frame or a time",
+			            i + 1);
 		}
 		if (h.has_style && !h.take.empty())
 		{
@@ -3006,8 +3149,9 @@ static std::string validate_request(const Request & r)
 		// score exists: the entries that name a frame, which are in order among
 		// themselves whatever the labels between them resolve to. The rest is
 		// checked once the base score has been walked (handover_cuts_check).
-		int    prev = 0;
-		size_t at   = 0;
+		int         prev = 0;
+		size_t      at   = 0;
+		std::string where;
 		for (size_t i = 0; i < r.handover.size(); i++)
 		{
 			const HandoverEntry & h = r.handover[i];
@@ -3017,26 +3161,28 @@ static std::string validate_request(const Request & r)
 			}
 			if (prev > 0 && h.frame <= prev)
 			{
-				return strf("\"handover\" entry %zu: frame %d is not after entry %zu's "
-				            "frame %d — entries are in the order the song plays them",
-				            i + 1, h.frame, at, prev);
+				return strf("\"handover\" entry %zu: %s is not after entry %zu's "
+				            "%s — entries are in the order the song plays them",
+				            i + 1, handover_where(h, h.frame).c_str(), at, where.c_str());
 			}
-			prev = h.frame;
-			at   = i + 1;
+			prev  = h.frame;
+			at    = i + 1;
+			where = handover_where(h, h.frame);
 			// The intrusion has to fit before the cut. Against the song that is
 			// arithmetic on the frame alone; against the take it needs the
 			// offset, which only a given one is (§5).
 			const int x = handover_x(h.seconds);
 			if (h.frame - x < 1)
 			{
-				return strf("\"handover\" entry %zu: a cut at frame %d has less than the "
-				            "%d-frame intrusion before it", i + 1, h.frame, x);
+				return strf("\"handover\" entry %zu: a cut at %s has less than the "
+				            "%d-frame intrusion before it", i + 1,
+				            handover_where(h, h.frame).c_str(), x);
 			}
 			if (!h.auto_off && h.frame - x - h.offset < 1)
 			{
-				return strf("\"handover\" entry %zu: a cut at frame %d with a %d-frame "
+				return strf("\"handover\" entry %zu: a cut at %s with a %d-frame "
 				            "intrusion at offset %+d leaves nothing of the take before it",
-				            i + 1, h.frame, x, h.offset);
+				            i + 1, handover_where(h, h.frame).c_str(), x, h.offset);
 			}
 		}
 	} else if (!r.base_take.empty()) {
@@ -5947,16 +6093,17 @@ static std::string handover_preflight(const std::vector<HandoverEntry> & es,
 		}
 		if (h.cut - h.x < 1)
 		{
-			return strf("\"handover\" entry %zu: a cut at frame %d has less than the "
-			            "%d-frame intrusion before it", i + 1, h.cut, h.x);
+			return strf("\"handover\" entry %zu: a cut at %s has less than the "
+			            "%d-frame intrusion before it", i + 1,
+			            handover_where(h, h.cut).c_str(), h.x);
 		}
 		// Least of the take before the intrusion: the smallest offset it could get.
 		const int left = h.cut - h.x + (h.auto_off ? HANDOVER_RANGE : -h.offset);
 		if (left < 1)
 		{
-			return strf("\"handover\" entry %zu: a cut at frame %d with a %d-frame intrusion "
-			            "at offset %+d leaves nothing of the take before it", i + 1, h.cut,
-			            h.x, h.offset);
+			return strf("\"handover\" entry %zu: a cut at %s with a %d-frame intrusion "
+			            "at offset %+d leaves nothing of the take before it", i + 1,
+			            handover_where(h, h.cut).c_str(), h.x, h.offset);
 		}
 		// The frame of the take the cut lands on at the largest offset the entry
 		// could end up with. It is both how far into the take the leg reads and
@@ -5977,10 +6124,10 @@ static std::string handover_preflight(const std::vector<HandoverEntry> & es,
 		const HandoverTake & t = takes[h.idx];
 		if (!t.codes.empty() && deep > (int) t.codes.size())
 		{
-			return strf("\"handover\" entry %zu: %s has %zu frames, and the cut at %d needs "
-			            "frame %d of it%s", i + 1, t.name().c_str(), t.codes.size(), h.cut,
-			            deep, h.auto_off ? " even at the largest offset the scan can pick"
-			                             : "");
+			return strf("\"handover\" entry %zu: %s has %zu frames, and the cut at %s needs "
+			            "frame %d of it%s", i + 1, t.name().c_str(), t.codes.size(),
+			            handover_where(h, h.cut).c_str(), deep,
+			            h.auto_off ? " even at the largest offset the scan can pick" : "");
 		}
 	}
 	return "";
@@ -6257,13 +6404,14 @@ static int run_handover(const ArBatchParams & p, const ArJob & job, JobState & t
 			h.hits      = fit.hits;
 			h.has_z     = true;
 			h.confident = fit.confident;
+			h.measured  = fit.measured;
 			if (!fit.confident)
 			{
-				fprintf(stderr, "warning: \"handover\" entry %zu: the offset of %s at frame "
-				        "%d is %+d, but no lag stands out (z %.1f of %.0f wanted, %d frames "
-				        "agree of %d) — the two takes may not be of one score\n", i + 1,
-				        t.name().c_str(), h.cut, h.offset, fit.z, HANDOVER_MIN_Z, fit.hits,
-				        HANDOVER_MIN_HITS);
+				fprintf(stderr, "warning: \"handover\" entry %zu: no lag of %s stands out at "
+				        "frame %d (the best is %+d, z %.1f of %.0f wanted, %d frames agree of "
+				        "%d) — handing over at offset 0; the two takes may not be of one "
+				        "score\n", i + 1, t.name().c_str(), h.cut, fit.measured, fit.z,
+				        HANDOVER_MIN_Z, fit.hits, HANDOVER_MIN_HITS);
 			}
 		}
 
@@ -6318,9 +6466,12 @@ static int run_handover(const ArBatchParams & p, const ArJob & job, JobState & t
 		prev   = i + 1;
 		printf("handover: leg %zu: frame %d <- %s, offset %+d", i + 1, h.cut, t.name().c_str(),
 		       h.offset);
-		if (h.has_z)
+		if (h.has_z && h.confident)
 		{
 			printf(" (z %.1f, %d frames agree)", h.z, h.hits);
+		} else if (h.has_z) {
+			printf(" (not believed: best %+d, z %.1f, %d frames agree)", h.measured, h.z,
+			       h.hits);
 		}
 		// The leg's own tok/s counts the forced frames as steps (SPEC_KEEP §3);
 		// what this line reports is the frames it sampled, over the same wall

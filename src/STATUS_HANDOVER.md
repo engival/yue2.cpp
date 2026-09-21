@@ -263,3 +263,96 @@ workflow to use when the takes already exist.
 - `tests/regress.sh` was not extended, for the reason stages 7 and 8 give: it
   runs the goldens, and this stage's model tests need takes that live outside
   the repo.
+
+## 5. Follow-up: `"at"` and the offset fallback
+
+Two additions the SPEC gained after the stage was built: a cut said as a **time
+in the base take's audio** (§2 `"at"`), and §4's unbelieved fit **falling back to
+offset 0** instead of being used anyway. Build `build_at/` (same cmake line,
+`-DYUE2_BUILD_TESTS=ON`), Vulkan **device 1** for every model run, `build/yue2`
+(HEAD) as the "vs HEAD" baseline and never rebuilt. `REQ/` below is the
+gitignored `tests/out/at/`, where the requests were written with absolute paths
+to the coordinator's two takes of one score.
+
+### What changed
+
+- `parse_handover` takes `"at"`: a JSON number of seconds, or a string `"78.6"`
+  / `"1:18.6"` / `"1:18"` (`parse_clock`, digits only, at most one colon,
+  seconds < 60 when there is one, a digit on both sides of a point). `frame =
+  llround(seconds * 25)`, no lead. From there the entry **is** a `"frame"`
+  entry — `has_frame` is what it sets — so the ordering rule, the up-front
+  arithmetic and every later check are literally the same code. `has_at` and the
+  value as written ride along for the messages and for `handover.json`.
+- Exactly one of `section` / `frame` / `at`, and `nth` / `lead_frames` only
+  beside a `section` (both new rules, the second of them also for `frame`).
+- `handover_where(entry, frame)` is how an error names where an entry cuts:
+  `frame 1965` as before, or `1:18.6 (frame 1965)` for an entry that wrote an
+  `at`. Used by the ordering check in `validate_request`, `handover_cuts_check`
+  and all of `handover_preflight`.
+- `handover_offset` drops an unbelieved peak for **offset 0** and keeps it in
+  `OffsetFit::measured`; the entry records `confident: false` and `measured`.
+  `offset_scan` is unchanged (it reports what it found), so the fallback is one
+  place. A given integer offset is untouched.
+- `handover.json` gains `at` (verbatim, `null` otherwise) and `measured` (`null`
+  when the offset was believed or given). The warning now says the best lag and
+  that the leg is handed over at 0; the leg's log line prints `(not believed:
+  best +k, z …, N frames agree)` in place of `(z …, N frames agree)`.
+- `HandoverEntry::at` — the label's bar in seconds — is now `bar_seconds`, so
+  `at` means only the request key.
+
+### Acceptance
+
+| # | check | result |
+|---|---|---|
+| 1 | table tests | **PASS** — `yue2-handover` **109 cases** (79 before, 30 new), 0 failures; `yue2-guidance` 133 and `yue2-bars` 71 still pass |
+| 2 | every `at` form and every malformed one of §7 | **PASS** — 26 new request cases (below) |
+| 3 | rounding: `78.6`, `"78.6"`, `"1:18.6"` → frame **1965**, `"1:18"` → **1950** | **PASS** |
+| 4 | the fallback on synthetic streams | **PASS** — 30 unrelated pairs: all `offset 0`, `confident false`, `measured` = the peak the retry scan found; a planted lag is unchanged (offset = measured = +11, confident) |
+| 5 | model: one entry as `"frame": 1965` and as `"at": "1:18.6"`, same takes | **PASS** — `semantic.npy` **byte-identical**, same leg (`offset +1, z 12.6, 37 frames agree`) |
+| 6 | model: a request with no `handover` vs HEAD | **PASS** — `semantic/prefix/abc_tokens.npy` all identical |
+| 7 | model: the handover request (confident offset) vs HEAD | **PASS** — same three files identical |
+| 8 | warning-clean build of our sources | **PASS** — no diagnostic from `src/` or `tests/` |
+| 9 | model, review pass: a 7-entry request whose first cut (frame 415) measures +18 on 2 agreeing frames, against the same request with `"offset": 0` written on that entry | **PASS** — the fallback picked 0 (`measured` 18, `confident` false), the other six offsets were believed, `semantic.npy` **byte-identical** |
+
+Review pass: the `at` frame is rounded as a double, not with `llround` — `1e30` is a finite time and no integer holds its frame (one more table case).
+
+```bash
+cmake -B build_at -S . -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DYUE2_BUILD_TESTS=ON
+nice -n 10 cmake --build build_at -j8
+./build_at/yue2-handover                     # PASS: 109 cases, 0 failures
+
+for n in frame at; do
+  ./build_at/yue2 ar -m yue2-ar-q8_0.gguf --request REQ/one_$n.json \
+      --artifacts REQ/out_$n --gpu 1 --seed 1 --max-semantic 2100
+done
+cmp REQ/out_frame/semantic.npy REQ/out_at/semantic.npy        # identical
+
+for b in build build_at; do
+  ./$b/yue2 ar -m yue2-ar-q8_0.gguf --request REQ/plain.json \
+      --artifacts REQ/reg_${b}_plain --gpu 1 --seed 1 --max-semantic 300
+  ./$b/yue2 ar -m yue2-ar-q8_0.gguf --request REQ/one_frame.json \
+      --artifacts REQ/reg_${b}_hand --gpu 1 --seed 1 --max-semantic 2100
+done                                          # 2 requests x 3 files identical
+```
+
+The two model requests are one entry over a `base_take`, both takes read from
+disk, so the run is a single leg: `--max-semantic 2100` stops it 135 frames past
+the cut, which is all the comparison needs (2.8 s a run).
+
+The 26 request cases: the four accepted forms (`78.6`, `"78.6"`, `"1:18.6"`,
+`"1:18"`) and a whole number; an `at` and a `frame` in order and out of order;
+`0.02` (frame 1, refused by §2's arithmetic, not by the parser); `-1`, `"-5"`,
+`0`, `100000`, `"1:75"`, `"1:2:3"`, `""`, `"abc"`, `"78.6s"`, `" 78.6"`,
+`"1:.6"`, `true`, `[78.6]`; `at` beside `frame`, `at` beside `section`, `nth`
+beside `at`, `lead_frames` beside `at`, and `nth` beside `frame`.
+
+### Deviations
+
+| # | what | why |
+|---|---|---|
+| A1 | `"at"` is resolved to a frame **in the parser**, not at locate time, and sets the same `has_frame` the `"frame"` key does. | §2's "from there on an `at` entry IS a `frame` entry". Resolving it anywhere later would mean two code paths to keep in step for the ordering rule and the up-front checks. |
+| A2 | The string form also rejects `".6"`, `"1."`, `"+5"`, a leading or trailing space, and anything longer than 24 characters of seconds or 9 of minutes. | "nothing else" (§2), read strictly: a point with a digit on both sides or no point at all. The lengths are what keeps `atof`/`atoi` in range; they are far past a song. |
+| A3 | An `at` whose frame falls outside `[1, CONTEXT]` is an `"at"` error (`"at" is frame 0, and a cut must be in [1, 24576]`), not the `"frame"` error. | The reader wrote a time, so the message names the time's frame rather than a key they did not write. `"at": 0.02` rounds to frame **1** and is accepted here — §2's arithmetic then refuses it for having less than the intrusion before it, which is the same answer a `"frame": 1` gets. |
+| A4 | `nth` / `lead_frames` beside a `"frame"` are now an **error**; before this follow-up they were accepted and ignored. | §2's new "`nth` and `lead_frames` only beside `section`" says nothing about which of the two frame forms, and a silently ignored key is what "unknown keys are errors" exists to prevent. |
+| A5 | `measured` is `null` in `handover.json` when the offset was believed or was given. | The H7 idiom: a key that is always there, null when there was nothing to record. |
+| A6 | No model test covers the fallback. | It needs two takes of one score whose tokens do not agree at any lag, which no real pair does — the same reason §4's backstop has none. The 30 synthetic pairs are the test. |

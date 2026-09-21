@@ -411,8 +411,12 @@ recovers into its own style within a bar or two. Chains work (A→B→C→D→A)
   changes first, the singer at the next natural entry. **1 s on a section
   boundary is a hard cut.** The range is 0.2–30.
 - Where: `section` + `nth` exactly as in `sections` (same labels, same
-  `lead_frames`), or `"frame": N` in the base take's own timeline. Cuts must be
-  strictly increasing, and the array is the order the song plays them in.
+  `lead_frames`), `"frame": N` in the base take's own timeline, or `"at"` — the
+  same place as a time in the base take's **audio**, the thing you read off a
+  player: `78.6`, `"78.6"`, `"1:18.6"` or `"1:18"` (25 frames = 1 s, and no lead
+  is subtracted — you already heard where it is). One of the three per entry;
+  `nth` and `lead_frames` belong to a `section`. Cuts must be strictly
+  increasing, and the array is the order the song plays them in.
 - What takes over: `style` (the engine renders that take itself, once per
   distinct style), `take` (an artifacts directory of an earlier render — its
   `score.abc` must be byte-identical to the base score, and its tags are read
@@ -426,10 +430,14 @@ recovers into its own style within a bar or two. Chains work (A→B→C→D→A)
   take is read at its own clock. `"offset"` is how many frames it runs ahead at
   the cut; the default `"auto"` measures it from the tokens (at the right lag two
   takes of one score share 2–3 % *identical* tokens over a 30 s window and next
-  to none at every other lag). `handover.json` records the offset, its z-score
-  and `confident: false` when no lag stood out.
-- `handover.json` also records, per entry, the label and bar it resolved to, the
-  cut frame, which take took over, the intrusion and how many frames of the final
+  to none at every other lag). When no lag stands out the measurement is not
+  used: the leg is handed over at **offset 0** with a warning, and
+  `handover.json` records `confident: false` and `measured` — the lag that was
+  not believed. A lag measured out of noise skips real song; 0 does not. An
+  offset you give as an integer is never second-guessed.
+- `handover.json` also records, per entry, the label and bar it resolved to (or
+  the `at` as you wrote it), the cut
+  frame, which take took over, the intrusion and how many frames of the final
   song that leg contributed. An entry whose label the score never writes, or
   whose cut is past the end of the song, is reported there rather than being an
   error.
