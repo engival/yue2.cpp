@@ -279,6 +279,7 @@ struct Request
 	double      cfg_scale  = 1.0;
 	bool        has_negative = false;             // "negative_style": SPEC_NEGATIVE.md
 	std::string negative_style;                   // the negative branch's [Tags]
+	bool        negative_lyrics = false;          // the negative branch keeps the lyrics (§7)
 	bool        has_guidance = false;             // "guidance": SPEC_GUIDANCE.md
 	std::vector<GuidanceEntry> guidance;
 	bool        has_keep   = false;               // "semantic_keep": SPEC_KEEP.md
@@ -295,6 +296,12 @@ struct Request
 	std::string text() const
 	{
 		return std::string(instruction(cot)) + "\n[Tags]\n" + style + "\n[Lyrics]\n" + lyrics + "\n";
+	}
+
+	// The blank branch of cfg_scale gets a prefix of its own (SPEC_NEGATIVE §3, §7).
+	bool replaces_blank() const
+	{
+		return has_negative || negative_lyrics;
 	}
 };
 
@@ -2173,8 +2180,9 @@ struct Artifacts
 	// traced step, written as guidance_trace.npy. A diagnostic, so it is not in
 	// plan.json and not in the manifest.
 	const std::vector<float> *         trace    = nullptr;
-	// null unless the request carried a "negative_style" and its branch was
-	// built: written as negative_prefix.npy, to be read back with the tokenizer.
+	// null unless the request carried a "negative_style" or "negative_lyrics" and
+	// its branch was built: written as negative_prefix.npy, to be read back with
+	// the tokenizer.
 	// Like the trace it is not in the manifest (SPEC_NEGATIVE §4).
 	const std::vector<llama_token> *   negative = nullptr;
 };
@@ -2260,6 +2268,10 @@ static void write_artifacts(const Artifacts & a)
 		if (a.req->has_negative)
 		{
 			plan["negative_style"] = a.req->negative_style;
+		}
+		if (a.req->negative_lyrics)
+		{
+			plan["negative_lyrics"] = true;
 		}
 		// What of this song came from an earlier render, and enough of a digest
 		// to tell which. The path is deliberately not here: an artifacts
@@ -2893,6 +2905,15 @@ static std::string parse_request_json(const json & root, const std::string & whe
 		req.has_negative   = true;
 		req.negative_style = root["negative_style"].get<std::string>();
 	}
+	if (root.contains("negative_lyrics") && !root["negative_lyrics"].is_null())
+	{
+		if (!root["negative_lyrics"].is_boolean())
+		{
+			return strf("%s: \"negative_lyrics\" must be true, false or null: whether the "
+			            "negative branch sings the song's lyrics", path);
+		}
+		req.negative_lyrics = root["negative_lyrics"].get<bool>();
+	}
 	if (root.contains("guidance") && !root["guidance"].is_null())
 	{
 		const std::string err = parse_guidance(root["guidance"], req.guidance);
@@ -3050,6 +3071,23 @@ static std::string validate_request(const Request & r)
 		if (cfg_scalar(r) == 1.0)
 		{
 			return "\"negative_style\" does nothing at cfg_scale 1: its branch is weighted "
+			       "cfg_scale - 1 = 0; set \"cfg_scale\", e.g. 3";
+		}
+	}
+	// SPEC_NEGATIVE §7.2: the same two rules for the lyrics. false is stage 11
+	// exactly, so only true is checked.
+	if (r.negative_lyrics)
+	{
+		if (r.has_guidance || r.has_sections || r.has_handover)
+		{
+			return strf("\"negative_lyrics\" with %s is not supported: it changes the blank "
+			            "branch of a plain \"cfg_scale\", one mechanism per request",
+			            r.has_guidance ? "\"guidance\""
+			            : r.has_sections ? "\"sections\"" : "\"handover\"");
+		}
+		if (cfg_scalar(r) == 1.0)
+		{
+			return "\"negative_lyrics\" does nothing at cfg_scale 1: its branch is weighted "
 			       "cfg_scale - 1 = 0; set \"cfg_scale\", e.g. 3";
 		}
 	}
@@ -3457,18 +3495,35 @@ static std::vector<llama_token> blank_prefix(const llama_vocab * vocab, const Re
 // SPEC_NEGATIVE §3: the request the negative branch is the prefix of — the
 // positive one with the tags swapped for "negative_style" and no lyrics, so that
 // the lyric push of cfg_scale is kept and the negative style comes on top of it.
+// With "negative_lyrics" (§7) the lyrics stay, so the branch differs from the
+// song in its tags alone; without a "negative_style" those tags are "".
 static Request negative_request(const Request & r)
 {
 	Request out = r;
 	out.style   = r.negative_style;
-	out.lyrics.clear();
+	if (!r.negative_lyrics)
+	{
+		out.lyrics.clear();
+	}
 	return out;
 }
 
+// What the negative branch is, for the log lines (SPEC_NEGATIVE §4, §7.3).
+static std::string negative_label(const Request & r)
+{
+	if (!r.has_negative)
+	{
+		return "an empty style with the song's lyrics";
+	}
+	return strf("negative style \"%s\"%s", r.negative_style.c_str(),
+	            r.negative_lyrics ? " with the song's lyrics" : "");
+}
+
 // The prefix that replaces blank_prefix when the request carries a
-// "negative_style": the positive prefix's own recipe on negative_request, then
-// the positive branch's exact score. cot=off ends the text in [MUSIC_START] with
-// no score, which is what blank_prefix does for that mode.
+// "negative_style" or "negative_lyrics": the positive prefix's own recipe on
+// negative_request, then the positive branch's exact score. cot=off ends the
+// text in [MUSIC_START] with no score, which is what blank_prefix does for that
+// mode.
 static std::vector<llama_token> negative_prefix(const llama_vocab * vocab, const Request & r,
 	const std::vector<llama_token> & abc_ids)
 {
@@ -3560,7 +3615,8 @@ struct JobState
 	std::vector<GuidanceEntry>            guide;
 	std::vector<std::vector<llama_token>> heads;
 	// SPEC_NEGATIVE §4: the prefix that replaced the blank one, for
-	// negative_prefix.npy. Empty unless the request carried a "negative_style".
+	// negative_prefix.npy. Empty unless the request carried a "negative_style"
+	// or "negative_lyrics".
 	std::vector<llama_token>              negative_prefix;
 	int                                   max_branches = 1;   // live sequences at once
 	int                                   guided_steps = 0;
@@ -4017,10 +4073,10 @@ void Runner::guidance_step(Seq & q)
 			b.pos  = prefill_branch(q, b.slot, b.prefix, branch_name(k), b.i_batch);
 			b.live = true;
 			fetch_row(b);
-			if (k == BRANCH_BLANK && js.req.has_negative)
+			if (k == BRANCH_BLANK && js.req.replaces_blank())
 			{
-				printf("%sguidance: negative style \"%s\" (%zu tokens) replaces the blank branch\n",
-				       js.tag.c_str(), js.req.negative_style.c_str(), b.prefix.size());
+				printf("%sguidance: %s (%zu tokens) replaces the blank branch\n",
+				       js.tag.c_str(), negative_label(js.req).c_str(), b.prefix.size());
 			}
 		} else if (!need && b.live) {
 			branch_drop(q, b, "its curve is zero from here on");
@@ -4057,7 +4113,7 @@ void Runner::guidance_enter(Seq & q)
 	}
 	// Both places a blank branch is born — the semantic entry and the end of a
 	// "semantic_keep" prefill — come through here (SPEC_NEGATIVE §3).
-	if (js.req.has_negative)
+	if (js.req.replaces_blank())
 	{
 		js.negative_prefix            = negative_prefix(vocab, js.req, js.abc_ids);
 		q.branch[BRANCH_BLANK].prefix = js.negative_prefix;
@@ -5190,7 +5246,9 @@ void Runner::finish_job(Seq & q)
 			printf("%sguidance trace: %zu rows x %d in guidance_trace.npy (%.3f ms/row)%s\n",
 			       js.tag.c_str(), rows, TRACE_COLUMNS,
 			       rows > 0 ? 1000 * js.trace_seconds / (double) rows : 0,
-			       js.req.has_negative ? "; its blank columns are the negative style's branch" : "");
+			       js.req.replaces_blank()
+			       ? ("; its blank columns are the negative branch: " + negative_label(js.req)).c_str()
+			       : "");
 		}
 	}
 
@@ -5202,7 +5260,8 @@ void Runner::finish_job(Seq & q)
 	r.seed        = js.req.seed;
 	r.cot         = js.req.cot;
 	r.cfg_scale   = js.guidance;
-	r.negative_style = js.req.negative_style;
+	r.negative_style  = js.req.negative_style;
+	r.negative_lyrics = js.req.negative_lyrics;
 	r.card        = card;
 	r.ok          = true;
 	r.is_template = js.is_template;
@@ -5514,7 +5573,7 @@ static int run_ar_dump(const ArParams & p)
 				if (plan[0].has[k] && curve_needed_from(plan[0].curve[k], 0))
 				{
 					feeds.push_back(k != BRANCH_BLANK ? semantic_prefix(prefix_abc, abc_ids)
-					                : req.has_negative ? negative_prefix(vocab, req, abc_ids)
+					                : req.replaces_blank() ? negative_prefix(vocab, req, abc_ids)
 					                : blank_prefix(vocab, req, abc_ids));
 					kinds.push_back(k);
 				}
@@ -5587,11 +5646,11 @@ static int run_ar_dump(const ArParams & p)
 		}
 		printf("prefill: %.3f s, %zu branch%s\n", now_seconds() - t0, rows.size() - 1,
 		       rows.size() == 2 ? "" : "es");
-		if (req.has_negative)
+		if (req.replaces_blank())
 		{
 			// The file keeps its name; there is no metadata beside it to carry
 			// the text, so the log does (SPEC_NEGATIVE §4).
-			printf("dump: the blank row is the negative style \"%s\"\n", req.negative_style.c_str());
+			printf("dump: the blank row is the negative branch: %s\n", negative_label(req).c_str());
 		}
 		save_row_or_die(p.dump_logits, n_vocab, blended.data());
 		for (size_t i = 0; i < rows.size(); i++)
@@ -5830,9 +5889,10 @@ static int ar_decode_jobs(const ArBatchParams & p, const std::vector<ArJob> & jo
 		if (!js.guide.empty())
 		{
 			// [EOD] + the instruction on its own + [ABC_START], which is what
-			// blank_prefix builds; cot=off's is shorter still. A negative style
-			// is a whole head of its own instead (SPEC_NEGATIVE §3).
-			head_max = std::max(head_max, js.req.has_negative
+			// blank_prefix builds; cot=off's is shorter still. A negative branch
+			// is a whole head of its own instead (SPEC_NEGATIVE §3, §7) — with
+			// the song's lyrics, as long as the positive one or longer.
+			head_max = std::max(head_max, js.req.replaces_blank()
 			                    ? prefix_head(vocab, negative_request(js.req).text()).size()
 			                    : tokenize(vocab, instruction(js.req.cot),
 			                               "negative instruction").size() + 2);

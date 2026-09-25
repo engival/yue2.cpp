@@ -96,8 +96,8 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template`, `cfg_scale`, `negative_style`, `guidance`, `sections`, `semantic_keep`,
-`handover` and `base_take` are optional.
+`abc`, `abc_template`, `cfg_scale`, `negative_style`, `negative_lyrics`, `guidance`,
+`sections`, `semantic_keep`, `handover` and `base_take` are optional.
 Lyrics carry `[Section]` tags on
 their own lines:
 
@@ -209,6 +209,26 @@ combine with `guidance`, `sections` or `handover`; it does combine with
 `semantic_keep`. The prefix lands as `negative_prefix.npy` in the artifacts
 directory and the text in `plan.json` / `config.json` (not in `request.json`,
 which stays loadable by the reference).
+
+`"negative_lyrics": true` gives that negative branch the song's own lyrics, so it
+differs from the song in its tags alone and `cfg_scale` pushes along the style
+difference only:
+
+```json
+{ "style": "…", "lyrics": "…", "cfg_scale": 3, "negative_style": "children's song", "negative_lyrics": true }
+{ "style": "…", "lyrics": "…", "cfg_scale": 3, "negative_lyrics": true }
+```
+
+Without it a short negative tag line behaves almost exactly like the blank: both
+branches are mostly "the song without its words". Measured with
+`--guidance-trace` on full songs at `cfg_scale` 3, the mean TV(song, negative)
+was 0.095 for `"children's song, happy"` vs 0.093 for the blank; on a second song
+0.124 vs 0.122, and 0.029 once that negative kept the lyrics. Without a
+`negative_style` the tags are empty (`[Tags]\n\n[Lyrics]`, not the blank's bare
+instruction), so `cfg_scale` amplifies the style tags only. `false` (the default)
+is the stage-11 branch; `true` has the same rules as `negative_style` (a
+`cfg_scale` other than 1, no `guidance` / `sections` / `handover`, fine with
+`semantic_keep`) and is recorded in `config.json` / `plan.json`.
 
 `"guidance"` is the same machinery with time-varying weights and a positive
 prefix that can change part-way through — which is how a song changes band or

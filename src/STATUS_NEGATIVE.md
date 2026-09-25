@@ -230,3 +230,171 @@ semantic steps; the branch is the same one row, only its prefix differs (644 vs
   branch) is rejected, per SPEC §2.
 - No listening test: this stage checks the mechanism, not whether
   "children's song" as a negative is audible.
+
+---
+
+# Stage 11b: `negative_lyrics`
+
+Contract: SPEC_NEGATIVE.md §7. Build `build_negative11b/` (same cmake line as
+above; `YUE2_WARN_FLAGS` clean, the same pre-existing `ggml-backend.h` `-Wshadow`
+only). Baseline for item 1: commit 4bdac91 exported with `git archive` into the
+gitignored `tests/out/neg11_src/` (its `llama.cpp` a symlink to the same
+submodule commit) and built into `build_neg11/`. Every model run is **Vulkan
+device 1 (Arc Pro B70)**, `yue2-ar-q8_0.gguf`, `yue2 ar`; device 0 was not used.
+
+## 0. What it is
+
+```json
+{ "cfg_scale": 3, "negative_style": "children's song", "negative_lyrics": true }
+{ "cfg_scale": 3, "negative_lyrics": true }
+```
+
+`negative_request` keeps the lyrics when the flag is set (tags = `negative_style`,
+or `""` without one); everything else is stage 11's machinery, selected by
+`Request::replaces_blank()` (= `has_negative || negative_lyrics`) where stage 11
+tested `has_negative`: `Runner::guidance_enter`, `run_ar_dump`, the context
+sizing. New: `Request::negative_lyrics` + parsing + the §7.2 rules in
+`validate_request`, `negative_label` (the log wording), `plan.json["negative_lyrics"]`
+(only when true), `ArResult::negative_lyrics` → `config.json["negative_lyrics"]`
+(always, true/false).
+
+## 1. Requests
+
+In the gitignored `tests/out/neg11b/`. `short`, `ext`, `ext_cfg3`, `off`, `neg`
+are stage 11's (§1 above). New: `neg_false` / `ext_cfg3_false` (`"negative_lyrics":
+false` added), `neglyr` (`neg` + true), `nostyle` (`ext_cfg3` + true, no style),
+`self` (`ext_cfg3` + `negative_style` = its own `style` + true), `off_lyr` /
+`off_neglyr` (cot=off at the 1.01 default), `keep_lyr` / `keep_neglyr` (+
+`semantic_keep` 64 frames of stage 11's `R/semantic.npy`), `err/*.json`. For
+item 4, `full_blank` / `full_neg` / `full_neglyr`: an original seven-section
+lullaby lyric (three verses, three choruses, a bridge, an outro), an orchestral
+storybook-lullaby style, `cot: full`, seed 11, `cfg_scale` 3; identical apart from
+`"negative_style": "children's song, happy"` and `"negative_lyrics": true`.
+
+## 2. Acceptance
+
+| # | check | result |
+|---|---|---|
+| 1 | untouched: absent / `false` vs `build_neg11/yue2` | **PASS** — `short`, `ext`, `ext_cfg3`, `off`, `neg` and `neg_false` / `ext_cfg3_false` (vs `neg` / `ext_cfg3`): `prefix.npy`, `abc_tokens.npy`, `semantic.npy`, `negative_prefix.npy` all identical; `ext_cfg3_false` writes no `negative_prefix.npy`, `neg_false`'s `plan.json` has no `negative_lyrics` |
+| 2 | recipe: negative = own style + lyrics | **PASS** — `negative_prefix.npy` == `prefix.npy` (692 tokens); `--dump-logits` blank row == primary row and blended == primary, max abs Δ 0.0 |
+| 3 | recipe: no `negative_style` | **PASS** — equals the reference's `protocol.token_prefixes(SongRequest(style="", lyrics=<same>, …))` (the reference accepts an empty style); text reads `…[Tags]\n\n[Lyrics]\n[Verse]\n…`; text tokens = one-call encode; score segment = the positive one's (612 tokens) |
+| 4 | full song, three runs | **PASS** (lyrics-kept clearly lower) — table below |
+| 5a | determinism | **PASS** — `neglyr` twice (+ a third with `--verify-sampler --guidance-trace`): `semantic.npy` identical; `prefix`/`abc_tokens`/`negative_prefix` identical |
+| 5b | `--verify-sampler` | **PASS** — 300 sampling steps matched the stage-5 sampler |
+| 5c | `semantic_keep` + `negative_lyrics` | **PASS** — `keep_lyr`, `keep_neglyr`: first 64 codes equal the file; branch born at step 64 |
+| 5d | §7.2 errors, CLI + `yue2-guidance` | **PASS** — 8 at the CLI, before the model loads; `yue2-guidance` 155 → **183** checks, 0 failures |
+
+`yue2-bars` PASS (71), `yue2-handover` PASS (109). `yue2 song` end to end on
+`nostyle.json` (`--gpu 1`, Opus): rc 0; `config.json` has `"cfg_scale": 3.0,
+"negative_style": null, "negative_lyrics": true`; `negative_prefix.npy` present;
+`request.json` carries neither key.
+
+### 1 — untouched
+
+```bash
+D=tests/out/neg11b
+for r in short ext ext_cfg3 off neg; do
+  nice -n 10 build_neg11/yue2 ar -m yue2-ar-q8_0.gguf --request $D/$r.json \
+      --artifacts $D/base_$r --gpu 1 --max-semantic 300
+done
+for r in short ext ext_cfg3 off neg neg_false ext_cfg3_false; do
+  nice -n 10 build_negative11b/yue2 ar -m yue2-ar-q8_0.gguf --request $D/$r.json \
+      --artifacts $D/new_$r --gpu 1 --max-semantic 300
+done
+# cmp base_X vs new_X (and base_neg vs new_neg_false, base_ext_cfg3 vs new_ext_cfg3_false)
+```
+
+### 2, 3 — the recipe
+
+```bash
+B="nice -n 10 build_negative11b/yue2 ar -m yue2-ar-q8_0.gguf --gpu 1"
+for r in self nostyle neglyr off_lyr off_neglyr; do $B --request $D/$r.json --artifacts $D/$r --max-semantic 300; done
+for r in self ext_cfg3 nostyle neglyr; do $B --request $D/$r.json --dump-logits $D/dump_$r.npy; done
+```
+
+Checked against `YuE2TextTokenizer` + `protocol` (CPU, a scratch script outside
+the repo):
+
+| request | negative tokens | == reference | text = one-call encode | score segment = positive |
+|---|---|---|---|---|
+| `self` | 692 (== `prefix.npy`) | yes | yes | yes |
+| `nostyle` | 676 | yes (`token_prefixes`, `style=""`) | yes | yes |
+| `neglyr` | 680 | yes | yes | yes |
+| `off_lyr` | 55 | yes (`[EOD]` + text + `[MUSIC_START]`, N7) | yes | — (no score) |
+| `off_neglyr` | 59 | yes (same form) | yes | — |
+
+`--dump-logits` over the 32 769 semantic ids: `nostyle` / `neglyr` primary rows
+bit-identical to `ext_cfg3`'s; branch rows differ from the blank by max abs 1.27 /
+1.71; blended == `P + 2(P − N)` recomputed in float32 exactly. `semantic.npy`
+vs the lyric-less `neg`: `neglyr` first differs at frame 3 (296/300 differ);
+`nostyle` vs `ext_cfg3` at frame 3.
+
+`self` sampled with `--guidance-trace` has TV(song, negative) = 0 and TV(blend)
+= 0 at all 300 steps (the blend moved nothing), yet its `semantic.npy` differs
+from the unguided `ext` from frame 1: the positive row of a two-stream guided
+context is not bit-identical to the single-stream decode on this backend (the
+batch shape changes the kernels). Not a recipe difference; noted, not chased.
+
+### 4 — the point of the stage
+
+```bash
+for r in full_blank full_neg full_neglyr; do
+  nice -n 10 build_negative11b/yue2 ar -m yue2-ar-q8_0.gguf --gpu 1 \
+      --request $D/$r.json --artifacts $D/$r --guidance-trace
+done
+```
+
+All three wrote the same score: `abc_tokens.npy` (1458 ids), `score.abc` and
+`prefix.npy` identical. ~59 s semantic each; 4808 / 4747 / 4738 codes (~190 s).
+`semantic.npy` differs from frame 0 (blank vs either negative) and frame 2
+(the two negatives). Mean of trace col 4 (TV(song, negative)) / col 6 (TV of the
+blend), weight 2 throughout:
+
+| window | blank | negative, no lyrics | negative + lyrics |
+|---|---|---|---|
+| **whole song** | **0.1216 / 0.1893** | **0.1238 / 0.1927** | **0.0292 / 0.0584** |
+| 0–30 s | 0.1360 / 0.2012 | 0.1412 / 0.2229 | 0.0538 / 0.1065 |
+| 30–60 s | 0.1724 / 0.2471 | 0.1676 / 0.2430 | 0.0354 / 0.0715 |
+| 60–90 s | 0.1188 / 0.1915 | 0.1198 / 0.1848 | 0.0227 / 0.0460 |
+| 90–120 s | 0.0976 / 0.1683 | 0.1034 / 0.1759 | 0.0253 / 0.0507 |
+| 120–150 s | 0.1637 / 0.2377 | 0.1676 / 0.2380 | 0.0221 / 0.0442 |
+| 150–180 s | 0.0637 / 0.1204 | 0.0646 / 0.1221 | 0.0187 / 0.0373 |
+| 180–end | 0.0664 / 0.1157 | 0.0579 / 0.1012 | 0.0200 / 0.0402 |
+
+The §7.1 finding reproduces on a second song: the lyric-less negative sits as far
+from the song as the blank (0.124 vs 0.122, window by window). With the lyrics
+kept, the negative is about 4× closer (0.029), so at the same weight the blend
+moves the sampler about a third as much (col 6 0.058 vs 0.19) — and what it
+moves is the tag difference alone. Equal *push* to the lyric-less negative would
+need a larger `cfg_scale`; not measured, and no listening test was done.
+
+### 5 — errors
+
+```
+nocfg     "negative_lyrics" does nothing at cfg_scale 1: its branch is weighted cfg_scale - 1 = 0; set "cfg_scale", e.g. 3
+cfg1      (the same, explicit 1.0)
+off_cfg1  (the same, cot=off with "cfg_scale": 1.0)
+str       "negative_lyrics" must be true, false or null: whether the negative branch sings the song's lyrics
+num       (the same, for 1)
+guid      "negative_lyrics" with "guidance" is not supported: it changes the blank branch of a plain "cfg_scale", one mechanism per request
+sect      "negative_lyrics" with "sections" is not supported: …
+hand      "negative_lyrics" with "handover" is not supported: …
+```
+
+`tests/guidance.cpp`: 16 request cases (accepted: both §7.2 examples, cot=off's
+1.01, keep + cfg + true, `false` with no cfg, `null`, `false` beside a negative
+style, `false` beside a guidance block; rejected: the eight above), 2 plan cases
+(true leaves `cfg_scale`'s plan; false alone asks for no branch), and
+`negative_request` / `negative_label` / `replaces_blank` checks (with lyrics,
+without a style, own style = `text()` exactly, false = blank).
+
+## 3. Deviations (11b)
+
+| # | what | why |
+|---|---|---|
+| L1 | The non-boolean error is in `parse_request_json`. | As N1: `Request` holds a `bool`; still before any GPU work and covered by `yue2-guidance`. |
+| L2 | `config.json["negative_lyrics"]` is always written (`false` when absent); `"negative_style"` stays `null` for an empty-tags negative. | §7.3 wording ("true\|false"); `negative_style` records the request's key, not the branch's tags. |
+| L3 | The trace and `--dump-logits` log lines changed wording for the stage-11 case too: `…its blank columns are the negative branch: negative style "X"` / `dump: the blank row is the negative branch: negative style "X"`. The `guidance: negative style "X" (P tokens) replaces the blank branch` line is unchanged. | One label function for the three forms of §7.3; logs are not compared. |
+| L4 | cot=off + `negative_lyrics`: `[EOD]` + text + `[MUSIC_START]` (stage 11's N7 form), not `token_prefixes` of the swapped request. | §7.2 "same text rule, then `[MUSIC_START]`, as §3". |
+| L5 | `"negative_lyrics": false` is accepted beside `guidance` / `sections` / `handover` and with no `cfg_scale`. | §7.2 "false is always accepted and changes nothing". |
+| L6 | README cites the §7.1 numbers and this stage's second-song numbers together. | §7.1's render is not in the public tree; both are labelled. |

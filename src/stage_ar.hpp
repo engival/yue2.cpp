@@ -115,6 +115,7 @@ struct ArResult
 	std::string          cot;
 	double               cfg_scale = 1.0;
 	std::string          negative_style;      // "" unless the request carried one (SPEC_NEGATIVE)
+	bool                 negative_lyrics = false; // the negative branch sang the lyrics (§7)
 	std::string          card;          // ggml device description
 	bool                 ok        = false;   // false until the job's artifacts are on disk
 	std::string          error;               // why not, when ok == false

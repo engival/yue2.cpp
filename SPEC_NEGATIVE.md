@@ -110,3 +110,70 @@ select between them at the two call sites that build `BRANCH_BLANK`'s prefix
 - Report: `src/STATUS_NEGATIVE.md` (results table, exact commands, deviations).
   README: document `negative_style` next to `cfg_scale`, one example.
   `docs/ROADMAP.md`: one Done line (stage 11).
+
+## 7. Stage 11b — `negative_lyrics`
+
+### 7.1 Why
+
+Measured on a real render (cfg 3, same seed and score, traced on the AMD): the stage-11
+negative `"children's song, happy"` with no lyrics disagreed with the song exactly as much
+as the blank did (mean TV(song, negative) 0.095 vs 0.093, the same in every 30 s window).
+Without lyrics, a short tag line is nearly indistinguishable from no tags: both branches
+mostly measure "the song without its words". To push along the *style* difference alone,
+the negative must carry the same lyrics.
+
+### 7.2 Request
+
+```json
+{ "cfg_scale": 3, "negative_style": "children's song", "negative_lyrics": true }
+{ "cfg_scale": 3, "negative_lyrics": true }
+```
+
+- `negative_lyrics`: boolean, default `false` (= stage 11 exactly). `null` = absent.
+- `true`: the negative prefix is built exactly as in §3 but with the request's own
+  lyrics instead of `""`:
+  `negative_request` = the positive request with `style = negative_style` (or `""` when
+  `negative_style` is absent) and the lyrics **unchanged**.
+- `negative_lyrics: true` without `negative_style` is allowed: tags `""`, same lyrics,
+  so `cfg_scale` amplifies the style tags only. The text is still the full
+  `text()` recipe (`[Tags]\n` followed directly by `\n[Lyrics]`), not the blank.
+- Errors (exact, tested, in `validate_request` / `parse_request_json` as in §2):
+  non-boolean; `true` at an effective `cfg_scale` of 1; `true` beside `guidance`,
+  `sections` or `handover`. `false` is always accepted and changes nothing.
+- `cot: "off"`: same text rule, then `[MUSIC_START]`, as §3.
+- `semantic_keep`: allowed, same as §2.
+
+### 7.3 Artifacts
+
+- `negative_prefix.npy` is written whenever the negative is not the blank (either key).
+- `config.json`: `"negative_lyrics": true|false` beside `"negative_style"`. `plan.json`:
+  only when `true`. Not in the engine's `request.json` (reference-loadable).
+- The log line of §4 says which: `… negative style "<text>" with the song's lyrics …` /
+  `… an empty style with the song's lyrics …`.
+
+### 7.4 Acceptance (Arc or CPU only, never device 0)
+
+1. Untouched: no `negative_lyrics` (or `false`) → `prefix.npy`, `abc_tokens.npy`,
+   `semantic.npy`, `negative_prefix.npy` byte-identical to the stage-11 binary
+   (commit 4bdac91; build it into `build_neg11/` from a `git worktree` or `git show`
+   export, don't touch `build/`) for unguided, `cfg_scale 3`, and `cfg_scale 3` +
+   `negative_style`.
+2. Recipe: with `negative_lyrics: true` and `negative_style` equal to the request's
+   own `style`, `negative_prefix.npy` equals `prefix.npy` exactly, and
+   `--dump-logits`' blended first row equals the positive row (`B + 2·(B − B)`).
+3. Recipe: with `negative_style` absent, decode `negative_prefix.npy` and show the
+   text reads `…[Tags]\n\n[Lyrics]\n<lyrics>…`, and its tokens equal the reference's
+   `protocol.token_prefixes(style="", lyrics=<same>)` if the reference accepts an
+   empty style (say so if it doesn't).
+4. The point of the stage: same request as the 7.1 measurement (cfg 3, a real
+   multi-verse lyric, seed fixed, `--guidance-trace`, a full song via the AR only):
+   three runs on the Arc — blank, `negative_style` without lyrics, `negative_style`
+   with lyrics. Report mean TV(song, negative) (trace col 4) and col 6 for each, whole
+   song and per 30 s window. Expected: the lyrics-kept one clearly lower than the other
+   two. Report whatever it is.
+5. Determinism, `--verify-sampler`, `semantic_keep` + `negative_lyrics` (first N codes
+   equal, branch born at N), every §7.2 error at the CLI and in `yue2-guidance`.
+
+Rules: §6, with `build_negative11b/` as the build dir. Report: a "Stage 11b" section in
+`src/STATUS_NEGATIVE.md`. README: `negative_lyrics` next to `negative_style`, and one
+sentence on why a negative without lyrics behaves like the blank (the 7.1 numbers).

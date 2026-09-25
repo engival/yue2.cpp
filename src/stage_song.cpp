@@ -297,6 +297,7 @@ void write_config(const std::string & dir, const BatchParams & p, const ArResult
 	cfg["cot"]             = ar.cot;
 	cfg["cfg_scale"]       = ar.cfg_scale;
 	cfg["negative_style"]  = ar.negative_style.empty() ? json(nullptr) : json(ar.negative_style);
+	cfg["negative_lyrics"] = ar.negative_lyrics;
 	cfg["seed"]            = ar.seed;
 	cfg["backend"]         = "yue2.cpp";
 	cfg["ar_gguf"]         = p.ar_model;

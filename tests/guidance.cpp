@@ -2,8 +2,9 @@
 // the "needed at or after t" rule that decides when a branch is decoded, and for
 // every request error of §2.3/§2.4 — plus SPEC_KEEP §5.7's file-free half, the
 // "semantic_keep" rules that are decided without opening the file, and
-// SPEC_NEGATIVE §5.8's "negative_style" errors and prefix text. None of it
-// touches llama, a model or a device, so this runs anywhere.
+// SPEC_NEGATIVE §2's "negative_style" and §7's "negative_lyrics" errors and
+// prefix text. None of it touches llama, a model or a device, so this runs
+// anywhere.
 //
 // Like tests/bars.cpp it *includes* stage_ar.cpp rather than linking it: the
 // functions under test live in that file's anonymous namespace, and including
@@ -610,6 +611,45 @@ const RequestCase REQUEST_CASES[] =
 	{ "\"cfg_scale\": 3, \"negative_style\": \"children's song\", "
 	  "\"abc_template\": \"X:1\\nK:C\\n%%yue2-gen bars=4\\n\"",
 	  "not supported yet",     "a template is already out with cfg_scale" },
+
+	// --- "negative_lyrics", SPEC_NEGATIVE §7.2 -----------------------------
+	{ "\"cfg_scale\": 3, \"negative_style\": \"children's song\", \"negative_lyrics\": true",
+	  nullptr,                 "the first example of SPEC_NEGATIVE §7.2" },
+	{ "\"cfg_scale\": 3, \"negative_lyrics\": true", nullptr,
+	  "no negative style: empty tags, the same lyrics" },
+	{ "\"cot\": \"off\", \"negative_lyrics\": true", nullptr,
+	  "cot=off's 1.01 default counts here too" },
+	{ KEEP_ABC ", \"cfg_scale\": 3, \"negative_lyrics\": true, "
+	  "\"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}", nullptr,
+	  "a lyric-carrying negative branch born at step N" },
+	{ "\"negative_lyrics\": false",                                   nullptr,
+	  "false is stage 11 exactly, even with no cfg_scale" },
+	{ "\"negative_lyrics\": null",                                    nullptr,
+	  "null is absent" },
+	{ "\"cfg_scale\": 3, \"negative_style\": \"children's song\", \"negative_lyrics\": false",
+	  nullptr,                 "false beside a negative style is the stage-11 branch" },
+	{ "\"guidance\": [{\"frame\": 0, \"against\": {\"blank\": [[0, 2]]}}], "
+	  "\"negative_lyrics\": false",
+	  nullptr,                 "false beside a guidance block changes nothing" },
+	{ "\"negative_lyrics\": true",
+	  "\"negative_lyrics\" does nothing at cfg_scale 1", "no cfg_scale: the branch would weigh 0" },
+	{ "\"cfg_scale\": 1.0, \"negative_lyrics\": true",
+	  "\"negative_lyrics\" does nothing at cfg_scale 1", "an explicit cfg_scale of 1" },
+	{ "\"cot\": \"off\", \"cfg_scale\": 1.0, \"negative_lyrics\": true",
+	  "\"negative_lyrics\" does nothing at cfg_scale 1", "cot=off with its 1.01 turned off again" },
+	{ "\"cfg_scale\": 3, \"negative_lyrics\": \"true\"",
+	  "\"negative_lyrics\" must be true, false or null", "a string that reads true" },
+	{ "\"cfg_scale\": 3, \"negative_lyrics\": 1",
+	  "\"negative_lyrics\" must be true, false or null", "a number for a flag" },
+	{ "\"guidance\": [{\"frame\": 0, \"against\": {\"blank\": [[0, 2]]}}], "
+	  "\"negative_lyrics\": true",
+	  "\"negative_lyrics\" with \"guidance\" is not supported", "beside a guidance block" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"negative_lyrics\": true",
+	  "\"negative_lyrics\" with \"sections\" is not supported", "beside a sections block" },
+	{ "\"handover\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}], "
+	  "\"negative_lyrics\": true",
+	  "\"negative_lyrics\" with \"handover\" is not supported", "beside a handover" },
 };
 
 void run_requests()
@@ -669,6 +709,10 @@ const PlanCase PLAN_CASES[] =
 	  "a negative style changes the branch's prefix, not its plan" },
 	{ "\"cot\": \"off\", \"negative_style\": \"children's song\"", 1, 0.01, 1.01,
 	  "and rides cot=off's 1.01 the same way" },
+	{ "\"cfg_scale\": 3, \"negative_lyrics\": true", 1, 2, 3.0,
+	  "negative_lyrics changes the branch's prefix, not its plan" },
+	{ "\"negative_lyrics\": false", 0, 0, 1.0,
+	  "and false alone asks for no branch at all" },
 };
 
 void run_plans()
@@ -712,27 +756,84 @@ void run_plans()
 // SPEC_NEGATIVE §3: the negative branch is the positive recipe with the tags
 // swapped and the lyrics empty; everything else (cot, score) is the request's.
 // The tokens need the vocab, so the model-side half is in STATUS_NEGATIVE.md.
-void run_negative()
+// An accepted request built from `extra`, or false with the failure counted.
+bool accepted_request(const char * what, const std::string & extra, Request & req)
 {
-	Request     req;
-	std::string err = parse_request_json(json::parse(request_with(
-		"\"cfg_scale\": 3, \"cot\": \"melody\", \"negative_style\": \"children's song\"")), "R", req);
+	std::string err = parse_request_json(json::parse(request_with(extra)), "R", req);
 	if (err.empty())
 	{
 		err = validate_request(req);
 	}
 	if (!err.empty())
 	{
-		check(false, "negative_request", err, "an accepted request");
-		return;
+		check(false, what, err, "an accepted request");
+		return false;
 	}
-	const Request     neg  = negative_request(req);
-	const std::string want = std::string(instruction("melody")) +
-	                         "\n[Tags]\nchildren's song\n[Lyrics]\n\n";
-	check(neg.text() == want, "negative_request text", neg.text(), want);
-	check(neg.cot == req.cot && neg.cfg_scale == req.cfg_scale && req.lyrics != "" &&
-	      req.style == "slow waltz, upright bass", "negative_request copy",
-	      "cot " + neg.cot + ", style " + req.style, "the request itself untouched");
+	return true;
+}
+
+void run_negative()
+{
+	Request req;
+	if (accepted_request("negative_request", "\"cfg_scale\": 3, \"cot\": \"melody\", "
+	                     "\"negative_style\": \"children's song\"", req))
+	{
+		const Request     neg  = negative_request(req);
+		const std::string want = std::string(instruction("melody")) +
+		                         "\n[Tags]\nchildren's song\n[Lyrics]\n\n";
+		check(neg.text() == want, "negative_request text", neg.text(), want);
+		check(neg.cot == req.cot && neg.cfg_scale == req.cfg_scale && req.lyrics != "" &&
+		      req.style == "slow waltz, upright bass", "negative_request copy",
+		      "cot " + neg.cot + ", style " + req.style, "the request itself untouched");
+		check(negative_label(req) == "negative style \"children's song\"", "negative_label(style)",
+		      negative_label(req), "the stage-11 wording");
+	}
+
+	// SPEC_NEGATIVE §7.2: "negative_lyrics" keeps the song's lyrics, so the text
+	// is the positive one with the tags swapped...
+	Request lyr;
+	if (accepted_request("negative_request(lyrics)", "\"cfg_scale\": 3, \"cot\": \"melody\", "
+	                     "\"negative_style\": \"children's song\", \"negative_lyrics\": true", lyr))
+	{
+		const std::string want = std::string(instruction("melody")) +
+		                         "\n[Tags]\nchildren's song\n[Lyrics]\n[Verse]\nrain on the tin\n\n";
+		check(negative_request(lyr).text() == want, "negative_request text(lyrics)",
+		      negative_request(lyr).text(), want);
+		check(lyr.replaces_blank(), "replaces_blank(lyrics)", "blank", "a negative branch");
+		check(negative_label(lyr) == "negative style \"children's song\" with the song's lyrics",
+		      "negative_label(lyrics)", negative_label(lyr), "the style, with the lyrics");
+	}
+
+	// ... with no negative style, empty tags — still the whole text() recipe,
+	// not the blank's bare instruction ...
+	Request tags;
+	if (accepted_request("negative_request(no style)", "\"cfg_scale\": 3, \"negative_lyrics\": true", tags))
+	{
+		const std::string want = std::string(instruction("full")) +
+		                         "\n[Tags]\n\n[Lyrics]\n[Verse]\nrain on the tin\n\n";
+		check(negative_request(tags).text() == want, "negative_request text(no style)",
+		      negative_request(tags).text(), want);
+		check(negative_label(tags) == "an empty style with the song's lyrics",
+		      "negative_label(no style)", negative_label(tags), "an empty style");
+	}
+
+	// ... and with the song's own style as the negative, it is the song itself
+	// (SPEC_NEGATIVE §7.4 item 2's model-side check rests on this).
+	Request self;
+	if (accepted_request("negative_request(self)", "\"cfg_scale\": 3, \"negative_style\": "
+	                     "\"slow waltz, upright bass\", \"negative_lyrics\": true", self))
+	{
+		check(negative_request(self).text() == self.text(), "negative_request text(self)",
+		      negative_request(self).text(), self.text());
+	}
+
+	// false, or absent, is stage 11: no branch of its own without a style.
+	Request off;
+	if (accepted_request("negative_lyrics(false)", "\"cfg_scale\": 3, \"negative_lyrics\": false", off))
+	{
+		check(!off.replaces_blank(), "replaces_blank(false)",
+		      off.replaces_blank() ? "a negative branch" : "blank", "blank");
+	}
 }
 
 } // namespace
