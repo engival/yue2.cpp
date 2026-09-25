@@ -114,6 +114,7 @@ struct ArResult
 	uint64_t             seed = 0;      // the seed this run actually used
 	std::string          cot;
 	double               cfg_scale = 1.0;
+	std::string          negative_style;      // "" unless the request carried one (SPEC_NEGATIVE)
 	std::string          card;          // ggml device description
 	bool                 ok        = false;   // false until the job's artifacts are on disk
 	std::string          error;               // why not, when ok == false

@@ -49,6 +49,12 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   `convert_nar.py --lora` bakes a keeper. A run without the flag is bit-identical
   to stage 9. The AR half (libllama adapters) is not done. Numbers in
   [src/STATUS_LORA.md](../src/STATUS_LORA.md).
+- Stage 11: `negative_style` — a negative prompt for `cfg_scale`. The text
+  replaces the blank branch's prefix (the positive recipe with those tags and no
+  lyrics, then the same score), so the song is pushed away from it as well as
+  towards its own tags and lyrics; weight, blend and sampler are unchanged, and a
+  request without it is bit-identical to stage 10. Numbers in
+  [src/STATUS_NEGATIVE.md](../src/STATUS_NEGATIVE.md).
 - The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
   Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
   exact) indistinguishable, and on the AMD the exact path is not faster — so

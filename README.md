@@ -96,7 +96,7 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template`, `cfg_scale`, `guidance`, `sections`, `semantic_keep`,
+`abc`, `abc_template`, `cfg_scale`, `negative_style`, `guidance`, `sections`, `semantic_keep`,
 `handover` and `base_take` are optional.
 Lyrics carry `[Section]` tags on
 their own lines:
@@ -192,6 +192,23 @@ else: one negative branch holding the instruction and the exact score but no tag
 and no lyrics, at the constant weight `c - 1`, for the whole phase. (`cot: "off"`
 defaults to `1.01`, as the reference does; say `"cfg_scale": 1.0` for the plain
 single-sequence decode.)
+
+`"negative_style"` turns that blank branch into a negative prompt: its text
+replaces the branch's (empty) tags, so the song is pushed away from what you
+describe as well as towards its own tags and lyrics.
+
+```json
+{ "style": "…", "lyrics": "…", "cfg_scale": 3, "negative_style": "children's song" }
+```
+
+The negative branch is the positive prefix's recipe with those tags and **no
+lyrics** (the blank has none either, so `cfg_scale`'s push towards the words is
+kept), then the same score; the weight is still `c - 1`. It needs a `cfg_scale`
+other than 1 (`cot: "off"`'s 1.01 counts), must be non-empty text, and does not
+combine with `guidance`, `sections` or `handover`; it does combine with
+`semantic_keep`. The prefix lands as `negative_prefix.npy` in the artifacts
+directory and the text in `plan.json` / `config.json` (not in `request.json`,
+which stays loadable by the reference).
 
 `"guidance"` is the same machinery with time-varying weights and a positive
 prefix that can change part-way through — which is how a song changes band or

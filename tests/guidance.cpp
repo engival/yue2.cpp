@@ -1,7 +1,8 @@
 // yue2-guidance — SPEC_GUIDANCE.md §5.8: table tests for the weight curves, for
 // the "needed at or after t" rule that decides when a branch is decoded, and for
 // every request error of §2.3/§2.4 — plus SPEC_KEEP §5.7's file-free half, the
-// "semantic_keep" rules that are decided without opening the file. None of it
+// "semantic_keep" rules that are decided without opening the file, and
+// SPEC_NEGATIVE §5.8's "negative_style" errors and prefix text. None of it
 // touches llama, a model or a device, so this runs anywhere.
 //
 // Like tests/bars.cpp it *includes* stage_ar.cpp rather than linking it: the
@@ -570,6 +571,45 @@ const RequestCase REQUEST_CASES[] =
 	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
 	  KEEP_ABC ", \"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}",
 	  nullptr,                 "sections beside a semantic_keep (the frames are the score's)" },
+
+	// --- "negative_style", SPEC_NEGATIVE §2 --------------------------------
+	{ "\"cfg_scale\": 3, \"negative_style\": \"children's song\"", nullptr,
+	  "the worked example of SPEC_NEGATIVE §2" },
+	{ "\"cot\": \"off\", \"negative_style\": \"children's song\"", nullptr,
+	  "cot=off's 1.01 default counts as a cfg_scale" },
+	{ "\"cfg_scale\": 0.5, \"negative_style\": \"children's song\"", nullptr,
+	  "a cfg_scale below 1 carries a weight too (pulled towards the style)" },
+	{ "\"negative_style\": null",                                     nullptr,
+	  "null is today's blank branch" },
+	{ KEEP_ABC ", \"cfg_scale\": 3, \"negative_style\": \"children's song\", "
+	  "\"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}", nullptr,
+	  "a negative branch born at step N" },
+	{ "\"negative_style\": \"children's song\"",
+	  "does nothing at cfg_scale 1", "no cfg_scale: the branch would weigh 0" },
+	{ "\"cfg_scale\": 1.0, \"negative_style\": \"children's song\"",
+	  "does nothing at cfg_scale 1", "an explicit cfg_scale of 1" },
+	{ "\"cot\": \"off\", \"cfg_scale\": 1.0, \"negative_style\": \"children's song\"",
+	  "does nothing at cfg_scale 1", "cot=off with its 1.01 turned off again" },
+	{ "\"cfg_scale\": 3, \"negative_style\": \"\"",
+	  "must be non-empty text", "an empty negative style" },
+	{ "\"cfg_scale\": 3, \"negative_style\": \" \\n\\t \"",
+	  "must be non-empty text", "whitespace only" },
+	{ "\"cfg_scale\": 3, \"negative_style\": 7",
+	  "\"negative_style\" must be a string", "a negative style that is not text" },
+	{ "\"cfg_scale\": 3, \"negative_style\": [\"children's song\"]",
+	  "\"negative_style\" must be a string", "a list of tags instead of the text" },
+	{ "\"guidance\": [{\"frame\": 0, \"against\": {\"blank\": [[0, 2]]}}], "
+	  "\"negative_style\": \"children's song\"",
+	  "\"negative_style\" with \"guidance\" is not supported", "beside a guidance block" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"negative_style\": \"children's song\"",
+	  "\"negative_style\" with \"sections\" is not supported", "beside a sections block" },
+	{ "\"handover\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}], "
+	  "\"negative_style\": \"children's song\"",
+	  "\"negative_style\" with \"handover\" is not supported", "beside a handover" },
+	{ "\"cfg_scale\": 3, \"negative_style\": \"children's song\", "
+	  "\"abc_template\": \"X:1\\nK:C\\n%%yue2-gen bars=4\\n\"",
+	  "not supported yet",     "a template is already out with cfg_scale" },
 };
 
 void run_requests()
@@ -625,6 +665,10 @@ const PlanCase PLAN_CASES[] =
 	  "and asking for 1.0 turns it off again" },
 	{ "\"guidance\": [{\"frame\": 0, \"against\": {\"blank\": [[0, 2]]}}]", 1, 2, 1.0,
 	  "a guidance block leaves cfg_scale at 1" },
+	{ "\"cfg_scale\": 3, \"negative_style\": \"children's song\"", 1, 2, 3.0,
+	  "a negative style changes the branch's prefix, not its plan" },
+	{ "\"cot\": \"off\", \"negative_style\": \"children's song\"", 1, 0.01, 1.01,
+	  "and rides cot=off's 1.01 the same way" },
 };
 
 void run_plans()
@@ -663,6 +707,34 @@ void run_plans()
 	}
 }
 
+// ------------------------------------------------- the negative prefix text ---
+
+// SPEC_NEGATIVE §3: the negative branch is the positive recipe with the tags
+// swapped and the lyrics empty; everything else (cot, score) is the request's.
+// The tokens need the vocab, so the model-side half is in STATUS_NEGATIVE.md.
+void run_negative()
+{
+	Request     req;
+	std::string err = parse_request_json(json::parse(request_with(
+		"\"cfg_scale\": 3, \"cot\": \"melody\", \"negative_style\": \"children's song\"")), "R", req);
+	if (err.empty())
+	{
+		err = validate_request(req);
+	}
+	if (!err.empty())
+	{
+		check(false, "negative_request", err, "an accepted request");
+		return;
+	}
+	const Request     neg  = negative_request(req);
+	const std::string want = std::string(instruction("melody")) +
+	                         "\n[Tags]\nchildren's song\n[Lyrics]\n\n";
+	check(neg.text() == want, "negative_request text", neg.text(), want);
+	check(neg.cot == req.cot && neg.cfg_scale == req.cfg_scale && req.lyrics != "" &&
+	      req.style == "slow waltz, upright bass", "negative_request copy",
+	      "cot " + neg.cot + ", style " + req.style, "the request itself untouched");
+}
+
 } // namespace
 
 int main(int argc, char ** argv)
@@ -678,6 +750,7 @@ int main(int argc, char ** argv)
 	run_sections_multi();
 	run_requests();
 	run_plans();
+	run_negative();
 
 	printf("%s: %d cases, %d failures\n", failures == 0 ? "PASS" : "FAIL", checked, failures);
 	return failures == 0 ? 0 : 1;
