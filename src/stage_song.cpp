@@ -298,6 +298,8 @@ void write_config(const std::string & dir, const BatchParams & p, const ArResult
 	cfg["cfg_scale"]       = ar.cfg_scale;
 	cfg["negative_style"]  = ar.negative_style.empty() ? json(nullptr) : json(ar.negative_style);
 	cfg["negative_lyrics"] = ar.negative_lyrics;
+	cfg["cfg_score"]       = ar.cfg_score;
+	cfg["score_tempo"]     = ar.score_tempo != 0 ? json(ar.score_tempo) : json(nullptr);
 	cfg["seed"]            = ar.seed;
 	cfg["backend"]         = "yue2.cpp";
 	cfg["ar_gguf"]         = p.ar_model;
@@ -642,6 +644,18 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		}
 	}
 
+	// The requests as given, read now: a request that sits in its own artifacts
+	// dir as request.json is overwritten by the one the AR stage normalises.
+	std::vector<std::string> as_given(jobs.size());
+	for (size_t k = 0; k < jobs.size(); k++)
+	{
+		const std::string err = read_file(jobs[k].request_path, as_given[k]);
+		if (!err.empty())
+		{
+			die("%s", err.c_str());
+		}
+	}
+
 	std::vector<ArResult> ar(jobs.size());
 	run_ar_batch(ar_params, jobs, ar);
 
@@ -671,15 +685,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		const std::string dir = job.artifacts + "/";
 
 		// The request as given, next to the request.json the AR stage normalises.
-		{
-			std::string body;
-			const std::string err = read_file(job.request_path, body);
-			if (!err.empty())
-			{
-				die("%s", err.c_str());
-			}
-			write_file_or_die(dir + "ar_request.json", body);
-		}
+		write_file_or_die(dir + "ar_request.json", as_given[k]);
 
 		const int64_t frames = (int64_t) ar[k].codes.size();
 		if (frames < 1)

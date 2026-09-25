@@ -3,8 +3,9 @@
 // every request error of §2.3/§2.4 — plus SPEC_KEEP §5.7's file-free half, the
 // "semantic_keep" rules that are decided without opening the file, and
 // SPEC_NEGATIVE §2's "negative_style" and §7's "negative_lyrics" errors and
-// prefix text. None of it touches llama, a model or a device, so this runs
-// anywhere.
+// prefix text, §8's "cfg_score" rules and the span its blend covers, and
+// §9/§10's header watch, header check and "score_tempo" rules. None of it
+// touches llama, a model or a device, so this runs anywhere.
 //
 // Like tests/bars.cpp it *includes* stage_ar.cpp rather than linking it: the
 // functions under test live in that file's anonymous namespace, and including
@@ -650,6 +651,92 @@ const RequestCase REQUEST_CASES[] =
 	{ "\"handover\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}], "
 	  "\"negative_lyrics\": true",
 	  "\"negative_lyrics\" with \"handover\" is not supported", "beside a handover" },
+
+	// --- "cfg_score", SPEC_NEGATIVE §8.2 -----------------------------------
+	{ "\"cfg_score\": 2, \"negative_style\": \"children's song\", \"negative_lyrics\": true, "
+	  "\"cfg_scale\": 3",       nullptr, "the worked example of §8.2" },
+	{ "\"cfg_score\": 2, \"negative_style\": \"children's song\", \"negative_lyrics\": true",
+	  nullptr,                 "cfg_scale 1: the score is guided, the semantic phase is not" },
+	{ "\"cfg_score\": 1.5, \"negative_lyrics\": true", nullptr,
+	  "no negative style: empty tags, the same lyrics, cfg_scale 1" },
+	{ "\"cfg_score\": 0.5, \"negative_lyrics\": true", nullptr,
+	  "below 1 pulls the score towards the negative" },
+	{ "\"cfg_score\": 20, \"negative_lyrics\": true", nullptr,  "the ceiling itself" },
+	{ "\"cfg_score\": 1",                                          nullptr,
+	  "1 is the unguided score phase, with no negative needed" },
+	{ "\"cfg_score\": 1.0, \"abc\": \"X:1\\nK:C\\n\"",           nullptr,
+	  "1 beside a given score changes nothing" },
+	{ "\"cfg_score\": null, \"negative_style\": \"children's song\"",
+	  "does nothing at cfg_scale 1 and cfg_score 1", "null is absent, so the negative weighs 0" },
+	{ "\"cfg_score\": \"2\", \"negative_lyrics\": true",
+	  "\"cfg_score\" must be a number", "a string for a scale" },
+	{ "\"cfg_score\": [2], \"negative_lyrics\": true",
+	  "\"cfg_score\" must be a number", "a list for a scale" },
+	{ "\"cfg_score\": 0, \"negative_lyrics\": true",
+	  "cfg_score must be finite and in (0, 20]", "zero" },
+	{ "\"cfg_score\": -1, \"negative_lyrics\": true",
+	  "cfg_score must be finite and in (0, 20]", "a negative scale" },
+	{ "\"cfg_score\": 20.5, \"negative_lyrics\": true",
+	  "cfg_score must be finite and in (0, 20]", "past the ceiling" },
+	{ "\"cfg_score\": 2",
+	  "\"cfg_score\" needs \"negative_lyrics\": true", "no negative at all" },
+	{ "\"cfg_score\": 2, \"cfg_scale\": 3, \"negative_style\": \"children's song\"",
+	  "\"cfg_score\" needs \"negative_lyrics\": true", "a negative without the lyrics" },
+	{ "\"cfg_score\": 2, \"negative_style\": \"children's song\", \"negative_lyrics\": false, "
+	  "\"cfg_scale\": 3",
+	  "\"cfg_score\" needs \"negative_lyrics\": true", "an explicit false" },
+	{ "\"cfg_score\": 2, \"negative_lyrics\": true, \"abc\": \"X:1\\nK:C\\n\"",
+	  "\"cfg_score\" with \"abc\"", "a given score: no score phase" },
+	{ "\"cfg_score\": 2, \"negative_lyrics\": true, "
+	  "\"abc_template\": \"X:1\\nK:C\\n%%yue2-gen bars=4\\n\"",
+	  "\"cfg_score\" with \"abc_template\" is not supported", "a score template" },
+	{ "\"cfg_score\": 2, \"negative_lyrics\": true, \"cot\": \"off\"",
+	  "\"cfg_score\" guides the score phase, and cot=off has none", "cot=off" },
+	{ KEEP_ABC ", \"cfg_score\": 2, \"negative_lyrics\": true, "
+	  "\"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}",
+	  "\"cfg_score\" with \"semantic_keep\"", "kept codes sing a given score" },
+	{ "\"guidance\": [{\"frame\": 0, \"against\": {\"blank\": [[0, 2]]}}], "
+	  "\"cfg_score\": 2, \"negative_lyrics\": true",
+	  "\"cfg_score\" with \"guidance\" is not supported", "beside a guidance block" },
+	{ "\"sections\": [{\"section\": \"verse\", \"style\": \"brass band\"}], "
+	  "\"cfg_score\": 2, \"negative_lyrics\": true",
+	  "\"cfg_score\" with \"sections\" is not supported", "beside a sections block" },
+	{ "\"handover\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}], "
+	  "\"cfg_score\": 2, \"negative_lyrics\": true",
+	  "\"cfg_score\" with \"handover\" is not supported", "beside a handover" },
+
+	// --- "score_tempo", SPEC_NEGATIVE §10.2 ---------------------------------
+	{ "\"score_tempo\": 90",                    nullptr, "the worked example of §10.2" },
+	{ "\"score_tempo\": 92.5",                  nullptr, "a tempo need not be whole" },
+	{ "\"score_tempo\": 20",                    nullptr, "the floor itself" },
+	{ "\"score_tempo\": 300",                   nullptr, "the ceiling itself" },
+	{ "\"score_tempo\": null",                  nullptr, "null is absent" },
+	{ "\"score_tempo\": 140, \"cfg_score\": 2, \"negative_lyrics\": true", nullptr,
+	  "with a guided score phase" },
+	{ "\"score_tempo\": 60, \"cot\": \"melody\"", nullptr, "cot=melody writes a header too" },
+	{ "\"score_tempo\": \"90\"",
+	  "\"score_tempo\" must be a number or null", "a string for a tempo" },
+	{ "\"score_tempo\": true",
+	  "\"score_tempo\" must be a number or null", "a flag for a tempo" },
+	{ "\"score_tempo\": 0",
+	  "score_tempo must be in [20, 300] quarter notes per minute", "zero is not absent" },
+	{ "\"score_tempo\": 19.9",
+	  "score_tempo must be in [20, 300] quarter notes per minute", "under the floor" },
+	{ "\"score_tempo\": 301",
+	  "score_tempo must be in [20, 300] quarter notes per minute", "past the ceiling" },
+	{ "\"score_tempo\": 90, \"abc\": \"X:1\\nK:C\\n\"",
+	  "\"score_tempo\" with \"abc\"", "a given score has its own Q:" },
+	{ "\"score_tempo\": 90, "
+	  "\"abc_template\": \"X:1\\nK:C\\n%%yue2-gen bars=4\\n\"",
+	  "\"score_tempo\" with \"abc_template\"", "a template gives the header" },
+	{ "\"score_tempo\": 90, \"cot\": \"off\"",
+	  "\"score_tempo\" forces the score's Q: line, and cot=off writes no score", "cot=off" },
+	{ KEEP_ABC ", \"score_tempo\": 90, "
+	  "\"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}",
+	  "\"score_tempo\" with \"semantic_keep\"", "kept codes sing a given score" },
+	{ "\"handover\": [{\"section\": \"verse\", \"nth\": 2, \"style\": \"brass band\"}], "
+	  "\"score_tempo\": 90",
+	  "\"score_tempo\" with \"handover\"", "a handover reuses its base take's score" },
 };
 
 void run_requests()
@@ -713,6 +800,8 @@ const PlanCase PLAN_CASES[] =
 	  "negative_lyrics changes the branch's prefix, not its plan" },
 	{ "\"negative_lyrics\": false", 0, 0, 1.0,
 	  "and false alone asks for no branch at all" },
+	{ "\"cfg_score\": 2, \"negative_lyrics\": true, \"cfg_scale\": 3", 1, 2, 3.0,
+	  "cfg_score leaves the semantic plan as cfg_scale's" },
 };
 
 void run_plans()
@@ -827,12 +916,247 @@ void run_negative()
 		      negative_request(self).text(), self.text());
 	}
 
+	// SPEC_NEGATIVE §8.2: at cfg_scale 1 a cfg_score song has no semantic plan,
+	// yet it is guided — the score phase has a branch — so it runs at
+	// --parallel 1 and the context is sized for the branch.
+	Request score;
+	if (accepted_request("cfg_score(cfg_scale 1)", "\"cfg_score\": 2, \"negative_lyrics\": true", score))
+	{
+		check(score_guided(score) && is_guided(score) && guidance_plan(score).empty(),
+		      "cfg_score(cfg_scale 1)", strf("score %d, guided %d, plan %zu",
+		      (int) score_guided(score), (int) is_guided(score), guidance_plan(score).size()),
+		      "score 1, guided 1, plan 0");
+	}
+	Request unscored;
+	if (accepted_request("cfg_score(1)", "\"cfg_score\": 1", unscored))
+	{
+		check(!score_guided(unscored) && !is_guided(unscored), "cfg_score(1)",
+		      is_guided(unscored) ? "guided" : "unguided", "unguided");
+	}
+
 	// false, or absent, is stage 11: no branch of its own without a style.
 	Request off;
 	if (accepted_request("negative_lyrics(false)", "\"cfg_scale\": 3, \"negative_lyrics\": false", off))
 	{
 		check(!off.replaces_blank(), "replaces_blank(false)",
 		      off.replaces_blank() ? "a negative branch" : "blank", "blank");
+	}
+}
+
+// ----------------------------------------------------------- the row spans ---
+
+// SPEC_NEGATIVE §8.2: a branch row carries exactly the ids the phase's sampler
+// visits, packed. The abc span must be sample_step's abc segments ([0, EOD) and
+// ABC_END); the semantic one the stage-7 run [MUSIC_END, codec end), in order,
+// since the guided semantic path is byte-identical only if it is.
+void run_spans()
+{
+	check(SPAN_ABC.total() == EOD + 1 && SPAN_ABC.id(0) == 0 && SPAN_ABC.id(EOD - 1) == EOD - 1 &&
+	      SPAN_ABC.id(EOD) == ABC_END, "span(abc)",
+	      strf("%d ids, last %d", SPAN_ABC.total(), SPAN_ABC.id(SPAN_ABC.total() - 1)),
+	      "[0, EOD) then ABC_END");
+	bool contiguous = SPAN_SEM.total() == CODEC_OFFSET + CODEC_SIZE - MUSIC_END;
+	for (int i = 0; contiguous && i < SPAN_SEM.total(); i++)
+	{
+		contiguous = SPAN_SEM.id(i) == MUSIC_END + i && SPAN_SEM.index(MUSIC_END + i) == i;
+	}
+	check(contiguous, "span(semantic)", contiguous ? "contiguous" : "not the stage-7 run",
+	      "MUSIC_END + i at every i");
+
+	const int outside[] = { EOD, ABC_START, ABC_END + 1, MUSIC_START, -1, VOCAB_SIZE };
+	bool      none      = true;
+	for (size_t i = 0; i < sizeof(outside) / sizeof(outside[0]); i++)
+	{
+		none = none && SPAN_ABC.index(outside[i]) == -1;
+	}
+	check(none && SPAN_ABC.index(ABC_END) == EOD && SPAN_ABC.index(0) == 0 &&
+	      SPAN_SEM.index(ABC_END) == -1, "span.index", none ? "outside ids are -1" : "an outside id mapped",
+	      "-1 off the span, ABC_END packed at EOD");
+
+	// pack_row: the two ranges end to end.
+	std::vector<float> full((size_t) VOCAB_SIZE);
+	for (size_t i = 0; i < full.size(); i++)
+	{
+		full[i] = (float) i;
+	}
+	std::vector<float> packed((size_t) SPAN_ABC.total());
+	pack_row(full.data(), SPAN_ABC, packed.data());
+	check(packed[0] == 0 && packed[(size_t) EOD - 1] == (float) (EOD - 1) &&
+	      packed[(size_t) EOD] == (float) ABC_END, "pack_row(abc)",
+	      strf("%g %g %g", packed[0], packed[(size_t) EOD - 1], packed[(size_t) EOD]),
+	      strf("0 %d %d", EOD - 1, ABC_END));
+}
+
+// ------------------------------------------------------------ the header ---
+
+// Every way of cutting `text` into pieces: `cuts` is a bit mask over the
+// len - 1 places between two characters.
+std::vector<std::string> split_by(const std::string & text, unsigned cuts)
+{
+	std::vector<std::string> out(1);
+	for (size_t i = 0; i < text.size(); i++)
+	{
+		out.back() += text[i];
+		if (i + 1 < text.size() && (cuts >> i) & 1)
+		{
+			out.emplace_back();
+		}
+	}
+	return out;
+}
+
+// Feeds `head` whole and unforced, then `tail` in pieces, as tokens would
+// arrive. Returns the offset into head + tail where the watch closed the header
+// or cut, or npos; `piece` is set to the piece that did it.
+size_t watch_at(HeaderWatch & w, const std::string & head, const std::vector<std::string> & tail,
+	bool force, size_t & piece)
+{
+	size_t at = header_scan(w, head, false);
+	if (w.cut != CUT_NONE || w.state != HEADER_OPEN)
+	{
+		piece = 0;
+		return at;
+	}
+	size_t base = head.size();
+	for (size_t i = 0; i < tail.size(); i++)
+	{
+		at = header_scan(w, tail[i], force);
+		if (w.cut != CUT_NONE || w.state != HEADER_OPEN)
+		{
+			piece = i + 1;
+			return base + at;
+		}
+		base += tail[i].size();
+	}
+	return std::string::npos;
+}
+
+// SPEC_NEGATIVE §9.2 / §10.2: the watch decides on text, never on how the text
+// was cut into tokens. §9.4 item 4 and §10.3 item 5.
+void run_header()
+{
+	const std::string head = "X:1\nT:\nM:6/8\nL:1/32\nQ:1/4=78\nV: Vocal clef=treble\n"
+	                         "V: Ins clef=treble";
+	const std::string key  = "\nK:Eb\n";
+
+	// The header closes on the newline that ends the K: line, whatever piece
+	// carries it, with or without a tempo to force (the Q: line is behind it).
+	for (int force = 0; force < 2; force++)
+	{
+		int bad = 0;
+		for (unsigned cuts = 0; cuts < (1u << (key.size() - 1)); cuts++)
+		{
+			const std::vector<std::string> tail = split_by(key, cuts);
+			HeaderWatch w;
+			size_t      piece = 0;
+			const size_t at   = watch_at(w, head, tail, force != 0, piece);
+			bad += at == head.size() + key.size() && piece == tail.size() && w.state == HEADER_KEY &&
+			       w.cut == CUT_NONE ? 0 : 1;
+		}
+		check(bad == 0, force ? "header(K: splits, forced)" : "header(K: splits)",
+		      strf("%d of %u splits wrong", bad, 1u << (key.size() - 1)), "every split closes on the last newline");
+	}
+
+	// The Q: line of a score_tempo job is cut right after its `Q:`, in the piece
+	// that completes it; nothing is cut or closed before.
+	{
+		const std::string pre  = "X:1\nT:\nM:6/8\nL:1/32";
+		const std::string text = "\nQ:1/4=78\n";
+		int               bad  = 0;
+		for (unsigned cuts = 0; cuts < (1u << (text.size() - 1)); cuts++)
+		{
+			const std::vector<std::string> tail = split_by(text, cuts);
+			HeaderWatch w;
+			size_t      piece = 0;
+			const size_t at   = watch_at(w, pre, tail, true, piece);
+			bad += at == pre.size() + 3 && w.cut == CUT_TEMPO && w.tempo && w.state == HEADER_OPEN ? 0 : 1;
+		}
+		check(bad == 0, "header(Q: splits)", strf("%d of %u splits wrong", bad,
+		      1u << (text.size() - 1)), "every split cuts after \"Q:\"");
+	}
+
+	// No Q: line: the cut goes in front of the K: line, or of the line that
+	// closes the header without one; unforced, the same text cuts nothing.
+	struct InsertCase
+	{
+		const char * text;
+		size_t       at;
+		HeaderState  unforced;
+		const char * why;
+	};
+	const InsertCase inserts[] = {
+		{ "X:1\nM:6/8\nL:1/32\nV: Vocal\nK:Eb\n",  26, HEADER_KEY,  "before K:" },
+		{ "X:1\nM:6/8\nL:1/32\n% intro\n",          17, HEADER_BODY, "before a % line" },
+		{ "X:1\nM:6/8\n|z4|\n",                      10, HEADER_BODY, "before a bar line" },
+		{ "X:1\nM:6/8\nabc\nV: Vocal\n",            14, HEADER_BODY, "before V: after a loose line" },
+	};
+	for (size_t i = 0; i < sizeof(inserts) / sizeof(inserts[0]); i++)
+	{
+		const InsertCase & c = inserts[i];
+		HeaderWatch        f;
+		const size_t       at = header_scan(f, c.text, true);
+		HeaderWatch        u;
+		header_scan(u, c.text, false);
+		check(at == c.at && f.cut == CUT_INSERT && u.cut == CUT_NONE && u.state == c.unforced,
+		      strf("header(insert %zu)", i + 1).c_str(),
+		      strf("at %zu, cut %d, unforced %d", at, (int) f.cut, (int) u.state),
+		      strf("at %zu, a CUT_INSERT, unforced %d (%s)", c.at, (int) c.unforced, c.why));
+	}
+
+	// The §9.2 fallback, unforced: where guidance starts without a K: line.
+	struct BodyCase
+	{
+		const char * text;
+		size_t       at;          // npos = the header is still open
+		HeaderState  state;
+		const char * why;
+	};
+	const BodyCase bodies[] = {
+		{ "X:1\nT:\n% intro\nV: Vocal\n",               8,  HEADER_BODY, "a comment line" },
+		{ "X:1\nT:\nz4|z4|\n",                           10, HEADER_BODY, "a bar line mid-line" },
+		{ "X:1\nT:\nfoo\nV: Vocal\n",                   12, HEADER_BODY, "V: after a loose line" },
+		{ "X:1\nT:\nV: Vocal clef=treble\nV: Vocal\n",  std::string::npos, HEADER_OPEN,
+		  "V: lines alone are the header's" },
+		{ "X:1\nT:\nM/8\nL:1/32\n",                     std::string::npos, HEADER_OPEN,
+		  "a broken field is loose, not a body" },
+		{ "X:1\nT:\n\nL:1/32\nV: x\n",                 std::string::npos, HEADER_OPEN,
+		  "a blank line is not loose" },
+		{ "X:1\nM:C|\nK:C\n",                            13, HEADER_KEY,
+		  "a | in a field is not a bar line" },
+	};
+	for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++)
+	{
+		const BodyCase & c  = bodies[i];
+		HeaderWatch      w;
+		const size_t     at = header_scan(w, c.text, false);
+		const size_t     got = w.state == HEADER_OPEN ? std::string::npos : at;
+		check(got == c.at && w.state == c.state, strf("header(body %zu)", i + 1).c_str(),
+		      strf("at %zu, state %d", got, (int) w.state),
+		      strf("at %zu, state %d (%s)", c.at, (int) c.state, c.why));
+	}
+
+	// §9.3: the fields a score is timed by.
+	struct MissingCase
+	{
+		const char * abc;
+		const char * missing;
+	};
+	const MissingCase missing[] = {
+		{ "X:1\nT:\nM:6/8\nL:1/32\nQ:1/4=78\nV: Vocal\nK:Eb\n% intro\n", "" },
+		{ "X:1\nT:\nL:1/32\nQ:1/4=78\nK:Eb\n",                           "M:" },
+		{ "X:1\nT:\nM/8\nL:1/32\nQ:1/4=60\nK:Eb\n",                     "M:" },
+		{ "X:1\nM:C|\nL: 1/8 \nK:C\n",                                    "" },
+		{ "X:1\nM:none\nL:1/8\nK:Am\n",                                   "" },
+		{ "X:1\nM:6/\nL:1/8x\nK:\n",                                      "M:, L:, K:" },
+		{ "X:1\nM:3/4\nL:1/8\nV: Vocal\nz4|\nK:C\n",                    "K:" },
+		{ "X:1\nM:3/4\nK:C\nL:1/8\n",                                     "L:" },
+		{ "",                                                               "M:, L:, K:" },
+	};
+	for (size_t i = 0; i < sizeof(missing) / sizeof(missing[0]); i++)
+	{
+		const std::string got = score_header_missing(missing[i].abc);
+		check(got == missing[i].missing, strf("score_header_missing(%zu)", i + 1).c_str(),
+		      "\"" + got + "\"", strf("\"%s\"", missing[i].missing));
 	}
 }
 
@@ -852,6 +1176,8 @@ int main(int argc, char ** argv)
 	run_requests();
 	run_plans();
 	run_negative();
+	run_spans();
+	run_header();
 
 	printf("%s: %d cases, %d failures\n", failures == 0 ? "PASS" : "FAIL", checked, failures);
 	return failures == 0 ? 0 : 1;

@@ -96,7 +96,7 @@ exact-F32 NAR path. Tensor tables and the full invocations are in
 
 **5. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template`, `cfg_scale`, `negative_style`, `negative_lyrics`, `guidance`,
+`abc`, `abc_template`, `cfg_scale`, `negative_style`, `negative_lyrics`, `cfg_score`, `score_tempo`, `guidance`,
 `sections`, `semantic_keep`, `handover` and `base_take` are optional.
 Lyrics carry `[Section]` tags on
 their own lines:
@@ -230,6 +230,44 @@ is the stage-11 branch; `true` has the same rules as `negative_style` (a
 `cfg_scale` other than 1, no `guidance` / `sections` / `handover`, fine with
 `semantic_keep`) and is recorded in `config.json` / `plan.json`.
 
+`"cfg_score": c` guides the **score phase** with that same lyric-carrying
+negative: every abc step samples from `B + (c - 1)·(B - N)` over the ids the abc
+sampler can visit, so the score itself is written away from the negative style
+instead of every cfg take of a seed sharing one `score.abc`. The reference has no
+equivalent — it never guides the abc phase — so this is opt-in and yue2.cpp's own.
+
+```json
+{ "style": "…", "lyrics": "…", "negative_style": "eurodance, four on the floor", "negative_lyrics": true, "cfg_score": 2, "cfg_scale": 3 }
+```
+
+It needs `"negative_lyrics": true` (`negative_style` may be absent: empty tags),
+takes `0 < c ≤ 20` (absent, `null` or 1 = today's unguided score), and is
+independent of `cfg_scale`: the negative is one branch, prefilled at abc step 0,
+fed every score token and then the same `[ABC_END, MUSIC_START]` as the song, at
+which point it *is* `negative_prefix.npy` (checked token by token) and goes on as
+`cfg_scale`'s negative — or is dropped when `cfg_scale` is 1. A request that gives
+its score (`abc`, `abc_template`, `semantic_keep`) or has none (`cot: "off"`) has
+no score phase to guide and is an error, as are `guidance` / `sections` /
+`handover` beside it; a `cfg_score` job needs `--parallel 1`. `config.json`
+always records it, `plan.json` when it is not 1, `request.json` never. The score's
+header (`X:` … `K:`) is never guided: the weight is 0 until the first `K:` line is
+written, so the metre and key lines stay the model's own.
+
+`"score_tempo": t` forces the score's tempo line to `Q:1/4=t` (quarter notes per
+minute, `20 ≤ t ≤ 300`): sampling stops at the header's `Q:`, and the rest of that
+line is fed as given text, the way a template line is — or a whole `Q:` line goes
+in ahead of `K:` if the model skips it. It works with or without guidance; a
+request with no header to write (`abc`, `abc_template`, `semantic_keep`,
+`cot: "off"`) is an error.
+
+```json
+{ "style": "…", "lyrics": "…", "score_tempo": 90 }
+```
+
+`plan.json` records `score_tempo` and what the model had begun to write
+(`score_tempo_sampled`), and — for every job — `"score_header_ok": false` with a
+warning when a score, written or given, lacks a well-formed `M:`, `L:` or `K:`.
+
 `"guidance"` is the same machinery with time-varying weights and a positive
 prefix that can change part-way through — which is how a song changes band or
 gains a voice mid-stream:
@@ -283,7 +321,8 @@ The normalised block, with a `reached` flag per entry, is written to
 `guidance.json` in the artifacts directory and into `plan.json`; `request.json`
 keeps only `cfg_scale`, so it stays loadable by the reference. Guidance needs
 `--parallel 1` (the branches are the other KV streams) and does not combine with
-`"abc_template"` yet. Only the semantic phase is guided; the score phase never is.
+`"abc_template"` yet. Only the semantic phase is guided, unless the request asks
+for `cfg_score` (above).
 
 **What the push actually did: `--guidance-trace`.** A flag on `yue2 ar`,
 `yue2 song` and `yue2 batch`. A guided job run with it and `--artifacts DIR` writes
@@ -292,7 +331,9 @@ had a live branch, eight columns. It costs about 0.5–0.8 ms a step (two or thr
 softmaxes over the 32 769 ids the semantic sampler can visit) and changes
 nothing else — the same request, seed and card sing the same `semantic.npy`
 traced or not. Without `--artifacts`, or on a request with no guidance, it writes
-nothing and says so.
+nothing and says so. A `cfg_score` job also writes `DIR/guidance_trace_abc.npy`:
+the same eight columns, one row per abc step, over the abc sampler's ids (about
+2.5 ms a step on the Arc — the abc vocabulary is 151 644 ids wide).
 
 ```python
 import numpy as np

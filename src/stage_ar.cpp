@@ -110,6 +110,10 @@ static const char * branch_name(int kind)
 static const double GUIDANCE_MAX_WEIGHT = 20.0;
 static const int    GUIDANCE_MAX_OFFSET = 1000000;
 
+// "score_tempo", quarter notes per minute (SPEC_NEGATIVE §10.2).
+static const double SCORE_TEMPO_MIN = 20.0;
+static const double SCORE_TEMPO_MAX = 300.0;
+
 struct Keyframe
 {
 	int    offset = 0;   // frames after the entry's frame
@@ -280,6 +284,9 @@ struct Request
 	bool        has_negative = false;             // "negative_style": SPEC_NEGATIVE.md
 	std::string negative_style;                   // the negative branch's [Tags]
 	bool        negative_lyrics = false;          // the negative branch keeps the lyrics (§7)
+	double      cfg_score  = 1.0;                 // "cfg_score": the abc phase's guidance (§8)
+	bool        has_tempo  = false;               // "score_tempo": the forced Q: (§10)
+	double      score_tempo = 0;                  // quarter notes per minute
 	bool        has_guidance = false;             // "guidance": SPEC_GUIDANCE.md
 	std::vector<GuidanceEntry> guidance;
 	bool        has_keep   = false;               // "semantic_keep": SPEC_KEEP.md
@@ -326,6 +333,13 @@ static bool sections_plain_swap(const std::vector<SectionEntry> & es)
 	return true;
 }
 
+// SPEC_NEGATIVE §8: the negative branch is decoded beside the score as well,
+// from abc step 0. Absent, null and 1 are the unguided abc phase.
+static bool score_guided(const Request & r)
+{
+	return r.cfg_score != 1.0;
+}
+
 // Either request form asks for branches beside the positive sequence.
 static bool is_guided(const Request & r)
 {
@@ -333,7 +347,7 @@ static bool is_guided(const Request & r)
 	{
 		return !sections_plain_swap(r.sections);
 	}
-	return r.has_guidance || cfg_scalar(r) != 1.0;
+	return r.has_guidance || cfg_scalar(r) != 1.0 || score_guided(r);
 }
 
 // The entries the decode loop runs, so that both request forms are one
@@ -1269,6 +1283,148 @@ static std::string clock_line(ScoreClock & c, const std::string & line)
 	return "";
 }
 
+// The score's header as the model writes it, read one token's text at a time
+// (SPEC_NEGATIVE §9.2, §10.2). It is over at the newline that ends the first
+// `K:` line, or — a header that never writes one — at the first sign of a body:
+// a line opening with `%` or `|`, a `|` in a line that is not a field (`M:C|`
+// is one), or a line opening with `V` once a line that is not a field has gone
+// by. Pure text work, table-tested in
+// tests/guidance.cpp.
+enum HeaderState { HEADER_OPEN, HEADER_KEY, HEADER_BODY };
+enum HeaderCut   { CUT_NONE, CUT_TEMPO, CUT_INSERT };
+
+struct HeaderWatch
+{
+	HeaderState state = HEADER_OPEN;
+	std::string line;              // the line being written, as far as it has come
+	bool        loose = false;     // a completed line that is not a field
+	bool        tempo = false;     // a line has opened with `Q:`
+	HeaderCut   cut   = CUT_NONE;  // why the last scan stopped short
+};
+
+static bool field_line(const std::string & line)
+{
+	return line.size() >= 2 && isalpha((unsigned char) line[0]) && line[1] == ':';
+}
+
+// Reads `text` into the watch and returns how much of it was read: all of it,
+// or less when the header closed inside it (the rest is body) or when `force`
+// (a score_tempo job) wants the text cut there. CUT_TEMPO stops right after a
+// line's opening `Q:`; CUT_INSERT stops before the first character of a line
+// that would close a header that has had no `Q:` line.
+static size_t header_scan(HeaderWatch & w, const std::string & text, bool force)
+{
+	w.cut = CUT_NONE;
+	for (size_t i = 0; i < text.size() && w.state == HEADER_OPEN; i++)
+	{
+		const char c = text[i];
+		if (c == '\n')
+		{
+			if (starts_with(w.line, "K:"))
+			{
+				w.state = HEADER_KEY;
+				return i + 1;
+			}
+			w.loose = w.loose || (!w.line.empty() && !field_line(w.line));
+			w.line.clear();
+			continue;
+		}
+		if (w.line.empty() && (c == 'K' || c == '%' || c == '|' || (c == 'V' && w.loose)))
+		{
+			if (force && !w.tempo)
+			{
+				w.cut = CUT_INSERT;
+				return i;
+			}
+			if (c != 'K')
+			{
+				w.state = HEADER_BODY;
+				return i + 1;
+			}
+		}
+		w.line += c;
+		if (c == '|' && !field_line(w.line))
+		{
+			w.state = HEADER_BODY;
+			return i + 1;
+		}
+		if (w.line == "Q:")
+		{
+			w.tempo = true;
+			if (force)
+			{
+				w.cut = CUT_TEMPO;
+				return i + 1;
+			}
+		}
+	}
+	return text.size();
+}
+
+// SPEC_NEGATIVE §9.3: the header fields a score cannot be timed without, as
+// "M:, K:" — "" when every one is there and well formed. The header is every
+// line up to the first `K:` line, or up to the first line that is not a field
+// and holds a `|`.
+static std::string score_header_missing(const std::string & abc)
+{
+	bool   m    = false;
+	bool   l    = false;
+	bool   k    = false;
+	size_t from = 0;
+	while (from < abc.size() && !k)
+	{
+		const size_t      nl   = abc.find('\n', from);
+		const std::string line = abc.substr(from, nl == std::string::npos ? nl : nl - from);
+		from = nl == std::string::npos ? abc.size() : nl + 1;
+		if (!field_line(line) && line.find('|') != std::string::npos)
+		{
+			break;
+		}
+		std::string  v = line.size() > 2 ? line.substr(2) : std::string();
+		const size_t a = v.find_first_not_of(" \t");
+		const size_t b = v.find_last_not_of(" \t\r");
+		v = a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+		int  num = 0;
+		int  den = 0;
+		char end = 0;
+		const bool fraction = sscanf(v.c_str(), "%d/%d%c", &num, &den, &end) == 2 && num > 0 && den > 0;
+		if (starts_with(line, "M:"))
+		{
+			m = m || fraction || v == "C" || v == "C|" || v == "none";
+		} else if (starts_with(line, "L:")) {
+			l = l || fraction;
+		} else if (starts_with(line, "K:")) {
+			k = !v.empty();
+			break;
+		}
+	}
+	std::string out;
+	const char * names[] = { "M:", "L:", "K:" };
+	const bool   have[]  = { m, l, k };
+	for (int i = 0; i < 3; i++)
+	{
+		if (!have[i])
+		{
+			out += (out.empty() ? "" : ", ") + std::string(names[i]);
+		}
+	}
+	return out;
+}
+
+// §9.3's one warning, naming what is missing; true when nothing is. A header
+// without them is not an error: the clock falls back on ABC's defaults.
+static bool header_check(const std::string & abc, const std::string & tag)
+{
+	const std::string missing = score_header_missing(abc);
+	if (!missing.empty())
+	{
+		fprintf(stderr, "%swarning: the score's header has no well-formed %s — anything that "
+		        "times its bars reads ABC's defaults (M:4/4, L:1/8) instead\n", tag.c_str(),
+		        missing.c_str());
+	}
+	return missing.empty();
+}
+
 // Walks a score that is already written and fills in every entry it finds. The
 // entries are matched in the order the request lists them and `nth` is counted
 // over every label line of that name from the top of the score, which is what
@@ -2162,6 +2318,10 @@ struct Artifacts
 	std::vector<int32_t>     codes;
 	std::string              abc_text;
 	bool                     have_abc_text = false;
+	// SPEC_NEGATIVE §9.3: plan.json says so only when it is false. §10.2: what
+	// the model had begun to write on the Q: line, read only for a score_tempo job.
+	bool                     header_ok     = true;
+	json                     tempo_sampled;
 	std::string              template_text;     // "" unless the request was a template
 	// null unless the request carried a "guidance" block; a plain `cfg_scale`
 	// is in request.json and needs no file of its own (SPEC_GUIDANCE §3).
@@ -2180,6 +2340,9 @@ struct Artifacts
 	// traced step, written as guidance_trace.npy. A diagnostic, so it is not in
 	// plan.json and not in the manifest.
 	const std::vector<float> *         trace    = nullptr;
+	// The same for the abc steps of a cfg_score job: guidance_trace_abc.npy
+	// (SPEC_NEGATIVE §8.3).
+	const std::vector<float> *         trace_abc = nullptr;
 	// null unless the request carried a "negative_style" or "negative_lyrics" and
 	// its branch was built: written as negative_prefix.npy, to be read back with
 	// the tokenizer.
@@ -2232,6 +2395,17 @@ static void write_artifacts(const Artifacts & a)
 			die("%s", err.c_str());
 		}
 	}
+	if (a.trace_abc != nullptr)
+	{
+		const std::vector<int64_t> shape = { (int64_t) (a.trace_abc->size() / TRACE_COLUMNS),
+		                                     (int64_t) TRACE_COLUMNS };
+		const std::string          err   = npy::save((dir + "guidance_trace_abc.npy").c_str(), shape,
+		                                             a.trace_abc->empty() ? nullptr : a.trace_abc->data());
+		if (!err.empty())
+		{
+			die("%s", err.c_str());
+		}
+	}
 	save_i32_or_die(dir + "abc_tokens.npy", std::vector<int32_t>(a.abc_ids.begin(), a.abc_ids.end()));
 	save_i32_or_die(dir + "prefix.npy",     std::vector<int32_t>(a.prefix_sem.begin(), a.prefix_sem.end()));
 	save_i32_or_die(dir + "semantic.npy",   a.codes);
@@ -2272,6 +2446,19 @@ static void write_artifacts(const Artifacts & a)
 		if (a.req->negative_lyrics)
 		{
 			plan["negative_lyrics"] = true;
+		}
+		if (score_guided(*a.req))
+		{
+			plan["cfg_score"] = a.req->cfg_score;
+		}
+		if (a.req->has_tempo)
+		{
+			plan["score_tempo"]         = a.req->score_tempo;
+			plan["score_tempo_sampled"] = a.tempo_sampled;
+		}
+		if (!a.header_ok)
+		{
+			plan["score_header_ok"] = false;
 		}
 		// What of this song came from an earlier render, and enough of a digest
 		// to tell which. The path is deliberately not here: an artifacts
@@ -2914,6 +3101,25 @@ static std::string parse_request_json(const json & root, const std::string & whe
 		}
 		req.negative_lyrics = root["negative_lyrics"].get<bool>();
 	}
+	if (root.contains("cfg_score") && !root["cfg_score"].is_null())
+	{
+		if (!root["cfg_score"].is_number())
+		{
+			return strf("%s: \"cfg_score\" must be a number or null: the guidance scale of "
+			            "the score phase", path);
+		}
+		req.cfg_score = root["cfg_score"].get<double>();
+	}
+	if (root.contains("score_tempo") && !root["score_tempo"].is_null())
+	{
+		if (!root["score_tempo"].is_number())
+		{
+			return strf("%s: \"score_tempo\" must be a number or null: the score's tempo in "
+			            "quarter notes per minute", path);
+		}
+		req.has_tempo   = true;
+		req.score_tempo = root["score_tempo"].get<double>();
+	}
 	if (root.contains("guidance") && !root["guidance"].is_null())
 	{
 		const std::string err = parse_guidance(root["guidance"], req.guidance);
@@ -3052,8 +3258,90 @@ static std::string validate_request(const Request & r)
 		return strf("cfg_scale must be finite and in [0, 20] (got %g)", r.cfg_scale);
 	}
 
+	// SPEC_NEGATIVE §8.2. The score phase guided against the §7 negative: it
+	// needs a score to write, and the one mechanism per request. Checked before
+	// the negative's own rules, so a request that combines them hears about
+	// cfg_score first.
+	if (!std::isfinite(r.cfg_score) || r.cfg_score <= 0 || r.cfg_score > GUIDANCE_MAX_WEIGHT)
+	{
+		return strf("cfg_score must be finite and in (0, 20] (got %g)", r.cfg_score);
+	}
+	if (score_guided(r))
+	{
+		if (r.has_keep)
+		{
+			return "\"cfg_score\" with \"semantic_keep\": the kept codes were sung to a score "
+			       "the request gives, so there is no score phase to guide";
+		}
+		if (r.has_abc)
+		{
+			return "\"cfg_score\" with \"abc\": the score is given, so there is no score phase "
+			       "to guide";
+		}
+		if (r.has_tpl)
+		{
+			return "\"cfg_score\" with \"abc_template\" is not supported: the template's lines "
+			       "are not ours to change, and its holes re-prefill the slot";
+		}
+		if (r.cot == "off")
+		{
+			return "\"cfg_score\" guides the score phase, and cot=off has none — use "
+			       "cot=melody or cot=full";
+		}
+		if (r.has_guidance || r.has_sections || r.has_handover)
+		{
+			return strf("\"cfg_score\" with %s is not supported: it guides the score against "
+			            "the negative of a plain \"cfg_scale\", one mechanism per request",
+			            r.has_guidance ? "\"guidance\""
+			            : r.has_sections ? "\"sections\"" : "\"handover\"");
+		}
+		if (!r.negative_lyrics)
+		{
+			return "\"cfg_score\" needs \"negative_lyrics\": true — a negative without the "
+			       "song's lyrics would push the score away from the words it places, not "
+			       "from a style";
+		}
+	}
+
+	// SPEC_NEGATIVE §10.2: the tempo is forced into a header the model writes,
+	// so there has to be one.
+	if (r.has_tempo)
+	{
+		if (!std::isfinite(r.score_tempo) || r.score_tempo < SCORE_TEMPO_MIN ||
+		    r.score_tempo > SCORE_TEMPO_MAX)
+		{
+			return strf("score_tempo must be in [%g, %g] quarter notes per minute (got %g)",
+			            SCORE_TEMPO_MIN, SCORE_TEMPO_MAX, r.score_tempo);
+		}
+		if (r.has_keep)
+		{
+			return "\"score_tempo\" with \"semantic_keep\": the kept codes were sung to a score "
+			       "the request gives, so there is no header to force";
+		}
+		if (r.has_abc)
+		{
+			return "\"score_tempo\" with \"abc\": the score is given — write its Q: line instead";
+		}
+		if (r.has_tpl)
+		{
+			return "\"score_tempo\" with \"abc_template\": the template gives the header — "
+			       "write its Q: line instead";
+		}
+		if (r.has_handover)
+		{
+			return "\"score_tempo\" with \"handover\": a handover reuses its base take's score, "
+			       "so there is no header to force";
+		}
+		if (r.cot == "off")
+		{
+			return "\"score_tempo\" forces the score's Q: line, and cot=off writes no score — "
+			       "use cot=melody or cot=full";
+		}
+	}
+
 	// SPEC_NEGATIVE §2. The negative style replaces the blank branch of a plain
-	// cfg_scale, so it needs that branch to exist and to carry a weight.
+	// cfg_scale, so it needs that branch to exist and to carry a weight — in the
+	// semantic phase, or in the score phase (§8.2).
 	if (r.has_negative)
 	{
 		if (r.negative_style.find_first_not_of(" \t\n\r\f\v") == std::string::npos)
@@ -3068,10 +3356,10 @@ static std::string validate_request(const Request & r)
 			            r.has_guidance ? "\"guidance\""
 			            : r.has_sections ? "\"sections\"" : "\"handover\"");
 		}
-		if (cfg_scalar(r) == 1.0)
+		if (cfg_scalar(r) == 1.0 && !score_guided(r))
 		{
-			return "\"negative_style\" does nothing at cfg_scale 1: its branch is weighted "
-			       "cfg_scale - 1 = 0; set \"cfg_scale\", e.g. 3";
+			return "\"negative_style\" does nothing at cfg_scale 1 and cfg_score 1: its branch is "
+			       "weighted cfg_scale - 1 = 0 and cfg_score - 1 = 0; set \"cfg_scale\", e.g. 3";
 		}
 	}
 	// SPEC_NEGATIVE §7.2: the same two rules for the lyrics. false is stage 11
@@ -3085,10 +3373,10 @@ static std::string validate_request(const Request & r)
 			            r.has_guidance ? "\"guidance\""
 			            : r.has_sections ? "\"sections\"" : "\"handover\"");
 		}
-		if (cfg_scalar(r) == 1.0)
+		if (cfg_scalar(r) == 1.0 && !score_guided(r))
 		{
-			return "\"negative_lyrics\" does nothing at cfg_scale 1: its branch is weighted "
-			       "cfg_scale - 1 = 0; set \"cfg_scale\", e.g. 3";
+			return "\"negative_lyrics\" does nothing at cfg_scale 1 and cfg_score 1: its branch is "
+			       "weighted cfg_scale - 1 = 0 and cfg_score - 1 = 0; set \"cfg_scale\", e.g. 3";
 		}
 	}
 
@@ -3448,6 +3736,19 @@ static std::string detokenize(const llama_vocab * vocab, const std::vector<llama
 	return std::string(buf.data(), (size_t) n);
 }
 
+// One token's text, exactly its share of detokenize() over the ids around it
+// (no special tokens, no leading space stripped).
+static std::string token_text(const llama_vocab * vocab, llama_token token)
+{
+	char      buf[256];
+	const int n = llama_token_to_piece(vocab, token, buf, (int32_t) sizeof(buf), 0, false);
+	if (n < 0)
+	{
+		die("token %d has no text", (int) token);
+	}
+	return std::string(buf, (size_t) n);
+}
+
 // protocol.token_prefixes without abc ids: [EOD] + tokenize(text) + [ABC_START].
 // The abc phase's whole prefix, and the head of every semantic one — including
 // the head of a guidance entry that changes the tags (SPEC_GUIDANCE §4.4).
@@ -3591,6 +3892,11 @@ struct JobState
 	std::vector<llama_token> prefix_sem;
 	std::string              abc_text;
 	bool                     have_abc_text = false;
+	// SPEC_NEGATIVE §9.3: the header has the M:, L: and K: fields the score is
+	// timed by. §10.2: what the model had begun to write on the Q: line
+	// score_tempo cut, null when there was no Q: line to cut.
+	bool                     header_ok = true;
+	json                     tempo_sampled;
 	bool                     do_abc        = false;
 	double                   guidance      = 1.0;
 
@@ -3625,7 +3931,9 @@ struct JobState
 	// --guidance-trace: TRACE_COLUMNS floats per semantic step that had a live
 	// branch, written as guidance_trace.npy. Empty unless the flag is on.
 	std::vector<float>                    trace;
+	std::vector<float>                    trace_abc;   // the same, per abc step of a cfg_score job
 	double                                trace_seconds = 0;
+	double                                trace_abc_seconds = 0;
 
 	// SPEC_KEEP.md, empty unless the request carried a "semantic_keep": the N
 	// leading codes of an earlier render, read at validation time, forced as
@@ -3663,7 +3971,11 @@ struct Branch
 	bool                     live    = false;
 	double                   weight  = 0;    // w_i at the step being sampled
 	std::vector<llama_token> prefix;         // what it is (re-)prefilled from
-	std::vector<float>       row;            // its logits over [MUSIC_END, codec end)
+	std::vector<float>       row;            // its logits over the phase's RowSpan, packed
+	// A cfg_score branch only: every token fed to it in the score phase, the
+	// prefix included — checked against negative_prefix at the transition
+	// (SPEC_NEGATIVE §8.2).
+	std::vector<llama_token> fed;
 };
 
 // One KV stream of the shared context, and the phase it is in. SPEC_BATCH §4.3.
@@ -3721,6 +4033,10 @@ struct Seq
 	std::string              line_pre;
 	size_t                   sec_next  = 0;   // the next entry to look for
 	int                      sec_cuts  = 0;   // cuts this score phase made
+
+	// The score's header as it is written, watched only by a job that has a
+	// use for it: cfg_score and score_tempo (SPEC_NEGATIVE §9.2, §10.2).
+	HeaderWatch              header;
 };
 
 // The resolved sections become the guidance plan: a frame each from the bar the
@@ -3786,6 +4102,8 @@ struct Runner
 	// so that tracing a step allocates nothing after the first one.
 	std::vector<double> trace_p;
 	std::vector<double> trace_q;
+	std::vector<float>  trace_row;     // the primary's row, packed over the phase's span
+	std::vector<float>  trace_blend;   // and the blended one
 
 	// Batch-level progress, so a driver watching a pipe sees the loop is alive.
 	// Printed from run() at most every PROGRESS_SECONDS, never per step.
@@ -3800,6 +4118,7 @@ struct Runner
 	                 const char * what);
 	llama_token sample(Seq & q, const float * logits);
 	void        apply(Seq & q, llama_token token);
+	void        draw(Seq & q);
 
 	// Guidance (SPEC_GUIDANCE §4.2, §4.3). Everything below returns at once for
 	// a job with no plan.
@@ -3811,7 +4130,14 @@ struct Runner
 	void          guidance_enter(Seq & q);
 	void          guidance_step(Seq & q);
 	void          guidance_clear(Seq & q);
-	void          fetch_row(Branch & b);
+	void          fetch_row(Branch & b, Phase phase);
+	// SPEC_NEGATIVE §8: the negative branch of cfg_score, born beside the score
+	// and carried into the semantic phase (or dropped) at the transition.
+	void          score_enter(Seq & q);
+	void          score_close(Seq & q, const std::vector<llama_token> & bridge);
+	void          score_guide(Seq & q);
+	// SPEC_NEGATIVE §9.2, §10.2: the header watch, and the forced Q: line.
+	bool          header_token(Seq & q, llama_token token);
 	const float * blend_row(Seq & q, const float * primary);
 	void          trace_step(Seq & q, const float * primary, llama_token token);
 
@@ -3898,11 +4224,56 @@ llama_token Runner::sample(Seq & q, const float * logits)
 	return token;
 }
 
-// The ids the semantic sampler can visit: MUSIC_END and the codec block, which
-// sit next to each other, so one contiguous run of floats is the whole of what a
-// branch row has to carry and the whole of what the blend writes (§2.1).
-static const int SEM_ROW_FIRST = MUSIC_END;
-static const int SEM_ROW_LEN   = CODEC_OFFSET + CODEC_SIZE - MUSIC_END;
+// The ids a phase's sampler can visit, as sample_step lays them out: two
+// ascending ranges, packed end to end into a branch row, and the whole of what
+// the blend writes (§2.1). The semantic ones — MUSIC_END and the codec block —
+// sit next to each other, so its packed row is one contiguous run of the vocab;
+// the abc phase's are [0, EOD) and ABC_END (SPEC_NEGATIVE §8.2).
+struct RowSpan
+{
+	int first[2];
+	int len[2];
+
+	int total() const
+	{
+		return len[0] + len[1];
+	}
+
+	// The vocab id at packed index `i`.
+	int id(int i) const
+	{
+		return i < len[0] ? first[0] + i : first[1] + (i - len[0]);
+	}
+
+	// The packed index of vocab id `v`, -1 when the sampler never visits it.
+	int index(int v) const
+	{
+		if (v >= first[0] && v < first[0] + len[0])
+		{
+			return v - first[0];
+		}
+		if (v >= first[1] && v < first[1] + len[1])
+		{
+			return len[0] + (v - first[1]);
+		}
+		return -1;
+	}
+};
+
+static const RowSpan SPAN_ABC = { { 0, ABC_END },          { EOD, 1 } };
+static const RowSpan SPAN_SEM = { { MUSIC_END, CODEC_OFFSET }, { 1, CODEC_SIZE } };
+
+static const RowSpan & phase_span(Phase phase)
+{
+	return phase == PHASE_ABC ? SPAN_ABC : SPAN_SEM;
+}
+
+// The span's entries of a full logits row, packed.
+static void pack_row(const float * logits, const RowSpan & sp, float * out)
+{
+	memcpy(out, logits + sp.first[0], (size_t) sp.len[0] * sizeof(float));
+	memcpy(out + sp.len[0], logits + sp.first[1], (size_t) sp.len[1] * sizeof(float));
+}
 
 // The lowest KV stream this song is not already using. Live slots are kept
 // contiguous from 0 that way, which is what `split_equal` wants (SPEC_BATCH
@@ -4072,7 +4443,7 @@ void Runner::guidance_step(Seq & q)
 			b.slot = free_slot(q);
 			b.pos  = prefill_branch(q, b.slot, b.prefix, branch_name(k), b.i_batch);
 			b.live = true;
-			fetch_row(b);
+			fetch_row(b, q.phase);
 			if (k == BRANCH_BLANK && js.req.replaces_blank())
 			{
 				printf("%sguidance: %s (%zu tokens) replaces the blank branch\n",
@@ -4100,6 +4471,10 @@ void Runner::guidance_enter(Seq & q)
 	{
 		return;
 	}
+	// A cfg_score song's negative branch is live already: it wrote the score
+	// beside the primary and took the bridge (score_close), so it is kept, and
+	// guidance_step finds it needed and live rather than prefilling it.
+	const bool carried = q.branch[BRANCH_BLANK].live;
 	q.guided  = true;
 	q.traced  = (*jobs)[q.job].trace;
 	q.g_next  = 0;
@@ -4107,9 +4482,13 @@ void Runner::guidance_enter(Seq & q)
 	q.blend.assign((size_t) n_vocab, 0.0f);
 	for (int k = 0; k < BRANCH_KINDS; k++)
 	{
+		if (carried && k == BRANCH_BLANK)
+		{
+			continue;
+		}
 		q.branch[k]      = Branch();
 		q.branch[k].kind = k;
-		q.branch[k].row.assign((size_t) SEM_ROW_LEN, 0.0f);
+		q.branch[k].row.assign((size_t) SPAN_SEM.total(), 0.0f);
 	}
 	// Both places a blank branch is born — the semantic entry and the end of a
 	// "semantic_keep" prefill — come through here (SPEC_NEGATIVE §3).
@@ -4121,6 +4500,225 @@ void Runner::guidance_enter(Seq & q)
 		q.branch[BRANCH_BLANK].prefix = blank_prefix(vocab, js.req, js.abc_ids);
 	}
 	guidance_step(q);
+}
+
+// SPEC_NEGATIVE §8.2: a cfg_score job's score phase is about to start. The
+// negative branch is prefilled with the positive abc prefix's own recipe on
+// negative_request — before the primary's feed, so the primary's decode is the
+// last one and its logits are live — and it is the one negative stream of the
+// song: it gets every abc token the primary gets, then the bridge
+// (score_close), then every code. Weight 0 while the header is written, then
+// cfg_score - 1 (score_guide, SPEC_NEGATIVE §9.2).
+void Runner::score_enter(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+	if (!score_guided(js.req))
+	{
+		return;
+	}
+	q.guided  = true;
+	q.traced  = (*jobs)[q.job].trace;
+	q.g_next  = 0;
+	q.g_entry = -1;
+	q.blend.assign((size_t) n_vocab, 0.0f);
+	for (int k = 0; k < BRANCH_KINDS; k++)
+	{
+		q.branch[k]      = Branch();
+		q.branch[k].kind = k;
+	}
+	Branch & b = q.branch[BRANCH_BLANK];
+	b.prefix = prefix_head(vocab, negative_request(js.req).text());
+	// Its whole score phase, and the longest bridge (a truncated score's last
+	// token + ABC_END + MUSIC_START), so a step appends without reallocating.
+	b.fed.reserve(b.prefix.size() + (size_t) s_abc.max_tokens + 3);
+	b.fed.assign(b.prefix.begin(), b.prefix.end());
+	b.slot   = free_slot(q);
+	b.pos    = prefill_branch(q, b.slot, b.prefix, "negative", b.i_batch);
+	b.live   = true;
+	b.weight = 0;   // until the header is written: score_guide (§9.2)
+	fetch_row(b, PHASE_ABC);
+	js.max_branches = std::max(js.max_branches, 2);
+	printf("%sguidance: score phase guided at %g by %s\n", js.tag.c_str(), js.req.cfg_score,
+	       negative_label(js.req).c_str());
+}
+
+// The header is written (SPEC_NEGATIVE §9.2): from the next abc step on, the
+// score branch carries its weight. Where the song and its negative agree most,
+// amplifying their small differences only broke the header's syntax.
+void Runner::score_guide(Seq & q)
+{
+	JobState & js = (*states)[q.job];
+	if (!score_guided(js.req))
+	{
+		return;
+	}
+	q.branch[BRANCH_BLANK].weight = js.req.cfg_score - 1.0;
+	if (q.header.state == HEADER_KEY)
+	{
+		printf("%sguidance: score phase guided at %g from abc step %d (after K:)\n",
+		       js.tag.c_str(), js.req.cfg_score, q.step + 1);
+		return;
+	}
+	fprintf(stderr, "%swarning: the score reached its body without a K: line; the score phase "
+	        "is guided at %g from abc step %d\n", js.tag.c_str(), js.req.cfg_score, q.step + 1);
+}
+
+// One sampled abc token while the header is being written, before apply() takes
+// it. It moves the watch, and the header's end is where cfg_score's guidance
+// starts. For a score_tempo job it may also be the token a cut falls in
+// (SPEC_NEGATIVE §10.2): the line's own `Q:` is kept and the rest of the line
+// forced, or a whole `Q:` line goes in ahead of the line that would have closed
+// a header without one. Then, as a template hole's closing token (SPEC_TEMPLATE
+// §3), the token is never fed: the part of its text before the cut and the
+// forced text are re-tokenized and fed — to the score branch too — and enter
+// the history like a given line, and the next token is drawn from there.
+// Returns true when that happened and the token is spent.
+bool Runner::header_token(Seq & q, llama_token token)
+{
+	JobState &        js    = (*states)[q.job];
+	const std::string piece = token_text(vocab, token);
+	const size_t      cut   = header_scan(q.header, piece, js.req.has_tempo);
+	if (q.header.cut != CUT_NONE)
+	{
+		const bool                     insert = q.header.cut == CUT_INSERT;
+		const std::string              tail   = strf("%s1/4=%g\n", insert ? "Q:" : "",
+		                                             js.req.score_tempo);
+		const std::vector<llama_token> ids    = tokenize(vocab, piece.substr(0, cut) + tail,
+		                                                 "forced tempo");
+		// The rest of the score has to fit under the abc cap it was sized by,
+		// and a forced line may be longer than what it replaces. Short of room —
+		// only a tiny --max-abc gets here — the model's own line stands.
+		if ((int) (q.history.size() + ids.size()) < s_abc.max_tokens)
+		{
+			header_scan(q.header, tail, false);
+			const size_t eol = piece.find('\n', cut);
+			js.tempo_sampled = insert ? json(nullptr)
+			                          : json(piece.substr(cut, eol == std::string::npos ? eol : eol - cut));
+			printf("%sscore: tempo forced to 1/4=%g (the model wrote %s)\n", js.tag.c_str(),
+			       js.req.score_tempo, insert ? "no Q:" : strf("\"Q:%s\"",
+			       js.tempo_sampled.get<std::string>().c_str()).c_str());
+
+			// Forced text is history (the penalty window) and counts against the
+			// cap, like every other abc token, but no draw was made for it.
+			q.history.insert(q.history.end(), ids.begin(), ids.end());
+			q.step += (int) ids.size();
+			for (size_t i = 0; i < ids.size() && !js.sections.empty(); i++)
+			{
+				sections_token(q, ids[i]);
+			}
+			Branch & b = q.branch[BRANCH_BLANK];
+			if (score_guided(js.req) && b.live)
+			{
+				const double t0 = now_seconds();
+				b.i_batch = decode_feed(ctx, batch, ids, b.slot, b.pos, "negative forced tempo");
+				decodes++;
+				b.fed.insert(b.fed.end(), ids.begin(), ids.end());
+				js.branch_seconds += now_seconds() - t0;
+				fetch_row(b, PHASE_ABC);
+			}
+			feed_tokens(q, ids, (size_t) q.pos + ids.size(), "forced tempo");
+			draw(q);
+			return true;
+		}
+		fprintf(stderr, "%swarning: no room left under the abc cap to force Q:1/4=%g; the "
+		        "score keeps its own tempo\n", js.tag.c_str(), js.req.score_tempo);
+		header_scan(q.header, piece.substr(cut), false);
+	}
+	if (q.header.state != HEADER_OPEN)
+	{
+		score_guide(q);
+	}
+	return false;
+}
+
+// The score is written (SPEC_NEGATIVE §8.2). The cfg_score branch has had every
+// abc token the primary had; with the bridge the primary is about to get, it
+// holds the §7 negative prefix — checked here token by token, since that is what
+// makes it the same branch a fresh prefill would be. At cfg_scale 1 its work is
+// done and it is dropped; otherwise it takes the bridge in its own decode,
+// before the primary's, and guidance_enter keeps it as cfg_scale's negative.
+void Runner::score_close(Seq & q, const std::vector<llama_token> & bridge)
+{
+	JobState & js = (*states)[q.job];
+	Branch &   b  = q.branch[BRANCH_BLANK];
+	if (!score_guided(js.req))
+	{
+		return;
+	}
+	if (!b.live)
+	{
+		die("%sguidance: the score branch is gone before the score is written", js.tag.c_str());
+	}
+	js.negative_prefix = negative_prefix(vocab, js.req, js.abc_ids);
+	b.fed.insert(b.fed.end(), bridge.begin(), bridge.end());
+	if (b.fed != js.negative_prefix)
+	{
+		size_t at = 0;
+		while (at < b.fed.size() && at < js.negative_prefix.size() &&
+		       b.fed[at] == js.negative_prefix[at])
+		{
+			at++;
+		}
+		die("%sguidance: the score branch holds %zu tokens, negative_prefix is %zu; they "
+		    "part at %zu", js.tag.c_str(), b.fed.size(), js.negative_prefix.size(), at);
+	}
+	if (js.guide.empty())
+	{
+		branch_drop(q, b, "the score is written and cfg_scale is 1");
+		guidance_clear(q);
+		return;
+	}
+
+	const double t0 = now_seconds();
+	b.i_batch = decode_feed(ctx, batch, bridge, b.slot, b.pos, "negative bridge");
+	decodes++;
+	if ((size_t) (llama_memory_seq_pos_max(mem, b.slot) + 1) != js.negative_prefix.size())
+	{
+		die("%sguidance: the negative bridge left %d tokens in slot %d, negative_prefix is %zu",
+		    js.tag.c_str(), (int) llama_memory_seq_pos_max(mem, b.slot) + 1, b.slot,
+		    js.negative_prefix.size());
+	}
+	js.branch_seconds += now_seconds() - t0;
+	fetch_row(b, PHASE_SEM);
+	printf("%sguidance: step 0: the score branch in slot %d holds negative_prefix exactly "
+	       "(%zu tokens) and goes on as the negative of cfg_scale\n",
+	       js.tag.c_str(), b.slot, js.negative_prefix.size());
+
+	if (verify)
+	{
+		// The row it gives for semantic step 0 against a fresh §7 prefill of the
+		// same tokens in the spare stream: one decode in chunks instead of one
+		// token per step, so equal to within the backend's f32 noise (§8.4).
+		const int slot = free_slot(q);
+		int       last = -1;
+		prefill_branch(q, slot, js.negative_prefix, "fresh negative (verify)", last);
+		const float * fresh = llama_get_logits_ith(ctx, last);
+		if (fresh == nullptr)
+		{
+			die("llama_get_logits_ith(%d) returned NULL for the fresh negative", last);
+		}
+		std::vector<float> packed((size_t) SPAN_SEM.total());
+		pack_row(fresh, SPAN_SEM, packed.data());
+		double worst = 0;
+		for (int i = 0; i < SPAN_SEM.total(); i++)
+		{
+			worst = std::max(worst, std::fabs((double) packed[(size_t) i] - b.row[(size_t) i]));
+		}
+		// How much that moves the distribution, beside the raw difference.
+		softmax_row(packed.data(), SPAN_SEM.total(), trace_p);
+		softmax_row(b.row.data(), SPAN_SEM.total(), trace_q);
+		const double tv    = tv_distance(trace_p, trace_q);
+		const bool   agree = argmax_row(packed.data(), SPAN_SEM.total()) ==
+		                     argmax_row(b.row.data(), SPAN_SEM.total());
+		llama_memory_seq_rm(mem, slot, -1, -1);
+		if (llama_memory_seq_pos_max(mem, slot) != -1)
+		{
+			die("verify: slot %d still holds tokens after the fresh negative was dropped", slot);
+		}
+		printf("%sverify: the carried negative's first semantic row vs a fresh prefill: "
+		       "max |d| %.6g over %d ids, TV %.6g, argmax %s\n", js.tag.c_str(), worst,
+		       SPAN_SEM.total(), tv, agree ? "agrees" : "differs");
+	}
 }
 
 // Every shadow slot goes back, so the next job of a --parallel 1 batch enters a
@@ -4143,9 +4741,9 @@ void Runner::guidance_clear(Seq & q)
 }
 
 // A branch's row for this step, copied out of the context's output buffer: the
-// next llama_decode overwrites it, and at the semantic entry the branches were
-// decoded before the primary.
-void Runner::fetch_row(Branch & b)
+// next llama_decode overwrites it, and at a phase's entry the branches were
+// decoded before the primary. Only the ids the phase's sampler visits.
+void Runner::fetch_row(Branch & b, Phase phase)
 {
 	const float * logits = llama_get_logits_ith(ctx, b.i_batch);
 	if (logits == nullptr)
@@ -4153,13 +4751,15 @@ void Runner::fetch_row(Branch & b)
 		die("llama_get_logits_ith(%d) returned NULL for the %s branch in slot %d",
 		    b.i_batch, branch_name(b.kind), b.slot);
 	}
-	memcpy(b.row.data(), logits + SEM_ROW_FIRST, (size_t) SEM_ROW_LEN * sizeof(float));
+	const RowSpan & sp = phase_span(phase);
+	b.row.resize((size_t) sp.total());
+	pack_row(logits, sp, b.row.data());
 }
 
-// L = B + sum_i w_i * (B - N_i), in f32 and only over the ids the semantic
+// L = B + sum_i w_i * (B - N_i), in f32 and only over the ids the phase's
 // sampler can visit; the rest of the scratch row is never read (§2.1). The raw
 // row is handed back untouched when nothing contributes, which is every step of
-// an unguided song and every abc step.
+// an unguided song and every abc step but a cfg_score job's (SPEC_NEGATIVE §8).
 const float * Runner::blend_row(Seq & q, const float * primary)
 {
 	if (!q.guided || primary == nullptr)
@@ -4173,15 +4773,18 @@ const float * Runner::blend_row(Seq & q, const float * primary)
 		live = live || q.branch[k].live;
 		any  = any  || (q.branch[k].live && q.branch[k].weight != 0);
 	}
-	(*states)[q.job].guided_steps += live ? 1 : 0;
+	// guided_steps counts semantic steps, as it always has (SPEC_GUIDANCE §3).
+	(*states)[q.job].guided_steps += live && q.phase == PHASE_SEM ? 1 : 0;
 	if (!any)
 	{
 		return primary;
 	}
 
-	for (int i = 0; i < SEM_ROW_LEN; i++)
+	const RowSpan & sp = phase_span(q.phase);
+	for (int i = 0; i < sp.total(); i++)
 	{
-		const float b   = primary[SEM_ROW_FIRST + i];
+		const int   id  = sp.id(i);
+		const float b   = primary[id];
 		float       acc = b;
 		for (int k = 0; k < BRANCH_KINDS; k++)
 		{
@@ -4190,7 +4793,7 @@ const float * Runner::blend_row(Seq & q, const float * primary)
 				acc += (float) q.branch[k].weight * (b - q.branch[k].row[(size_t) i]);
 			}
 		}
-		q.blend[(size_t) (SEM_ROW_FIRST + i)] = acc;
+		q.blend[(size_t) id] = acc;
 	}
 	return q.blend.data();
 }
@@ -4218,11 +4821,17 @@ void Runner::trace_step(Seq & q, const float * primary, llama_token token)
 		return;
 	}
 
-	JobState &    js    = (*states)[q.job];
-	const double  t0    = now_seconds();
-	const float * b_row = primary + SEM_ROW_FIRST;
-	const double  logz  = softmax_row(b_row, SEM_ROW_LEN, trace_p);
-	const float   na    = std::numeric_limits<float>::quiet_NaN();
+	// Over the phase's span, packed as the branch rows are: the abc phase of a
+	// cfg_score job traces into its own file (SPEC_NEGATIVE §8.3).
+	JobState &      js   = (*states)[q.job];
+	const double    t0   = now_seconds();
+	const RowSpan & sp   = phase_span(q.phase);
+	const int       n    = sp.total();
+	trace_row.resize((size_t) n);
+	pack_row(primary, sp, trace_row.data());
+	const float *   b_row = trace_row.data();
+	const double    logz  = softmax_row(b_row, n, trace_p);
+	const float     na    = std::numeric_limits<float>::quiet_NaN();
 
 	// Columns 1..4 are two per branch, in BranchKind order.
 	static_assert(BRANCH_PREVIOUS == 0 && BRANCH_BLANK == 1 && BRANCH_KINDS == 2,
@@ -4238,28 +4847,32 @@ void Runner::trace_step(Seq & q, const float * primary, llama_token token)
 			row[3 + k] = na;
 			continue;
 		}
-		softmax_row(b.row.data(), SEM_ROW_LEN, trace_q);
+		softmax_row(b.row.data(), n, trace_q);
 		row[3 + k] = (float) tv_distance(trace_p, trace_q);
 	}
 	// Whether the branch this song pushes away from still wants the same token:
 	// the cheapest reading of "the two prefixes have parted".
 	const Branch & prev = q.branch[BRANCH_PREVIOUS];
 	row[5] = prev.live
-		? (argmax_row(b_row, SEM_ROW_LEN) == argmax_row(prev.row.data(), SEM_ROW_LEN) ? 1.0f : 0.0f)
+		? (argmax_row(b_row, n) == argmax_row(prev.row.data(), n) ? 1.0f : 0.0f)
 		: na;
 	// What the sampler was handed: blend_row leaves the primary's own row when
 	// no live branch carries a weight, and that is a distance of 0.
 	row[6] = 0.0f;
 	if (any)
 	{
-		softmax_row(q.blend.data() + SEM_ROW_FIRST, SEM_ROW_LEN, trace_q);
+		trace_blend.resize((size_t) n);
+		pack_row(q.blend.data(), sp, trace_blend.data());
+		softmax_row(trace_blend.data(), n, trace_q);
 		row[6] = (float) tv_distance(trace_p, trace_q);
 	}
-	const int id = (int) token - SEM_ROW_FIRST;
-	row[7] = id >= 0 && id < SEM_ROW_LEN ? (float) ((double) b_row[id] - logz) : na;
+	const int id = sp.index((int) token);
+	row[7] = id >= 0 ? (float) ((double) b_row[id] - logz) : na;
 
-	js.trace.insert(js.trace.end(), row, row + TRACE_COLUMNS);
-	js.trace_seconds += now_seconds() - t0;
+	const bool           abc = q.phase == PHASE_ABC;
+	std::vector<float> & out = abc ? js.trace_abc : js.trace;
+	out.insert(out.end(), row, row + TRACE_COLUMNS);
+	(abc ? js.trace_abc_seconds : js.trace_seconds) += now_seconds() - t0;
 }
 
 void Runner::apply(Seq & q, llama_token token)
@@ -4281,6 +4894,11 @@ void Runner::apply(Seq & q, llama_token token)
 	GenStats &       st  = abc ? js.st_abc : js.st_sem;
 
 	const bool eos = token == (abc ? ABC_END : MUSIC_END);
+	if (abc && !eos && q.header.state == HEADER_OPEN &&
+	    (score_guided(js.req) || js.req.has_tempo) && header_token(q, token))
+	{
+		return;
+	}
 	if (!eos)
 	{
 		// The end token is never part of the output (stage_ar.cpp's generate()).
@@ -4326,6 +4944,13 @@ void Runner::apply(Seq & q, llama_token token)
 	}
 	js.abc_text      = detokenize(vocab, js.abc_ids);
 	js.have_abc_text = true;
+	js.header_ok     = header_check(js.abc_text, js.tag);
+	if (js.req.has_tempo && js.abc_text.find(strf("\nQ:1/4=%g\n", js.req.score_tempo)) == std::string::npos)
+	{
+		fprintf(stderr, "%swarning: the score has no Q:1/4=%g line: it ended before its header "
+		        "was written, or there was no room to force it\n", js.tag.c_str(),
+		        js.req.score_tempo);
+	}
 
 	js.prefix_sem = semantic_prefix(js.prefix_abc, js.abc_ids);
 	if ((int) js.prefix_sem.size() + s_sem.max_tokens > (int) n_ctx_seq)
@@ -4379,7 +5004,9 @@ void Runner::apply(Seq & q, llama_token token)
 	js.st_sem.prefix_tokens = (int) js.prefix_sem.size();
 
 	// Whatever step 0 is guided against goes in before the bridge, so that the
-	// primary's decode is the last one and its logits are live (§4.3).
+	// primary's decode is the last one and its logits are live (§4.3). A
+	// cfg_score branch takes the same bridge, or is dropped (SPEC_NEGATIVE §8.2).
+	score_close(q, bridge);
 	guidance_enter(q);
 	feed(q, bridge, js.prefix_sem.size(), "semantic");
 }
@@ -4417,10 +5044,14 @@ void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expec
 
 	GenStats & st = q.phase == PHASE_ABC ? js.st_abc : js.st_sem;
 	st.prefill_seconds = now_seconds() - q.t_phase0;
+	draw(q);
+}
 
-	// Immediately: the next llama_decode from any slot overwrites this buffer.
-	// The branches were prefilled before this feed, so their rows are in hand
-	// (SPEC_GUIDANCE §4.3).
+// Samples and applies the token after whatever was fed last. Immediately: the
+// next llama_decode from any slot overwrites this buffer. The branches were
+// prefilled before that feed, so their rows are in hand (SPEC_GUIDANCE §4.3).
+void Runner::draw(Seq & q)
+{
 	const float *     primary = llama_get_logits_ith(ctx, q.i_batch);
 	const llama_token token   = sample(q, blend_row(q, primary));
 	if (q.traced)
@@ -4928,6 +5559,7 @@ void Runner::template_done(Seq & q)
 	}
 	js.abc_text      = js.tpl_text;
 	js.have_abc_text = true;
+	js.header_ok     = header_check(js.abc_text, js.tag);
 
 	// From here the request *is* a plain external-"abc" request for the score the
 	// holes produced, and that is what request.json and plan.json record. Nothing
@@ -5011,6 +5643,7 @@ void Runner::enter(Seq & q, int job)
 	q.line_pre.clear();
 	q.sec_next = 0;
 	q.sec_cuts = 0;
+	q.header   = HeaderWatch();
 	active++;
 
 	if (js.do_abc)
@@ -5033,6 +5666,9 @@ void Runner::enter(Seq & q, int job)
 			template_step(q);
 			return;
 		}
+		// A cfg_score job's negative goes in first, so the primary's decode is
+		// the last one and its logits are live (SPEC_NEGATIVE §8.2).
+		score_enter(q);
 		feed(q, js.prefix_abc, js.prefix_abc.size(), "abc");
 		return;
 	}
@@ -5223,11 +5859,14 @@ void Runner::finish_job(Seq & q)
 		a.codes         = codes;
 		a.abc_text      = js.abc_text;
 		a.have_abc_text = js.have_abc_text;
+		a.header_ok     = js.header_ok;
+		a.tempo_sampled = js.tempo_sampled;
 		a.template_text = js.is_template ? js.req.abc_template : std::string();
 		a.guidance      = js.req.has_guidance || js.req.has_sections ? &js.guide : nullptr;
 		a.sections      = js.req.has_sections ? &js.sections : nullptr;
 		a.keep          = js.keep_codes.empty() ? nullptr : &js.keep_codes;
 		a.trace         = (*jobs)[q.job].trace && !js.guide.empty() ? &js.trace : nullptr;
+		a.trace_abc     = (*jobs)[q.job].trace && score_guided(js.req) ? &js.trace_abc : nullptr;
 		a.negative      = js.negative_prefix.empty() ? nullptr : &js.negative_prefix;
 		write_artifacts(a);
 		printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
@@ -5238,11 +5877,20 @@ void Runner::finish_job(Seq & q)
 	if ((*jobs)[q.job].trace)
 	{
 		const size_t rows = js.trace.size() / TRACE_COLUMNS;
-		if (js.guide.empty())
+		if (score_guided(js.req))
+		{
+			const size_t abc_rows = js.trace_abc.size() / TRACE_COLUMNS;
+			printf("%sguidance trace: %zu rows x %d in guidance_trace_abc.npy (the score phase, "
+			       "%.3f ms/row); its blank columns are the negative branch: %s\n", js.tag.c_str(),
+			       abc_rows, TRACE_COLUMNS,
+			       abc_rows > 0 ? 1000 * js.trace_abc_seconds / (double) abc_rows : 0,
+			       negative_label(js.req).c_str());
+		}
+		if (js.guide.empty() && !score_guided(js.req))
 		{
 			printf("%sguidance trace: this request has no guidance, nothing to trace\n",
 			       js.tag.c_str());
-		} else {
+		} else if (!js.guide.empty()) {
 			printf("%sguidance trace: %zu rows x %d in guidance_trace.npy (%.3f ms/row)%s\n",
 			       js.tag.c_str(), rows, TRACE_COLUMNS,
 			       rows > 0 ? 1000 * js.trace_seconds / (double) rows : 0,
@@ -5262,6 +5910,8 @@ void Runner::finish_job(Seq & q)
 	r.cfg_scale   = js.guidance;
 	r.negative_style  = js.req.negative_style;
 	r.negative_lyrics = js.req.negative_lyrics;
+	r.cfg_score       = js.req.cfg_score;
+	r.score_tempo     = js.req.has_tempo ? js.req.score_tempo : 0;
 	r.card        = card;
 	r.ok          = true;
 	r.is_template = js.is_template;
@@ -5362,6 +6012,10 @@ void Runner::run()
 				}
 				b.i_batch = batch.n_tokens;
 				batch_add(batch, q.next, b.pos++, b.slot, true);
+				if (q.phase == PHASE_ABC)
+				{
+					b.fed.push_back(q.next);   // score_close checks what it holds
+				}
 				first = b.slot < first ? b.slot : first;
 				last  = std::max(last, b.slot);
 			}
@@ -5399,7 +6053,7 @@ void Runner::run()
 			{
 				if (seqs[i].branch[k].live)
 				{
-					fetch_row(seqs[i].branch[k]);
+					fetch_row(seqs[i].branch[k], seqs[i].phase);
 				}
 			}
 			const float * primary = llama_get_logits_ith(ctx, seqs[i].i_batch);
@@ -5544,7 +6198,12 @@ static int run_ar_dump(const ArParams & p)
 	// Guided: the row worth dumping is the *blended* one of the first semantic
 	// step, so the prefixes are the semantic ones and every live branch is
 	// prefilled beside the positive sequence (SPEC_GUIDANCE §3).
+	//
+	// A cfg_score request's first guided row is abc step 0's instead: the
+	// positive abc prefix and the negative's, both whole before anything is
+	// written (SPEC_NEGATIVE §8.3).
 	const bool                            guided = is_guided(req);
+	const bool                            score  = score_guided(req);
 	const std::vector<GuidanceEntry>      plan   = guidance_plan(req);
 	std::vector<std::vector<llama_token>> feeds;
 	std::vector<int>                      kinds;   // parallel to feeds, -1 = the positive one
@@ -5552,6 +6211,11 @@ static int run_ar_dump(const ArParams & p)
 	{
 		feeds.push_back(prefix_abc);
 		kinds.push_back(-1);
+	} else if (score) {
+		feeds.push_back(prefix_abc);
+		kinds.push_back(-1);
+		feeds.push_back(prefix_head(vocab, negative_request(req).text()));
+		kinds.push_back(BRANCH_BLANK);
 	} else {
 		if (req.cot != "off" && !req.has_abc)
 		{
@@ -5605,7 +6269,7 @@ static int run_ar_dump(const ArParams & p)
 		die("failed to create the llama context");
 	}
 	printf("context: %u tokens, %s prefix %zu tokens, batch %u\n",
-	       cparams.n_ctx, guided ? "semantic" : "abc", feeds[0].size(), llama_n_batch(ctx));
+	       cparams.n_ctx, guided && !score ? "semantic" : "abc", feeds[0].size(), llama_n_batch(ctx));
 
 	llama_batch batch = llama_batch_init((int32_t) llama_n_batch(ctx), 0, 1);
 	if (!guided)
@@ -5630,19 +6294,21 @@ static int run_ar_dump(const ArParams & p)
 			rows[i - 1].assign(logits, logits + n_vocab);
 		}
 
-		// The blend of §2.1 over the ids the semantic sampler can visit; outside
-		// them the file keeps the positive row, so one .npy shows both.
+		// The blend of §2.1 over the ids the phase's sampler can visit; outside
+		// them the file keeps the positive row, so one .npy shows both. Abc step
+		// 0 is in the score's header, which cfg_score never guides (SPEC_NEGATIVE
+		// §9.2): its blended row is the primary's, as the sampler sees it.
 		std::vector<float> blended = rows[0];
-		for (int i = 0; i < SEM_ROW_LEN; i++)
+		for (int i = 0; i < SPAN_SEM.total() && !score; i++)
 		{
-			const float b   = rows[0][(size_t) (SEM_ROW_FIRST + i)];
-			float       acc = b;
+			const size_t id  = (size_t) SPAN_SEM.id(i);
+			const float  b   = rows[0][id];
+			float        acc = b;
 			for (size_t k = 1; k < rows.size(); k++)
 			{
-				const float w = (float) curve_at(plan[0].curve[kinds[k]], 0);
-				acc += w * (b - rows[k][(size_t) (SEM_ROW_FIRST + i)]);
+				acc += (float) curve_at(plan[0].curve[kinds[k]], 0) * (b - rows[k][id]);
 			}
-			blended[(size_t) (SEM_ROW_FIRST + i)] = acc;
+			blended[id] = acc;
 		}
 		printf("prefill: %.3f s, %zu branch%s\n", now_seconds() - t0, rows.size() - 1,
 		       rows.size() == 2 ? "" : "es");
@@ -5651,6 +6317,11 @@ static int run_ar_dump(const ArParams & p)
 			// The file keeps its name; there is no metadata beside it to carry
 			// the text, so the log does (SPEC_NEGATIVE §4).
 			printf("dump: the blank row is the negative branch: %s\n", negative_label(req).c_str());
+		}
+		if (score)
+		{
+			printf("dump: abc step 0 is in the score's header, which is never guided: the "
+			       "blended row is the primary's\n");
 		}
 		save_row_or_die(p.dump_logits, n_vocab, blended.data());
 		for (size_t i = 0; i < rows.size(); i++)
@@ -5845,6 +6516,7 @@ static int ar_decode_jobs(const ArBatchParams & p, const std::vector<ArJob> & jo
 			js.abc_ids       = tokenize(vocab, js.req.abc, "external abc");
 			js.abc_text      = detokenize(vocab, js.abc_ids);
 			js.have_abc_text = true;
+			js.header_ok     = header_check(js.abc_text, js.tag);
 			for (size_t k = 0; k < js.abc_ids.size(); k++)
 			{
 				if (js.abc_ids[k] < 0 || js.abc_ids[k] >= EOD)
@@ -5886,7 +6558,10 @@ static int ar_decode_jobs(const ArBatchParams & p, const std::vector<ArJob> & jo
 		js.guide = js.req.has_sections ? sections_plan(js.sections) : guidance_plan(js.req);
 		js.heads.assign(js.guide.size(), std::vector<llama_token>());
 		size_t head_max = js.prefix_abc.size();
-		if (!js.guide.empty())
+		// A cfg_score job's negative lives from abc step 0 on, with no plan entry
+		// of its own when cfg_scale is 1: its head is sized for all the same, and
+		// covers the score and the semantic phase behind it (SPEC_NEGATIVE §8.2).
+		if (!js.guide.empty() || score_guided(js.req))
 		{
 			// [EOD] + the instruction on its own + [ABC_START], which is what
 			// blank_prefix builds; cot=off's is shorter still. A negative branch
@@ -6003,7 +6678,8 @@ static int ar_decode_jobs(const ArBatchParams & p, const std::vector<ArJob> & jo
 		// A plain-swap "sections" job is not one of them: its cut drops the old
 		// sequence and refills the slot it freed, so no branch is ever live and
 		// one stream is the whole of what it needs (SPEC_SECTIONS §4).
-		guided = guided || (states[i].ok && !states[i].guide.empty() && !states[i].plain_swap);
+		guided = guided || (states[i].ok && !states[i].guide.empty() && !states[i].plain_swap) ||
+		         (states[i].ok && score_guided(states[i].req));
 	}
 	const int n_streams = guided ? BRANCH_KINDS + 1 : parallel;
 
@@ -6677,6 +7353,7 @@ static int run_handover(const ArBatchParams & p, const ArJob & job, JobState & t
 		a.codes         = song;
 		a.abc_text      = base.abc_text;
 		a.have_abc_text = true;
+		a.header_ok     = score_header_missing(base.abc_text).empty();
 		a.handover      = &handover;
 		write_artifacts(a);
 	}

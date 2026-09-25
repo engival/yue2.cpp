@@ -59,6 +59,16 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   `cfg_scale` pushes along the tag difference alone (a lyric-less negative traced
   as far from the song as the blank did); `false` is bit-identical to stage 11.
   Numbers in [src/STATUS_NEGATIVE.md](../src/STATUS_NEGATIVE.md).
+- Stage 11c: `cfg_score` — the lyric-carrying negative also guides the score
+  phase (no reference equivalent): one branch from abc step 0 that becomes
+  `cfg_scale`'s negative at the transition (or is dropped at `cfg_scale` 1);
+  without it every path is bit-identical to stage 11b. Numbers in
+  [src/STATUS_NEGATIVE.md](../src/STATUS_NEGATIVE.md).
+- Stage 11d: `cfg_score` leaves the score header unguided (weight 0 until the
+  first `K:` line), a header check (`score_header_ok`) for every score, and
+  `score_tempo` forcing the score's `Q:1/4=t` line; without them every path is
+  bit-identical to stage 11c. Numbers in
+  [src/STATUS_NEGATIVE.md](../src/STATUS_NEGATIVE.md).
 - The VAE fork (2026-09-13): `song`/`batch` decode in-process at the NAR's
   Vulkan precision. A listening test found the fp16-staged decode (58.5 dB from
   exact) indistinguishable, and on the AMD the exact path is not faster — so
