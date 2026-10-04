@@ -232,6 +232,9 @@ struct KV
 	ggml_tensor * in_t   = nullptr;
 	ggml_tensor * in_pos = nullptr;
 	ggml_tensor * in_lat = nullptr;
+	// Flash-attention only: masks the padding columns of a cache rounded up to
+	// FA_KV_ALIGN; nullptr when there is no padding (the NAR otherwise runs unmasked).
+	ggml_tensor * nar_mask = nullptr;
 	int64_t smax = 0;
 
 	void free_all()
@@ -249,15 +252,22 @@ struct KV
 		k.clear();
 		v.clear();
 		o_scratch = nullptr;
-		in_x = in_t = in_pos = in_lat = nullptr;
+		in_x = in_t = in_pos = in_lat = nar_mask = nullptr;
 		kv_type = GGML_TYPE_F32;
 		smax = 0;
 	}
 };
 
+// ggml-vulkan's coopmat1 flash attention takes its bounds-checked path for every
+// KV tile, not just the last, unless KV is a multiple of its 64-column tile:
+// 16 -> 27 TFLOP/s at the NAR's shape on the 7900 XTX. Padding columns are zero
+// and masked.
+static const int64_t FA_KV_ALIGN = 64;
+
 static void kv_alloc(KV & kv, const Config & c, ggml_backend_t backend, bool fa,
-                     ggml_type kv_type, int64_t smax, int64_t N, int64_t n_scratch)
+                     ggml_type kv_type, int64_t S, int64_t N, int64_t n_scratch)
 {
+	const int64_t smax = fa ? GGML_PAD(S, FA_KV_ALIGN) : S;
 	kv.free_all();
 	kv.smax    = smax;
 	kv.fa      = fa;
@@ -292,6 +302,11 @@ static void kv_alloc(KV & kv, const Config & c, ggml_backend_t backend, bool fa,
 	ggml_set_name(kv.in_t,   "t_emb");
 	ggml_set_name(kv.in_pos, "nar_pos");
 	ggml_set_name(kv.in_lat, "latent_pos");
+	if (smax > S)
+	{
+		kv.nar_mask = ggml_new_tensor_2d(kv.ctx, GGML_TYPE_F16, smax, GGML_PAD(N, 64));
+		ggml_set_name(kv.nar_mask, "nar_mask");
+	}
 
 	kv.buf = ggml_backend_alloc_ctx_tensors(kv.ctx, backend);
 	if (kv.buf == nullptr)
@@ -301,6 +316,21 @@ static void kv_alloc(KV & kv, const Config & c, ggml_backend_t backend, bool fa,
 	// Attention always reads the whole cache (see block()), so the rows a prefill
 	// block has not written yet must be finite, not uninitialised.
 	ggml_backend_buffer_clear(kv.buf, 0);
+
+	if (kv.nar_mask != nullptr)
+	{
+		const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+		const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+		std::vector<ggml_fp16_t> row((size_t) smax, ninf);
+		std::fill(row.begin(), row.begin() + S, zero);
+		std::vector<ggml_fp16_t> mask;
+		mask.reserve((size_t) ggml_nelements(kv.nar_mask));
+		for (int64_t i = 0; i < kv.nar_mask->ne[1]; i++)
+		{
+			mask.insert(mask.end(), row.begin(), row.end());
+		}
+		ggml_backend_tensor_set(kv.nar_mask, mask.data(), 0, ggml_nbytes(kv.nar_mask));
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -540,7 +570,7 @@ static void build_velocity(const Model & m, KV & kv, int64_t ar_length, int64_t 
 
 	for (int l = 0; l < c.n_layer; l++)
 	{
-		x = block(b, kv, l, "nar_", x, pos, nullptr, ar_length, kv.fa ? 0 : query_chunk);
+		x = block(b, kv, l, "nar_", x, pos, kv.nar_mask, ar_length, kv.fa ? 0 : query_chunk);
 		if (dump && l == 0)
 		{
 			ggml_set_name(x, "x_l0");
@@ -1052,12 +1082,12 @@ int run_nar(const NarParams & p)
 					pos[(size_t) i] = (int32_t) (off + i);
 				}
 				const int64_t mrows = g.mask->ne[1];
-				mask.assign((size_t) S * mrows, -INFINITY);
+				mask.assign((size_t) (kv.smax * mrows), -INFINITY);
 				for (int64_t i = 0; i < B; i++)
 				{
 					for (int64_t j = 0; j < S; j++)
 					{
-						mask[(size_t) (i * S + j)] = j <= off + i ? 0.0f : -INFINITY;
+						mask[(size_t) (i * kv.smax + j)] = j <= off + i ? 0.0f : -INFINITY;
 					}
 				}
 				ggml_backend_tensor_set(g.in_a, &ids[(size_t) off], 0, (size_t) B * sizeof(int32_t));
