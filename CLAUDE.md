@@ -49,8 +49,9 @@ manual; this file is where things are and the rules that were learned the hard w
   `yue2 batch` decode the VAE at the NAR's, and the exact-F32 decode is the
   standalone `yue2 vae` (SPEC_SINGLE §2.2 — it used to be a forked child).
 - F32 K/V makes attention an F32×F32 matmul (slowest path); F16 K/V (`--kv-f16`)
-  puts it on coopmat. Flash-attention wins on RADV, loses on the Arc (ggml's FA
-  tuning is for Xe1).
+  puts it on coopmat. Flash-attention wins on both cards with coopmat on (the Arc
+  needs our fork's coopmat1 FA for its 8x16x16 shape); without coopmat
+  (`--nar-f32`) the Arc's FA is the scalar kernel and loses to `--query-chunk`.
 - `ggml_gallocr` recycles graph-owned input tensors between evaluations; inputs
   that must survive live in their own backend buffer.
 - ggml-vulkan returned zeros for kv heads ≥ 1 on a strided-ne2 F32 `mul_mat`

@@ -130,10 +130,11 @@ yue2 song --request R.json --out X.flac [--artifacts DIR] [--seed N]
 ```
 Defaults for the three GGUFs: `yue2-ar-q8_0.gguf`, `yue2-nar-f16.gguf`,
 `yue2-vae-f32.gguf` next to the executable, then the repo root (hardlinks live
-there). `--gpu 0` → NAR uses `--kv-f16 --vk-f16-matmul --flash-attn`; `--gpu 1`
-(Intel Arc) → `--kv-f16 --vk-f16-matmul --query-chunk 8192` — the measured
-per-card choice from STATUS_NAR_PERF §8; pick by ggml device **name** (contains
-"Intel"), not by index, and print which flags were chosen. `--nar-f32` drops
+there). The NAR uses `--kv-f16 --vk-f16-matmul --flash-attn` on both cards. With
+`--nar-f32` on an Intel card (picked by ggml device **name**, containing "Intel",
+not by index) it uses `--query-chunk 8192` instead of `--flash-attn`, since FA
+without coopmat is the scalar kernel there (STATUS_NAR_PERF §8). Print which
+flags were chosen. `--nar-f32` drops
 `--vk-f16-matmul`. `--seed` overrides the request's seed for AR sampling and
 noise alike.
 

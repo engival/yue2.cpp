@@ -204,10 +204,11 @@ void pick_nar_flags(const BatchParams & p, int64_t prefix_len, int64_t frames,
 	card = ggml_backend_dev_description(vulkan_device(p.gpu));
 	nar.kv_f16        = true;
 	nar.vk_f16_matmul = !p.nar_f32;
-	if (card.find("Intel") != std::string::npos)
+	if (card.find("Intel") != std::string::npos && !nar.vk_f16_matmul)
 	{
-		// ggml-vulkan's flash-attention kernel is untuned for Battlemage
-		// (2.6 TFLOP/s); one unfused query tile wins — when it fits. Untiled,
+		// Without coopmat (--nar-f32), ggml-vulkan's flash attention falls back
+		// to its scalar kernel on Battlemage (2.6 TFLOP/s); one unfused query
+		// tile wins — when it fits. Untiled,
 		// the materialized scores are one S*N*n_head float buffer: 2.6 GB for a
 		// 164 s song, and past Vulkan's per-allocation ceiling by ~5000 frames,
 		// where the allocation fails outright. Keep the default tiling there.

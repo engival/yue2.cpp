@@ -92,11 +92,12 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
    `song`/`batch` option instead of a standalone-only route, and `--nar-f32`
    would stop shifting AR sampling. A legitimate upstream PR. Needs both shader variants compiled per
    device (`ggml-vulkan.cpp` ~L6584/L7513 read the env once).
-2. **ggml-vulkan: Intel Battlemage flash-attention tuning.** ggml's
-   `get_fa_tuning_params_scalar` disables subgroups and halves `block_rows` for
-   Intel (tuned on Xe1). On the B70 FA runs at 2.6 TFLOP/s vs 19 on RADV; the Arc
-   NAR uses unfused tiles at 92 s because of it. A tuned FA could bring the Arc
-   under 60 s. Also a submodule/upstream change.
+2. ~~**ggml-vulkan: Intel Battlemage flash-attention tuning.**~~ Done in our
+   llama.cpp fork (`dev`): coopmat1 FA on the Arc's 8x16x16 coopmat shape runs at
+   ~29 TFLOP/s at the NAR shape (was 2.6 scalar), plus upstream PR #29882 for the
+   per-head norm and a fused SwiGLU. The Arc NAR now uses `--flash-attn` like the
+   AMD: ~0.5 s/eval at 16 steps on a full song (was 1.1 with unfused tiles).
+   Upstreaming the FA work is still open.
 3. **Beat torch's 46 s on the AMD.** Attention is 66 % of a velocity eval and
    RADV's FA kernel runs at 19 TFLOP/s; the GEMMs are already at 56. Upstream
    is tuning this kernel for NVIDIA and Intel, not RDNA3 — so it is ours after

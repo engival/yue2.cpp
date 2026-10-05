@@ -463,8 +463,8 @@ static ggml_tensor * block(const Builder & b, KV & kv, int l, const char * pfx,
 	}
 
 	ggml_tensor * h2 = b.rms(x, bn(l, pfx, "ffn_norm.weight"));
-	ggml_tensor * up = ggml_mul(ctx,
-		ggml_silu(ctx, b.mm(bn(l, pfx, "ffn_gate.weight"), h2)),
+	ggml_tensor * up = ggml_swiglu_split(ctx,
+		b.mm(bn(l, pfx, "ffn_gate.weight"), h2),
 		b.mm(bn(l, pfx, "ffn_up.weight"), h2));
 	return ggml_add(ctx, x, b.mm(bn(l, pfx, "ffn_down.weight"), up));
 }

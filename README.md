@@ -777,7 +777,7 @@ ROCm bf16 artifact is itself 35 dB from it, so ~30 dB is inaudible here):
 | `--kv-f16` | F16 K/V cache. Halves it, and puts the attention matmuls on ggml-vulkan's f16 pipelines — the difference between 8 and 27 TFLOP/s on an Arc B70. |
 | `--vk-f16-matmul` | Skips the `GGML_VK_DISABLE_F16`/`COOPMAT` guard, so Vulkan stages matmul operands as f16. Big speedup, ~33 dB instead of ~66. |
 | `--query-chunk N` | Query tile for the materialized-score path. `8192` (one tile) is fastest and needs 2.8 GB of arena at `N = 4111`; `512`–`1024` trade ~10 % for a quarter of that. |
-| `--flash-attn` | `ggml_flash_attn_ext` instead of materialized scores. Wins on the 7900 XTX, loses badly on the Arc (Intel's scalar FA kernel). |
+| `--flash-attn` | `ggml_flash_attn_ext` instead of materialized scores. Wins on both cards with `--vk-f16-matmul`; on the Arc without it (scalar FA kernel) it loses to `--query-chunk`. |
 | `--weights f32` | Widen F16 weights at load. Needed only on `--device cpu`, where ggml's F16 `mul_mat` rounds the activations too. |
 
 Measured on the 164 s `alley_swing_s1`, 32 steps: Arc B70 92 s with
