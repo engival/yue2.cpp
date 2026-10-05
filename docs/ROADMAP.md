@@ -74,6 +74,12 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
   exact) indistinguishable, and on the AMD the exact path is not faster — so
   exact-F32 is a numeric reference reached through the standalone `yue2 vae`,
   and asking `song`/`batch` for it is an error, not a downgrade. SPEC_SINGLE §2.2.
+- VAE ConvTranspose1d as a kernel-2 Conv1d (2026-10-05): each decoder block's
+  transposed conv (kernel 2·stride) runs as im2col + mul_mat with `stride·Cout`
+  outputs and a permute, its weight rearranged at load. ggml-vulkan's
+  `conv_transpose_1d` kernel had been 82 % of the decode. 191 s song: Arc
+  16.1 → 3.3 s, AMD 7.6 → 1.9 s; CPU golden 122.09 dB (was 121.95), fp16-staged
+  65 dB from exact (was 67).
 - Opus output: an output named `X.opus` is encoded with libopusenc at
   `--opus-bitrate` (default 160 kbit/s) in `song`, `batch` and `vae`, tags and
   all. Optional at build time (`-DYUE2_OPUS`, default on when pkg-config finds

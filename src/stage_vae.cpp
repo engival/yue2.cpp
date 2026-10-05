@@ -138,13 +138,34 @@ static void load_model(const char * path, ggml_backend_t backend, Model & model)
 	};
 	model.wctx = ggml_init(ip);
 
+	// Each decoder block's ConvTranspose1d weight ([2s, Cout, Cin] in ggml order)
+	// is rearranged at load into a kernel-2 Conv1d weight [2, Cin, s * Cout]; see
+	// Builder::conv_transpose1d.
+	std::map<std::string, int> transposed;   // weight name -> stride
+	for (size_t i = 0; i < c.strides.size(); i++)
+	{
+		transposed["decoder.layers." + std::to_string(i + 1) + ".layers.1.weight"] = c.strides[c.strides.size() - 1 - i];
+	}
+
 	// Everything lives as F32 on the backend: the graph feeds conv weights to
-	// mul_mat as src1, which must be F32, and the Vulkan conv_transpose_1d
-	// kernel is F32-only. F16 tensors in the file are widened at load.
+	// mul_mat as src1, which must be F32. F16 tensors in the file are widened at load.
 	for (int64_t i = 0; i < n_tensors; i++)
 	{
 		const char * name = gguf_get_tensor_name(gc, i);
 		const int64_t * ne = gguf_get_tensor_ne(gc, i);
+		auto tr = transposed.find(name);
+		if (tr != transposed.end())
+		{
+			const int s = tr->second;
+			if (ne[0] != 2 * s)
+			{
+				die("'%s': kernel %lld, expected 2 * stride = %d", name, (long long) ne[0], 2 * s);
+			}
+			ggml_tensor * t = ggml_new_tensor_3d(model.wctx, GGML_TYPE_F32, 2, ne[2], s * ne[1]);
+			ggml_set_name(t, name);
+			model.tensors[name] = t;
+			continue;
+		}
 		ggml_tensor * t = ggml_new_tensor_4d(model.wctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
 		ggml_set_name(t, name);
 		model.tensors[name] = t;
@@ -207,6 +228,33 @@ static void load_model(const char * path, ggml_backend_t backend, Model & model)
 			}
 		}
 
+		// Output block t (s samples) of the transposed conv is x[t] * w[0:s] +
+		// x[t - 1] * w[s:2s]: tap kk = 1 reads x[t], tap kk = 0 reads x[t - 1].
+		auto tr = transposed.find(name);
+		if (tr != transposed.end())
+		{
+			const int64_t * ne  = gguf_get_tensor_ne(gc, i);
+			const int64_t   s   = tr->second;
+			const int64_t   k_n = ne[0], cout = ne[1], cin = ne[2];
+			std::vector<float> re((size_t) nelem);
+			for (int64_t co = 0; co < cout; co++)
+			{
+				for (int64_t j = 0; j < s; j++)
+				{
+					for (int64_t ci = 0; ci < cin; ci++)
+					{
+						for (int64_t kk = 0; kk < 2; kk++)
+						{
+							re[(size_t) (kk + 2 * (ci + cin * (j + s * co)))] =
+								src[j + s * (1 - kk) + k_n * (co + cout * ci)];
+						}
+					}
+				}
+			}
+			ggml_backend_tensor_set(t, re.data(), 0, (size_t) nelem * sizeof(float));
+			continue;
+		}
+
 		ggml_backend_tensor_set(t, src, 0, (size_t) nelem * sizeof(float));
 	}
 	fclose(f);
@@ -256,12 +304,23 @@ struct Builder
 		return r;
 	}
 
-	// torch ConvTranspose1d(stride=s, kernel=2s, padding=p): ggml has no
-	// padding, so run it unpadded and crop p samples off each end.
+	// torch ConvTranspose1d(stride=s, kernel=2s, padding=p), as a kernel-2 Conv1d
+	// with s * Cout outputs over x padded by one frame each side (weight
+	// rearranged at load). The mul_mat gives [L + 1, s, Cout] — s output samples
+	// per block — so permute the s phases into time, then crop p samples off
+	// each end. Same math as
+	// ggml_conv_transpose_1d, but on im2col + mul_mat — ggml-vulkan's
+	// conv_transpose_1d kernel was 82% of the decode on the Arc.
 	ggml_tensor * conv_transpose1d(ggml_tensor * x, const std::string & prefix, int stride, int pad)
 	{
-		ggml_tensor * w = model->get(prefix + ".weight");
-		ggml_tensor * r = ggml_conv_transpose_1d(ctx, w, x, stride, 0, 1);
+		ggml_tensor * w = model->get(prefix + ".weight");   // [2, Cin, s * Cout]
+		ggml_tensor * im2col = ggml_im2col(ctx, w, x, 1, 0, 1, 0, 1, 0, false, im2col_type);
+		ggml_tensor * r = ggml_mul_mat(ctx,
+			ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+			ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
+		const int64_t blocks = im2col->ne[1];
+		r = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, r, blocks, stride, w->ne[2] / stride), 1, 0, 2, 3));
+		r = ggml_reshape_2d(ctx, r, stride * blocks, r->ne[2]);
 		if (pad > 0)
 		{
 			const int64_t len = r->ne[0] - 2 * pad;

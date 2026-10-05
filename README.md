@@ -117,8 +117,8 @@ build/yue2 song --request song.json --out song.flac --gpu 0
 ```
 
 `--gpu N` picks the Vulkan device (and with it the NAR's flags). Measured on an
-Intel Arc B70: 155 s and ~8 GB peak VRAM for 156 s of audio; a 7900 XTX is
-roughly twice as fast per GPU stage (NAR 52 s vs 92 s, VAE 7.5 s vs 15 s). The
+Intel Arc B70: 200 s for 340 s of audio (abc 31 s, semantic 84 s, NAR 78 s,
+VAE 6.8 s); a 7900 XTX is roughly 1.7× as fast (VAE of a 191 s song: 1.9 s vs 3.3 s). The
 **first** Vulkan run spends ~16 min compiling RADV pipelines; later runs start in
 under a second.
 
@@ -586,11 +586,8 @@ build/yue2 vae -m yue2-vae-f32.gguf -i DIR/latent.npy -o exact.flac --device vul
 key) rather than silently downgrading — the error names that command. `--nar-f32` is the one switch that does move the whole process,
 VAE included, onto the exact pipelines.
 
-Measured on the Intel Arc B70, 156 s of audio: 155 s end to end (abc 15 s,
-semantic 37 s, NAR 88 s, VAE 14 s), ~8.7 GB peak VRAM — the VAE figure is from
-the exact-F32 child. The two precisions cost about the same: on this card exact
-is ~6 % faster (16.2 s vs 17.1 s fp16-staged, 191 s song), on the AMD the
-fp16-staged path is the quicker one (9.2 s vs 9.5 s). Details, the per-stage
+The two precisions cost about the same: a 191 s song decodes on the Intel Arc
+B70 in 4.1 s exact vs 3.3 s fp16-staged (65 dB apart). Details, the per-stage
 goldens and the Q8_0/F16 prefix measurement are in
 [src/STATUS_SINGLE.md](src/STATUS_SINGLE.md).
 
