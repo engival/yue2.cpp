@@ -8,6 +8,9 @@
 
 #include "stage_ar.hpp"
 
+#include "draft_accept.hpp"
+#include "draft_eagle3.hpp"
+
 #include "common/device.hpp"
 #include "common/fileio.hpp"
 #include "common/util.hpp"
@@ -350,6 +353,27 @@ static bool is_guided(const Request & r)
 	return r.has_guidance || cfg_scalar(r) != 1.0 || score_guided(r);
 }
 
+// SPEC_DRAFT §1: the requests a draft head cannot speculate for, "" when it
+// can. A plain-swap "sections", a template and cot=off with cfg_scale 1 are
+// fine; cot=off alone is guided (its cfg_scale defaults to 1.01).
+static std::string draft_request_error(const Request & r)
+{
+	if (is_guided(r))
+	{
+		return "--draft does not support guidance (guidance, cfg_scale, cfg_score or "
+		       "sections with an \"against\"; cot=off needs \"cfg_scale\": 1)";
+	}
+	if (r.has_keep)
+	{
+		return "--draft does not support \"semantic_keep\"";
+	}
+	if (r.has_handover)
+	{
+		return "--draft does not support \"handover\"";
+	}
+	return "";
+}
+
 // The entries the decode loop runs, so that both request forms are one
 // mechanism: plain `cfg_scale = c` is the blank branch live from semantic step 0
 // with the constant weight c - 1 (SPEC_GUIDANCE §2.2).
@@ -419,6 +443,31 @@ static std::string strf(const char * fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	return buf;
+}
+
+// draft_request_error's counterpart for the process-wide flags, at the clamped
+// parallel (SPEC_DRAFT §1).
+static std::string draft_params_error(bool greedy, bool verify_sampler, bool prefix_only,
+	int parallel)
+{
+	if (greedy)
+	{
+		return "--draft does not support --greedy";
+	}
+	if (verify_sampler)
+	{
+		return "--draft does not support --verify-sampler";
+	}
+	if (prefix_only)
+	{
+		return "--draft does not support --prefix-only";
+	}
+	if (parallel > 1)
+	{
+		return strf("--draft needs --parallel 1 (this batch decodes %d songs side by side)",
+		            parallel);
+	}
+	return "";
 }
 
 // -------------------------------------------------------- score templates ---
@@ -1805,16 +1854,18 @@ static void scan_allowed(const float * logits, const int seg[2][2],
 // pass is a compare per allowed id and the divide is one instruction beside it,
 // and for the semantic phase — the long one, and the only one where temperature
 // is 1 — there is no divide at all.
-static llama_token sample_step(const float * logits, int n_vocab, const Sampling & s,
+//
+// Split since stage 12 (SPEC_DRAFT §3.1): shape_step is everything above the
+// draw and consumes no RNG, so the speculative path can shape a distribution it
+// only compares against. It returns the argmax when greedy (temperature 0),
+// else -1 with sc.cand / sc.prob holding the distribution, p descending and id
+// ascending on ties. `history` is read for its last penalty_window ids only.
+static llama_token shape_step(const float * logits, int n_vocab, const Sampling & s,
 	const std::vector<llama_token> & history, int step,
-	bool phase_abc, bool legacy_off, std::mt19937_64 & rng,
-	SampleScratch * scratch = nullptr, bool mask_end = false)
+	bool phase_abc, bool legacy_off, SampleScratch & sc, bool mask_end = false)
 {
 	const float ninf = -std::numeric_limits<float>::infinity();
 	const int   end  = phase_abc ? ABC_END : MUSIC_END;
-
-	SampleScratch   local;
-	SampleScratch & sc = scratch != nullptr ? *scratch : local;
 
 	// The allowed set, ascending: abc is [0, EOD) then ABC_END, semantic is
 	// MUSIC_END then the codec block. `end` is masked out below min_tokens.
@@ -1986,19 +2037,33 @@ static llama_token sample_step(const float * logits, int n_vocab, const Sampling
 			sc.prob[i] /= sum;
 		}
 	}
+	return -1;
+}
 
+// One draw from [0, 1): every RNG use of the sampler and of the speculative
+// rounds goes through this, one draw each (SPEC_DRAFT §3.3 step 3).
+static double uniform01(std::mt19937_64 & rng)
+{
 	std::uniform_real_distribution<double> uniform(0.0, 1.0);
-	const double                           r = uniform(rng);
-	double                                 c = 0;
-	for (size_t i = 0; i < sc.prob.size(); i++)
-	{
-		c += sc.prob[i];
-		if (r < c)
-		{
-			return (llama_token) sc.cand[i].second;
-		}
-	}
-	return (llama_token) sc.cand.back().second;
+	return uniform(rng);
+}
+
+// The draw half of sample_step: inverse CDF over what shape_step left.
+static llama_token draw_step(const SampleScratch & sc, std::mt19937_64 & rng)
+{
+	return (llama_token) sc.cand[inverse_cdf(sc.prob.data(), sc.prob.size(), uniform01(rng))].second;
+}
+
+static llama_token sample_step(const float * logits, int n_vocab, const Sampling & s,
+	const std::vector<llama_token> & history, int step,
+	bool phase_abc, bool legacy_off, std::mt19937_64 & rng,
+	SampleScratch * scratch = nullptr, bool mask_end = false)
+{
+	SampleScratch     local;
+	SampleScratch &   sc     = scratch != nullptr ? *scratch : local;
+	const llama_token greedy = shape_step(logits, n_vocab, s, history, step, phase_abc,
+	                                      legacy_off, sc, mask_end);
+	return greedy >= 0 ? greedy : draw_step(sc, rng);
 }
 
 // LLAMA_BUILD_COMMON is OFF, so this is common/common.cpp's common_batch_add.
@@ -2054,6 +2119,11 @@ static int decode_feed(llama_context * ctx, llama_batch & b,
 
 // One row of guidance_trace.npy. The columns are in README.md.
 static const int TRACE_COLUMNS = 8;
+
+// One row of draft_trace.npy, per emitted token (SPEC_DRAFT §5): frame, depth
+// (1..K accepted draft, K+1 bonus, 0 residual), accepted (1 draft, 0 bonus,
+// 2 residual), p(tok), q(tok), Σmin(p, q) at that depth, H(p), p_max.
+static const int DRAFT_TRACE_COLUMNS = 8;
 
 // softmax over `n` logits, in double and with the row's maximum subtracted.
 // Returns log(sum exp(row)) — so `row[i] - the return value` is log p_i, which
@@ -2348,6 +2418,9 @@ struct Artifacts
 	// the tokenizer.
 	// Like the trace it is not in the manifest (SPEC_NEGATIVE §4).
 	const std::vector<llama_token> *   negative = nullptr;
+	// null unless --draft-trace: written as draft_trace.npy, a diagnostic like
+	// the guidance trace (SPEC_DRAFT §5).
+	const std::vector<float> *         draft_trace = nullptr;
 };
 
 static void write_artifacts(const Artifacts & a)
@@ -2401,6 +2474,17 @@ static void write_artifacts(const Artifacts & a)
 		                                     (int64_t) TRACE_COLUMNS };
 		const std::string          err   = npy::save((dir + "guidance_trace_abc.npy").c_str(), shape,
 		                                             a.trace_abc->empty() ? nullptr : a.trace_abc->data());
+		if (!err.empty())
+		{
+			die("%s", err.c_str());
+		}
+	}
+	if (a.draft_trace != nullptr)
+	{
+		const std::vector<int64_t> shape = { (int64_t) (a.draft_trace->size() / DRAFT_TRACE_COLUMNS),
+		                                     (int64_t) DRAFT_TRACE_COLUMNS };
+		const std::string          err   = npy::save((dir + "draft_trace.npy").c_str(), shape,
+		                                             a.draft_trace->empty() ? nullptr : a.draft_trace->data());
 		if (!err.empty())
 		{
 			die("%s", err.c_str());
@@ -2506,16 +2590,21 @@ static void write_artifacts(const Artifacts & a)
 
 // -------------------------------------------------------------------- main ---
 
-static int parse_positive_arg(const char * name, const char * text)
+static int parse_int_arg(const char * name, const char * text, int lo)
 {
 	errno = 0;
 	char *      endp  = nullptr;
 	const long  value = strtol(text, &endp, 10);
-	if (errno != 0 || endp == text || *endp != '\0' || value <= 0 || value > CONTEXT)
+	if (errno != 0 || endp == text || *endp != '\0' || value < lo || value > CONTEXT)
 	{
-		die("%s must be an integer in [1, %d] (got \"%s\")", name, CONTEXT, text);
+		die("%s must be an integer in [%d, %d] (got \"%s\")", name, lo, CONTEXT, text);
 	}
 	return (int) value;
+}
+
+static int parse_positive_arg(const char * name, const char * text)
+{
+	return parse_int_arg(name, text, 1);
 }
 
 // One `[offset, weight]` list. SPEC_GUIDANCE §2.3: non-empty, offsets
@@ -3838,6 +3927,20 @@ static std::vector<llama_token> negative_prefix(const llama_vocab * vocab, const
 }
 
 
+// The weight type config.json records for a draft head (SPEC_DRAFT §5).
+static std::string ftype_name(llama_ftype t)
+{
+	switch (t)
+	{
+		case LLAMA_FTYPE_ALL_F32:        return "F32";
+		case LLAMA_FTYPE_MOSTLY_F16:     return "F16";
+		case LLAMA_FTYPE_MOSTLY_BF16:    return "BF16";
+		case LLAMA_FTYPE_MOSTLY_Q8_0:    return "Q8_0";
+		case LLAMA_FTYPE_MOSTLY_Q4_K_M:  return "Q4_K_M";
+		default:                         return strf("ftype %d", (int) t);
+	}
+}
+
 // `vocab_only` loads the tokenizer and no weights, on no device (--prefix-only).
 static llama_model * load_model(const std::string & path, const std::string & device, int gpu,
 	std::string & backend_name, ggml_backend_dev_t * devices, bool vocab_only = false)
@@ -3934,6 +4037,10 @@ struct JobState
 	std::vector<float>                    trace_abc;   // the same, per abc step of a cfg_score job
 	double                                trace_seconds = 0;
 	double                                trace_abc_seconds = 0;
+
+	// --draft-trace: DRAFT_TRACE_COLUMNS floats per semantic token a speculative
+	// round emitted, written as draft_trace.npy (SPEC_DRAFT §5).
+	std::vector<float>                    draft_trace;
 
 	// SPEC_KEEP.md, empty unless the request carried a "semantic_keep": the N
 	// leading codes of an earlier render, read at validation time, forced as
@@ -4111,6 +4218,17 @@ struct Runner
 	double    t_loop0     = 0;
 	double    t_progress  = 0;
 
+	// SPEC_DRAFT: the EAGLE-3 head, null without --draft. --draft needs parallel
+	// 1, so its state is the one sequence's. The rest is a round's scratch.
+	Eagle3 *                 draft      = nullptr;
+	DraftParams              dp;
+	std::vector<DraftDist>   draft_q;      // q_1 .. q_K
+	DraftDist                draft_p;      // the p being tested
+	std::vector<llama_token> draft_ids;    // d_1 .. d_K
+	std::vector<llama_token> draft_hist;   // the penalty window's tail ++ what is drafted on it
+	std::vector<double>      draft_w;      // residual weights
+	SampleScratch            draft_sc;
+
 	void        enter(Seq & q, int job);
 	void        feed_tokens(Seq & q, const std::vector<llama_token> & tokens, size_t expect_pos,
 	                        const char * what);
@@ -4166,6 +4284,14 @@ struct Runner
 	void        start_continue(Seq & q);
 	void        continue_token(Seq & q, llama_token token);
 	void        finish_continue(Seq & q, const char * stopped_by);
+
+	// SPEC_DRAFT §3: the head's boundary after the semantic prefix, one
+	// speculative round, and the distributions it compares.
+	void        draft_prime(Seq & q);
+	void        draft_round(Seq & q);
+	void        draft_dist(const float * logits, int step, bool legacy_off, bool raw, DraftDist & out);
+	void        draft_trace_row(JobState & js, int frame, int depth, int accepted, llama_token tok,
+	                            const DraftDist * q);
 
 	void        finish_job(Seq & q);
 	void        progress();
@@ -5040,7 +5166,19 @@ void Runner::feed(Seq & q, const std::vector<llama_token> & tokens, size_t expec
 	const char * what)
 {
 	JobState & js = (*states)[q.job];
+	// The semantic phase extracts the head's target features from its first
+	// decode on, the prefix included: that is where the MUSIC_START row comes
+	// from (SPEC_DRAFT §3.2). Off again in finish_job.
+	const bool primed = draft != nullptr && !dp.extract_only && q.phase == PHASE_SEM;
+	if (primed)
+	{
+		eagle3_extract(*draft, true);
+	}
 	feed_tokens(q, tokens, expect_pos, what);
+	if (primed)
+	{
+		draft_prime(q);
+	}
 
 	GenStats & st = q.phase == PHASE_ABC ? js.st_abc : js.st_sem;
 	st.prefill_seconds = now_seconds() - q.t_phase0;
@@ -5646,6 +5784,12 @@ void Runner::enter(Seq & q, int job)
 	q.header   = HeaderWatch();
 	active++;
 
+	// --draft-extract-only: the extraction priced over both phases (§6.1).
+	if (draft != nullptr && dp.extract_only)
+	{
+		eagle3_extract(*draft, true);
+	}
+
 	if (js.do_abc)
 	{
 		// Unreachable: "semantic_keep" needs the score in "abc" (§2), and that
@@ -5810,6 +5954,246 @@ void Runner::sections_cut(Seq & q, size_t idx)
 	       s.nth, s.bar, s.seconds, head, feed.size() - head, now_seconds() - t0);
 }
 
+// ------------------------------------------------- speculative rounds ---
+// SPEC_DRAFT §3. Notation: P = q.pos, s = q.step; the target holds 0 .. P−1 and
+// q.next = t_P; the head holds depth-0 rows S−1 .. P−2 and the deferred
+// boundary (g_last, pos_last = P−1).
+
+// The head's boundary at S−1, the MUSIC_START row of the prefill just fed:
+// draw() reads its logits from the same batch index. A prefill of several
+// chunks leaves only the last one in the layer buffers, and that holds it.
+void Runner::draft_prime(Seq & q)
+{
+	JobState &   js = (*states)[q.job];
+	const double t0 = now_seconds();
+	if (q.last_fed != MUSIC_START || llama_memory_seq_pos_max(mem, q.slot) != q.pos - 1)
+	{
+		die("%sdraft: the semantic prefix ends in %d at %d, not MUSIC_START at %d",
+		    js.tag.c_str(), (int) q.last_fed, (int) llama_memory_seq_pos_max(mem, q.slot),
+		    (int) q.pos - 1);
+	}
+	eagle3_features(*draft, q.i_batch, 1);
+	eagle3_encode(*draft, 1);
+	draft->g_last.assign(draft->g.begin(), draft->g.begin() + draft->n_embd);
+	draft->pos_last = q.pos - 1;
+
+	js.st_sem.tested_per_depth.assign((size_t) dp.k, 0);
+	js.st_sem.accepted_per_depth.assign((size_t) dp.k, 0);
+	js.st_sem.draft_seconds += now_seconds() - t0;
+}
+
+// The distribution a logits row stands for at `step`, given draft_hist as the
+// history: the sampler's own shape (every p, and q by default), or for
+// --draft-q raw a plain softmax over MUSIC_END and the codec block — the head's
+// d2t set — with MUSIC_END masked below min_tokens as the shape masks it.
+void Runner::draft_dist(const float * logits, int step, bool legacy_off, bool raw, DraftDist & out)
+{
+	if (logits == nullptr)
+	{
+		die("draft: no logits row at semantic step %d", step);
+	}
+	if (!raw)
+	{
+		shape_step(logits, n_vocab, s_sem, draft_hist, step, false, legacy_off, draft_sc);
+		out.base = -1;
+		out.id.resize(draft_sc.cand.size());
+		for (size_t i = 0; i < draft_sc.cand.size(); i++)
+		{
+			out.id[i] = draft_sc.cand[i].second;
+		}
+		out.prob = draft_sc.prob;
+		return;
+	}
+	const int n = CODEC_OFFSET + CODEC_SIZE - MUSIC_END;
+	out.base = MUSIC_END;
+	out.prob.resize((size_t) n);
+	double top = -std::numeric_limits<double>::infinity();
+	for (int i = 0; i < n; i++)
+	{
+		top = std::max(top, (double) logits[MUSIC_END + i]);
+	}
+	double sum = 0;
+	for (int i = 0; i < n; i++)
+	{
+		out.prob[(size_t) i] = std::exp((double) logits[MUSIC_END + i] - top);
+		sum += out.prob[(size_t) i];
+	}
+	if (step < s_sem.min_tokens)
+	{
+		sum         -= out.prob[0];
+		out.prob[0]  = 0;
+	}
+	for (int i = 0; i < n; i++)
+	{
+		out.prob[(size_t) i] /= sum;
+	}
+}
+
+// One row of draft_trace.npy (DRAFT_TRACE_COLUMNS) for the token just decided
+// against draft_p; `q` is null for the bonus, which no draft proposed. Reads
+// nothing the sampler reads and never touches the RNG.
+void Runner::draft_trace_row(JobState & js, int frame, int depth, int accepted, llama_token tok,
+	const DraftDist * q)
+{
+	const float na = std::numeric_limits<float>::quiet_NaN();
+	const float row[DRAFT_TRACE_COLUMNS] =
+	{
+		(float) frame, (float) depth, (float) accepted,
+		(float) draft_p.of(tok),
+		q != nullptr ? (float) q->of(tok) : na,
+		q != nullptr ? (float) draft_overlap(draft_p, *q) : na,
+		(float) draft_entropy(draft_p),
+		(float) draft_p.prob[0],
+	};
+	js.draft_trace.insert(js.draft_trace.end(), row, row + DRAFT_TRACE_COLUMNS);
+}
+
+void Runner::draft_round(Seq & q)
+{
+	JobState &      js         = (*states)[q.job];
+	GenStats &      st         = js.st_sem;
+	Eagle3 &        e          = *draft;
+	const llama_pos P          = q.pos;
+	const int       s          = q.step;
+	const bool      legacy_off = js.req.cot == "off";
+	const double    t0         = now_seconds();
+
+	// The invariant every round starts from (§3.3, §7).
+	if (e.pos_last != P - 1)
+	{
+		die("%sdraft: the head's boundary is at %d, the target holds %d tokens",
+		    js.tag.c_str(), (int) e.pos_last, (int) P);
+	}
+
+	// The penalty window is all of the history shape_step reads; drafted tokens
+	// go on after it, so H_j is draft_hist with j of them pushed.
+	const size_t tail = std::min(q.history.size(), (size_t) s_sem.penalty_window);
+	draft_hist.assign(q.history.end() - (std::ptrdiff_t) tail, q.history.end());
+
+	// ---- 1. draft: the seed row (t_P, g_{P−1}) at P−1, then chained rows
+	// (d_{i−1}, prenorm_{i−2}) at P+i−2. No more than the song has room for.
+	if (dp.window > 0 && e.pos_last - dp.window + 1 > (llama_pos) js.prefix_sem.size() - 1)
+	{
+		llama_memory_seq_rm(e.mem, 0, 0, e.pos_last - dp.window + 1);
+	}
+	llama_memory_seq_rm(e.mem, 0, P - 1, -1);
+	const int k_max   = std::min(dp.k, s_sem.max_tokens - s - 1);
+	int       n_draft = 0;
+	while (n_draft < k_max && (n_draft == 0 || draft_ids[(size_t) n_draft - 1] != MUSIC_END))
+	{
+		const float * logits = n_draft == 0
+			? eagle3_draft(e, q.next, e.g_last.data(), P - 1)
+			: eagle3_draft(e, draft_ids[(size_t) n_draft - 1], e.prenorm.data(), P + n_draft - 1);
+		draft_dist(logits, s + n_draft, legacy_off, dp.q_raw, draft_q[(size_t) n_draft]);
+		draft_ids[(size_t) n_draft] = draft_q[(size_t) n_draft].draw(uniform01(q.rng));
+		draft_hist.push_back(draft_ids[(size_t) n_draft]);
+		n_draft++;
+	}
+	const double t1 = now_seconds();
+
+	// ---- 2. verify: t_P at P and d_r at P+r, logits on every row; the features
+	// of every row copied out before anything decodes on the target again.
+	batch.n_tokens = 0;
+	batch_add(batch, q.next, P, q.slot, true);
+	for (int r = 1; r <= n_draft; r++)
+	{
+		batch_add(batch, draft_ids[(size_t) r - 1], P + r, q.slot, true);
+	}
+	const int ret = llama_decode(ctx, batch);
+	if (ret != 0)
+	{
+		die("%sllama_decode returned %d on a %d-row verify", js.tag.c_str(), ret, n_draft + 1);
+	}
+	decodes++;
+	eagle3_features(e, 0, n_draft + 1);
+	const double t2 = now_seconds();
+
+	// ---- 3. accept, depth by depth: one uniform each up to the first reject,
+	// then one draw for the residual or the bonus — in that order, nothing else
+	// on q.rng. Row j−1's logits under H_{j−1} are p_j.
+	draft_hist.resize(tail);
+	int         n_acc = 0;
+	llama_token x     = -1;
+	for (int j = 1; j <= n_draft; j++)
+	{
+		const DraftDist & qj = draft_q[(size_t) j - 1];
+		const llama_token d  = draft_ids[(size_t) j - 1];
+		// Output index j−1 == batch row j−1 only because every verify row is an
+		// output (one sequence); selecting fewer outputs would shift this.
+		draft_dist(llama_get_logits_ith(ctx, j - 1), s + j - 1, legacy_off, false, draft_p);
+		st.tested_per_depth[(size_t) j - 1]++;
+		if (!draft_accept(uniform01(q.rng), dp.lambda, draft_p.of(d), qj.of(d)))
+		{
+			x = draft_residual(draft_p, qj, uniform01(q.rng), draft_w);
+			if (dp.trace)
+			{
+				draft_trace_row(js, s + j - 1, 0, 2, x, &qj);
+			}
+			break;
+		}
+		if (dp.trace)
+		{
+			draft_trace_row(js, s + j - 1, j, 1, d, &qj);
+		}
+		st.accepted_per_depth[(size_t) j - 1]++;
+		n_acc = j;
+		draft_hist.push_back(d);
+	}
+	// All accepted: the bonus from the last row, unless the song just ended.
+	if (n_acc == n_draft && !(n_draft > 0 && draft_ids[(size_t) n_draft - 1] == MUSIC_END))
+	{
+		draft_dist(llama_get_logits_ith(ctx, n_draft), s + n_draft, legacy_off, false, draft_p);
+		x = draft_p.draw(uniform01(q.rng));
+		if (dp.trace)
+		{
+			draft_trace_row(js, s + n_draft, dp.k + 1, 0, x, nullptr);
+		}
+	}
+
+	// Everything finish_job copies is counted before the apply that may call it.
+	const double t3 = now_seconds();
+	st.draft_rounds++;
+	st.draft_proposed += n_draft;
+	st.draft_accepted += n_acc;
+	st.draft_seconds  += t1 - t0;
+	st.verify_seconds += t2 - t1;
+	steps_whole++;
+	time_whole += t3 - t0;
+	sampled    += n_acc + (x >= 0 ? 1 : 0);
+
+	// ---- 4. apply in order, up to a terminal token (finish_job clears the slot
+	// and the head's cache, so 5 and 6 are moot then).
+	for (int j = 0; j < n_acc && q.job >= 0; j++)
+	{
+		apply(q, draft_ids[(size_t) j]);
+	}
+	if (x >= 0 && q.job >= 0)
+	{
+		apply(q, x);
+	}
+	if (q.job < 0)
+	{
+		return;
+	}
+
+	// ---- 5. the target drops the rows of d_{n_acc+1} .. d_{n_draft}; q.next is x.
+	llama_memory_seq_rm(mem, q.slot, P + 1 + n_acc, -1);
+	q.pos = P + 1 + n_acc;
+
+	// ---- 6. the head: the chained rows go, the accepted pairs (d_{k+1}, g_{P+k})
+	// are written at P+k, and g_{P+n_acc} is the new boundary at q.pos − 1.
+	eagle3_encode(e, n_acc + 1);
+	llama_memory_seq_rm(e.mem, 0, P, -1);
+	if (n_acc > 0)
+	{
+		eagle3_feed(e, draft_ids.data(), n_acc, P);
+	}
+	e.g_last.assign(e.g.begin() + (std::ptrdiff_t) n_acc * e.n_embd,
+	                e.g.begin() + (std::ptrdiff_t) (n_acc + 1) * e.n_embd);
+	e.pos_last = P + n_acc;
+	st.draft_seconds += now_seconds() - t3;
+}
+
 void Runner::finish_job(Seq & q)
 {
 	JobState & js = (*states)[q.job];
@@ -5848,6 +6232,30 @@ void Runner::finish_job(Seq & q)
 	js.st_abc.section_prefill_seconds = js.sec_seconds;
 	js.st_sem.section_prefill_seconds = js.sec_seconds;
 
+	// The head's side of the slot: extraction off, its cache empty for the next
+	// job, and the round counts on one line.
+	if (draft != nullptr)
+	{
+		eagle3_extract(*draft, false);
+		llama_memory_seq_rm(draft->mem, 0, -1, -1);
+		draft->pos_last = -1;
+		const GenStats & st = js.st_sem;
+		if (st.draft_rounds > 0)
+		{
+			std::string depths;
+			for (size_t j = 0; j < st.accepted_per_depth.size(); j++)
+			{
+				depths += strf("%s%.3f", j > 0 ? " / " : "", st.tested_per_depth[j] > 0
+				               ? (double) st.accepted_per_depth[j] / st.tested_per_depth[j] : 0.0);
+			}
+			printf("%sdraft:    K %d, lambda %g, q %s, window %d: %d rounds, %.2f tokens/round, "
+			       "acceptance per depth %s, draft %.2f + verify %.2f ms/round\n", js.tag.c_str(),
+			       dp.k, dp.lambda, dp.q_raw ? "raw" : "shaped", dp.window, st.draft_rounds,
+			       (double) (st.output_tokens - 1) / st.draft_rounds, depths.c_str(),
+			       1000 * st.draft_seconds / st.draft_rounds, 1000 * st.verify_seconds / st.draft_rounds);
+		}
+	}
+
 	if (!js.no_files)
 	{
 		Artifacts a;
@@ -5868,6 +6276,7 @@ void Runner::finish_job(Seq & q)
 		a.trace         = (*jobs)[q.job].trace && !js.guide.empty() ? &js.trace : nullptr;
 		a.trace_abc     = (*jobs)[q.job].trace && score_guided(js.req) ? &js.trace_abc : nullptr;
 		a.negative      = js.negative_prefix.empty() ? nullptr : &js.negative_prefix;
+		a.draft_trace   = draft != nullptr && dp.trace && !dp.extract_only ? &js.draft_trace : nullptr;
 		write_artifacts(a);
 		printf("%sartifacts: %s (abc %zu ids, semantic %zu codes)\n", js.tag.c_str(),
 		       (*jobs)[q.job].artifacts.c_str(), js.abc_ids.size(), codes.size());
@@ -5974,6 +6383,15 @@ void Runner::run()
 		if (active == 0)
 		{
 			break;
+		}
+
+		// --draft decodes one song (parallel 1): its semantic phase is a round at a
+		// time instead of the lockstep step below (SPEC_DRAFT §3.3).
+		if (draft != nullptr && !dp.extract_only && seqs[0].job >= 0 && seqs[0].phase == PHASE_SEM)
+		{
+			draft_round(seqs[0]);
+			progress();
+			continue;
 		}
 
 		// A guided sequence takes its entries and settles which branches are live
@@ -6747,9 +7165,44 @@ static int ar_decode_jobs(const ArBatchParams & p, const std::vector<ArJob> & jo
 		r.seqs[(size_t) i].home = i;
 	}
 
+	// SPEC_DRAFT §3.2: the head on the target's device, its context made from the
+	// target's parameters, both alive for every job of this context.
+	ggml_backend_dev_t head_devices[2] = {nullptr, nullptr};
+	llama_model *      head_model      = nullptr;
+	Eagle3             head;
+	if (!p.draft.file.empty())
+	{
+		std::string head_backend;
+		head_model = load_model(p.draft.file, p.device, p.gpu, head_backend, head_devices);
+		const std::string err = eagle3_init(head, head_model, ctx, cparams);
+		if (!err.empty())
+		{
+			die("%s: %s", p.draft.file.c_str(), err.c_str());
+		}
+		const std::string type = ftype_name(llama_model_ftype(head_model));
+		for (size_t i = 0; i < results.size(); i++)
+		{
+			results[i].draft_type = type;
+		}
+		printf("draft:   eagle3 %s, target layers %d/%d/%d, K %d, lambda %g, q %s, window %d%s\n",
+		       type.c_str(), head.layer[0], head.layer[1], head.layer[2], p.draft.k,
+		       p.draft.lambda, p.draft.q_raw ? "raw" : "shaped", p.draft.window,
+		       p.draft.extract_only ? " (extract only: nothing is drafted)" : "");
+		r.draft = &head;
+		r.dp    = p.draft;
+		r.draft_q.resize((size_t) p.draft.k);
+		r.draft_ids.resize((size_t) p.draft.k);
+	}
+
 	const double t_ar0 = now_seconds();
 	r.run();
 	const double ar_seconds = now_seconds() - t_ar0;
+
+	if (head_model != nullptr)
+	{
+		eagle3_free(head);
+		llama_model_free(head_model);
+	}
 
 	int    ok_jobs = 0;
 	double tokens  = 0;
@@ -7386,7 +7839,9 @@ static void usage(const char * argv0)
 	        "        [--threads N] [--dump-logits FILE.npy] [--greedy]\n"
 	        "        [--max-abc N] [--max-semantic N] [--continue-on-error]\n"
 	        "        [--verify-sampler] [--guidance-trace]\n"
-	        "        [--prefix-only]   the request carries its \"abc\": write prefix.npy, decode nothing\n", argv0, argv0);
+	        "        [--prefix-only]   the request carries its \"abc\": write prefix.npy, decode nothing\n"
+	        "        [--draft HEAD.gguf [--draft-k 2] [--draft-lambda 1] [--draft-q shaped|raw]\n"
+	        "         [--draft-window N] [--draft-trace]]\n", argv0, argv0);
 }
 
 } // namespace
@@ -7544,6 +7999,8 @@ ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
 			p.max_abc = parse_positive_arg("--max-abc", need(argc, argv, i));
 		} else if (a == "--max-semantic") {
 			p.max_semantic = parse_positive_arg("--max-semantic", need(argc, argv, i));
+		} else if (parse_draft_arg(a, argc, argv, i, p.draft)) {
+			continue;
 		} else if (a == "-h" || a == "--help") {
 			usage(argv0);
 			exit(0);
@@ -7568,7 +8025,70 @@ ArParams parse_ar_args(const char * argv0, int argc, char ** argv)
 		usage(argv0);
 		die("--dump-logits is a single-request path; use --request");
 	}
+	check_draft_args(p.draft);
+	if (!p.draft.file.empty() && !p.dump_logits.empty())
+	{
+		die("--draft does not support --dump-logits");
+	}
 	return p;
+}
+
+bool parse_draft_arg(const std::string & a, int argc, char ** argv, int & i, DraftParams & d)
+{
+	if (a == "--draft")
+	{
+		d.file = need(argc, argv, i);
+	} else if (a == "--draft-k") {
+		d.k = parse_positive_arg("--draft-k", need(argc, argv, i));
+	} else if (a == "--draft-lambda") {
+		const char * text = need(argc, argv, i);
+		char *       endp = nullptr;
+		d.lambda = strtod(text, &endp);
+		if (endp == text || *endp != '\0')
+		{
+			die("--draft-lambda must be a number (got \"%s\")", text);
+		}
+	} else if (a == "--draft-q") {
+		const std::string q = need(argc, argv, i);
+		if (q != "shaped" && q != "raw")
+		{
+			die("--draft-q must be shaped or raw");
+		}
+		d.q_raw = q == "raw";
+	} else if (a == "--draft-window") {
+		d.window = parse_int_arg("--draft-window", need(argc, argv, i), 0);
+	} else if (a == "--draft-trace") {
+		d.trace = true;
+	} else if (a == "--draft-extract-only") {
+		d.extract_only = true;
+	} else {
+		return false;
+	}
+	return true;
+}
+
+void check_draft_args(const DraftParams & d)
+{
+	if (d.k < 1 || d.k > 8)
+	{
+		die("--draft-k must be in [1, 8]");
+	}
+	if (!(d.lambda >= 1) || !std::isfinite(d.lambda))
+	{
+		die("--draft-lambda must be a number >= 1 (1 = exact)");
+	}
+	if (d.window < 0)
+	{
+		die("--draft-window must be >= 0 (0 = the whole song)");
+	}
+	if (d.file.empty() && (d.trace || d.extract_only))
+	{
+		die("--draft-trace and --draft-extract-only need --draft");
+	}
+	if (!d.file.empty() && !std::filesystem::exists(d.file))
+	{
+		die("%s does not exist", d.file.c_str());
+	}
 }
 
 int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
@@ -7702,6 +8222,25 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 		parallel = std::min<int>(parallel, (int) jobs.size() - rejected);
 	}
 
+	// SPEC_DRAFT §1: what a draft head cannot speculate for. The flags are the
+	// whole run's, so they are fatal; a request is one more rejected job.
+	if (!p.draft.file.empty())
+	{
+		const std::string err = draft_params_error(p.greedy, p.verify_sampler, p.prefix_only, parallel);
+		if (!err.empty())
+		{
+			die("%s", err.c_str());
+		}
+		for (size_t i = 0; i < jobs.size(); i++)
+		{
+			const std::string req_err = states[i].ok ? draft_request_error(states[i].req) : "";
+			if (!req_err.empty())
+			{
+				reject(i, strf("%s: %s", jobs[i].request_path.c_str(), req_err.c_str()));
+			}
+		}
+	}
+
 	if (rejected == (int) jobs.size())
 	{
 		fprintf(stderr, "error: every job was rejected; nothing to decode\n");
@@ -7763,6 +8302,7 @@ int run_ar(const ArParams & p, ArResult * out)
 	bp.continue_on_error = p.continue_on_error;
 	bp.verify_sampler    = p.verify_sampler;
 	bp.prefix_only       = p.prefix_only;
+	bp.draft             = p.draft;
 
 	std::vector<ArJob> jobs;
 	if (p.requests.empty())

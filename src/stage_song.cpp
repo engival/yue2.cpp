@@ -129,7 +129,9 @@ void usage(const char * argv0)
 	        "        [--ar AR.gguf] [--nar NAR.gguf] [--vae VAE.gguf]\n"
 	        "        [--gpu N] [--cpu] [--nar-f32] [--noise FILE] [--steps 16]\n"
 	        "        [--nar-lora LORA.safetensors[:S]]\n"
-	        "        [--guidance-trace] [--no-tags] [--opus-bitrate 160]\n", argv0);
+	        "        [--guidance-trace] [--no-tags] [--opus-bitrate 160]\n"
+	        "        [--draft HEAD.gguf [--draft-k 2] [--draft-lambda 1] [--draft-q shaped|raw]\n"
+	        "         [--draft-window N] [--draft-trace]]\n", argv0);
 }
 
 void usage_batch(const char * argv0)
@@ -142,6 +144,8 @@ void usage_batch(const char * argv0)
 	        "        [--threads N] [--greedy] [--max-abc N] [--max-semantic N]\n"
 	        "        [--continue-on-error] [--guidance-trace] [--no-tags]\n"
 	        "        [--opus-bitrate 160]\n"
+	        "        [--draft HEAD.gguf [--draft-k 2] [--draft-lambda 1] [--draft-q shaped|raw]\n"
+	        "         [--draft-window N] [--draft-trace]]   --draft needs --parallel 1\n"
 	        "\n"
 	        "jobs.json is an array of { \"request\", \"out\", \"artifacts\", \"seed\", \"noise\" };\n"
 	        "request and out are required and paths are relative to the working directory.\n",
@@ -285,7 +289,8 @@ json json_template(const TemplateStats & t)
 
 // config.json, minus the fields that only meant something under torch (see
 // src/STATUS_SINGLE.md for the list of drops).
-void write_config(const std::string & dir, const BatchParams & p, const ArResult & ar)
+void write_config(const std::string & dir, const BatchParams & p, const ArResult & ar,
+	const std::string & draft_sha)
 {
 	json gen = json::object();
 	gen["ode_steps"]  = p.steps;
@@ -324,6 +329,24 @@ void write_config(const std::string & dir, const BatchParams & p, const ArResult
 		}
 		cfg["nar_lora"] = adapters;
 	}
+	// SPEC_DRAFT §5: only with --draft, so a run without it writes exactly the
+	// config.json it always did.
+	if (!p.draft.file.empty())
+	{
+		json draft = json::object();
+		draft["file"]   = std::filesystem::path(p.draft.file).filename().string();
+		draft["sha256"] = draft_sha;
+		draft["type"]   = ar.draft_type;
+		draft["k"]      = p.draft.k;
+		draft["lambda"] = p.draft.lambda;
+		draft["q"]      = p.draft.q_raw ? "raw" : "shaped";
+		draft["window"] = p.draft.window;
+		if (p.draft.extract_only)
+		{
+			draft["extract_only"] = true;
+		}
+		cfg["draft"] = draft;
+	}
 	cfg["vae_decode"]      = "halo_crop";
 	cfg["vae_core_frames"] = 256;
 	cfg["vae_halo_frames"] = 16;
@@ -337,6 +360,18 @@ void write_result(const std::string & dir, const ArResult & ar, const std::strin
 	semantic["seconds"]       = ar.semantic.seconds;
 	semantic["output_tokens"] = ar.semantic.output_tokens;
 	semantic["attention"]     = "llama.cpp";
+	// SPEC_DRAFT §5, only when a draft head was loaded.
+	if (!ar.draft_type.empty())
+	{
+		const GenStats & st = ar.semantic;
+		semantic["draft_rounds"]       = st.draft_rounds;
+		semantic["draft_proposed"]     = st.draft_proposed;
+		semantic["draft_accepted"]     = st.draft_accepted;
+		semantic["tested_per_depth"]   = st.tested_per_depth;
+		semantic["accepted_per_depth"] = st.accepted_per_depth;
+		semantic["draft_seconds"]      = st.draft_seconds;
+		semantic["verify_seconds"]     = st.verify_seconds;
+	}
 
 	json timing = json::object();
 	timing["abc"]         = json_timing(ar.abc);
@@ -439,6 +474,8 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
 		} else if (a == "--vk-f16-matmul" || a == "--no-vk-f16-matmul") {
 			die_vae_precision(a);
+		} else if (parse_draft_arg(a, argc, argv, i, p.draft)) {
+			continue;
 		} else if (a == "-h" || a == "--help") {
 			usage(argv0);
 			exit(0);
@@ -447,6 +484,7 @@ SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 			die("unknown argument %s", a.c_str());
 		}
 	}
+	check_draft_args(p.draft);
 	if (p.request_path.empty() || p.out.empty())
 	{
 		usage(argv0);
@@ -525,6 +563,8 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			p.seed     = parse_seed_arg("--seed", need(argc, argv, i));
 		} else if (a == "--vk-f16-matmul" || a == "--no-vk-f16-matmul") {
 			die_vae_precision(a);
+		} else if (parse_draft_arg(a, argc, argv, i, p.draft)) {
+			continue;
 		} else if (a == "-h" || a == "--help") {
 			usage_batch(argv0);
 			exit(0);
@@ -533,6 +573,7 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv)
 			die("unknown argument %s", a.c_str());
 		}
 	}
+	check_draft_args(p.draft);
 	if (p.jobs_path.empty())
 	{
 		usage_batch(argv0);
@@ -633,6 +674,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 	ar_params.max_abc           = p.max_abc;
 	ar_params.max_semantic      = p.max_semantic;
 	ar_params.continue_on_error = p.continue_on_error;
+	ar_params.draft             = p.draft;
 
 	// A bad "tags" block is a request error, so it is one before anything renders.
 	std::vector<flac::Tags> tags(jobs.size());
@@ -664,6 +706,8 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 
 	json summary  = json::array();
 	int  failed   = 0;
+	// The head's, for every config.json: hashed once, after the AR is done with it.
+	const std::string draft_sha = p.draft.file.empty() ? "" : sha256_file_hex(p.draft.file);
 	for (size_t k = 0; k < jobs.size(); k++)
 	{
 		const ArJob & job = jobs[k];
@@ -779,7 +823,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		// ---- artifacts -----------------------------------------------------
 
 		const double e2e_seconds = now_seconds() - t_batch0;
-		write_config(dir, p, ar[k]);
+		write_config(dir, p, ar[k], draft_sha);
 		write_result(dir, ar[k], card, frames, nar_seconds, vae_seconds, e2e_seconds);
 
 		printf("%stotal:   abc %.1f s, semantic %.1f s, nar %.1f s, vae %.1f s\n", tag.c_str(),
@@ -830,6 +874,7 @@ int run_song(const SongParams & p)
 	bp.guidance_trace = p.guidance_trace;
 	bp.no_tags   = p.no_tags;
 	bp.opus_bitrate = p.opus_bitrate;
+	bp.draft     = p.draft;
 
 	ArJob job;
 	job.request_path = p.request_path;

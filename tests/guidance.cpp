@@ -771,6 +771,92 @@ void run_requests()
 	}
 }
 
+// ------------------------------------------------------- --draft's guard ---
+// SPEC_DRAFT §1: every request and flag a draft head cannot speculate for is an
+// error, and the ones it can are not.
+
+const RequestCase DRAFT_CASES[] =
+{
+	{ "",                                              nullptr, "an unguided song" },
+	{ "\"cfg_scale\": 1.0",                            nullptr, "cfg_scale 1 is unguided" },
+	{ "\"cot\": \"off\", \"cfg_scale\": 1.0",          nullptr, "cot=off with cfg_scale 1" },
+	{ "\"abc_template\": \"X:1\\nK:C\\n%%yue2-gen bars=4\\n\"", nullptr, "a score template" },
+	{ "\"sections\": [{\"section\": \"Chorus\", \"style\": \"brass band\"}]", nullptr,
+	  "a plain-swap sections block" },
+	{ "\"cfg_scale\": 3",                              "does not support guidance", "cfg_scale" },
+	{ "\"cot\": \"off\"",                              "does not support guidance",
+	  "cot=off alone defaults to cfg_scale 1.01" },
+	{ "\"guidance\": [{\"frame\": 0, \"against\": {\"blank\": [[0, 2]]}}]",
+	  "does not support guidance", "a guidance block" },
+	{ "\"cfg_score\": 1.5, \"negative_lyrics\": true", "does not support guidance", "cfg_score" },
+	{ "\"sections\": [{\"section\": \"Chorus\", \"style\": \"brass band\", "
+	  "\"against\": {\"previous\": [[0, 5]]}}]",       "does not support guidance",
+	  "sections with an against" },
+	{ KEEP_ABC ", \"semantic_keep\": {\"file\": \"r/semantic.npy\", \"frames\": 100}",
+	  "does not support \"semantic_keep\"", "semantic_keep" },
+	{ KEEP_ABC ", \"handover\": [{\"section\": \"chorus\"}]",
+	  "does not support \"handover\"", "handover" },
+};
+
+struct DraftFlagCase
+{
+	bool         greedy;
+	bool         verify;
+	bool         prefix_only;
+	int          parallel;
+	const char * err;
+};
+
+const DraftFlagCase DRAFT_FLAG_CASES[] =
+{
+	{ false, false, false, 1, nullptr },
+	{ true,  false, false, 1, "--greedy" },
+	{ false, true,  false, 1, "--verify-sampler" },
+	{ false, false, true,  1, "--prefix-only" },
+	{ false, false, false, 2, "--parallel 1" },
+};
+
+void run_draft_guard()
+{
+	for (size_t i = 0; i < sizeof(DRAFT_CASES) / sizeof(DRAFT_CASES[0]); i++)
+	{
+		const RequestCase & c    = DRAFT_CASES[i];
+		const std::string   what = strf("draft request(case %zu)", i + 1);
+		Request             req;
+		std::string         err = parse_request_json(json::parse(request_with(c.extra)), "R", req);
+		if (err.empty())
+		{
+			err = validate_request(req);
+		}
+		if (!err.empty())
+		{
+			check(false, what.c_str(), err, strf("a valid request (%s)", c.why));
+			continue;
+		}
+		err = draft_request_error(req);
+		if (c.err == nullptr)
+		{
+			check(err.empty(), what.c_str(), err.empty() ? "accepted" : err, strf("accepted (%s)", c.why));
+			continue;
+		}
+		check(err.find(c.err) != std::string::npos, what.c_str(),
+		      err.empty() ? "accepted" : err, strf("an error containing \"%s\" (%s)", c.err, c.why));
+	}
+	for (size_t i = 0; i < sizeof(DRAFT_FLAG_CASES) / sizeof(DRAFT_FLAG_CASES[0]); i++)
+	{
+		const DraftFlagCase & c    = DRAFT_FLAG_CASES[i];
+		const std::string     what = strf("draft flags(case %zu)", i + 1);
+		const std::string     err  = draft_params_error(c.greedy, c.verify, c.prefix_only, c.parallel);
+		if (c.err == nullptr)
+		{
+			check(err.empty(), what.c_str(), err.empty() ? "accepted" : err, "accepted");
+			continue;
+		}
+		check(err.find(c.err) != std::string::npos, what.c_str(),
+		      err.empty() ? "accepted" : err, strf("an error containing \"%s\"", c.err));
+	}
+}
+
 // ------------------------------------------------------------ the plan ------
 
 struct PlanCase
@@ -1174,6 +1260,7 @@ int main(int argc, char ** argv)
 	run_clock();
 	run_sections_multi();
 	run_requests();
+	run_draft_guard();
 	run_plans();
 	run_negative();
 	run_spans();
