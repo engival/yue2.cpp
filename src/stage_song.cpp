@@ -17,7 +17,13 @@
 
 #include "npy.hpp"
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -53,9 +59,15 @@ void remove_temp_artifacts()
 // a literal prefix so the remove_all above can never be handed anything else.
 std::string temp_artifacts_dir(size_t job)
 {
-	const std::string dir = (std::filesystem::temp_directory_path() /
-		("yue2song." + std::to_string(getpid()) + "." + std::to_string(job))).string();
-	if (dir.find("/yue2song.") == std::string::npos)
+#ifdef _WIN32
+	const unsigned long pid = GetCurrentProcessId();
+#else
+	const long pid = (long) getpid();
+#endif
+	const std::filesystem::path path = std::filesystem::temp_directory_path() /
+		("yue2song." + std::to_string(pid) + "." + std::to_string(job));
+	const std::string dir = path.string();
+	if (path.filename().string().rfind("yue2song.", 0) != 0 || path.parent_path().empty())
 	{
 		die("refusing to use '%s' as the temporary artifacts directory", dir.c_str());
 	}
@@ -149,25 +161,33 @@ void usage_batch(const char * argv0)
 	        argv0);
 }
 
-// This executable's own path, via /proc/self/exe — where resolve_gguf() looks
-// for the default GGUFs.
-std::string exe_path()
+// This executable's own path — where resolve_gguf() looks for the default GGUFs.
+std::filesystem::path exe_path()
 {
-	char    buf[4096];
-	ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
-	if (n <= 0)
+#ifdef _WIN32
+	wchar_t buf[32768];
+	const DWORD n = GetModuleFileNameW(nullptr, buf, sizeof(buf) / sizeof(buf[0]));
+	if (n == 0 || n >= sizeof(buf) / sizeof(buf[0]))
 	{
-		die("cannot read /proc/self/exe");
+		die("cannot get this executable's path (GetModuleFileNameW)");
 	}
-	buf[n] = '\0';
-	return buf;
+	return std::filesystem::path(std::wstring(buf, n));
+#else
+	std::error_code ec;
+	std::filesystem::path p = std::filesystem::read_symlink("/proc/self/exe", ec);
+	if (ec)
+	{
+		die("cannot read /proc/self/exe: %s", ec.message().c_str());
+	}
+	return p;
+#endif
 }
 
 // A default GGUF's path, or "" when it is in none of the places resolve_gguf()
 // looks: next to the executable, one level up, the working directory.
 std::string find_default_gguf(const char * name)
 {
-	const std::filesystem::path here = std::filesystem::path(exe_path()).parent_path();
+	const std::filesystem::path here = exe_path().parent_path();
 	const std::string tried[] = { (here / name).string(), (here / ".." / name).string(), name };
 	for (const std::string & candidate : tried)
 	{
@@ -197,7 +217,7 @@ std::string resolve_gguf(const std::string & given, const char * name)
 	const std::string found = find_default_gguf(name);
 	if (found.empty())
 	{
-		const std::filesystem::path here = std::filesystem::path(exe_path()).parent_path();
+		const std::filesystem::path here = exe_path().parent_path();
 		die("cannot find %s — looked in %s, %s and the working directory",
 		    name, here.c_str(), (here / "..").c_str());
 	}
@@ -411,7 +431,7 @@ void write_result(const std::string & dir, const ArResult & ar, const std::strin
 
 std::string gguf_home_dir()
 {
-	return std::filesystem::path(exe_path()).parent_path().string();
+	return exe_path().parent_path().string();
 }
 
 SongParams parse_song_args(const char * argv0, int argc, char ** argv)
