@@ -22,6 +22,7 @@ jobs:
   linux:
     name: linux (ubuntu-22.04, EAGLE3 ${{ matrix.eagle3 }})
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -68,6 +69,7 @@ jobs:
   linux-distro:
     name: linux (ubuntu-24.04, distro packages, Opus)
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v6
@@ -76,8 +78,9 @@ jobs:
 
       - name: Dependencies
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends build-essential ninja-build \
+          apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${apt_opts[@]}" update -y
+          sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends build-essential ninja-build \
             glslc libvulkan-dev spirv-headers libflac-dev libopusenc-dev pkg-config
 
       - name: ccache
@@ -108,6 +111,7 @@ jobs:
   windows:
     name: windows (MSVC x64)
     runs-on: windows-latest
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v6
@@ -148,3 +152,15 @@ jobs:
         env:
           NOISE_GOLDEN_SOFT: '1'
         run: bash .github/scripts/smoke-test.sh build
+
+      # Git Bash keeps only the low byte of a native exit status; a crash's
+      # NTSTATUS (0xC0000409 fast-fail, 0xC0000005 access violation) needs pwsh.
+      - name: Exit status of a failed test (diagnostic)
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($t in 'yue2-sampler-diff')
+          {
+            & "build\$t.exe" --cases 200
+            '{0}: exit 0x{1:X8}' -f $t, $LASTEXITCODE
+          }

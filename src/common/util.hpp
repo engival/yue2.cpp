@@ -33,14 +33,19 @@ inline const char * need(int argc, char ** argv, int & i)
 	return argv[++i];
 }
 
+// On Windows ggml_time_us() divides by a frequency that only ggml_time_init()
+// sets (ggml_init / llama_backend_init call it), so a caller that never touches
+// ggml — `yue2 convert`, the tests — died of an integer divide by zero. The init
+// runs once; later calls are a single InitOnce check, and a no-op elsewhere.
 inline int64_t now_us()
 {
+	ggml_time_init();
 	return ggml_time_us();
 }
 
 inline double now_seconds()
 {
-	return (double) ggml_time_us() / 1e6;
+	return (double) now_us() / 1e6;
 }
 
 // protocol.SongRequest's seed: [0, 2**63), exactly, never through a double.

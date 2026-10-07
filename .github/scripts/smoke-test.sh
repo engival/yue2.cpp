@@ -72,7 +72,9 @@ run_test()
 	fi
 	echo "== $name $*"
 	local t0=$SECONDS
-	if ! "$bin" "$@"; then fail "$name failed"; fi
+	local rc=0
+	"$bin" "$@" || rc=$?
+	if [ "$rc" -ne 0 ]; then fail "$name failed (exit $rc)"; fi
 	echo "   ($((SECONDS - t0)) s)"
 }
 

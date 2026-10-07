@@ -22,8 +22,10 @@ runs:
         set -euo pipefail
         wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
         sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
-        sudo apt-get update -y
-        sudo apt-get install -y --no-install-recommends build-essential ninja-build vulkan-sdk
+        # A stalled Azure mirror once hung apt for 13 minutes: time out and retry.
+        apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        sudo apt-get "${apt_opts[@]}" update -y
+        sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends build-essential ninja-build vulkan-sdk
         glslc --version | head -n 1
 
     - name: Static libFLAC ${{ inputs.flac-version }}
