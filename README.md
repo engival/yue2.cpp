@@ -6,7 +6,7 @@ on CUDA; on AMD (ROCm) the VAE decode alone takes ~194 s for a 3.4-minute song
 and MIOpen occasionally takes the GPU down with it. ggml's Vulkan backend sidesteps
 rocBLAS/MIOpen entirely.
 
-Listed in [awesome-YuE](https://github.com/RevolutionLA/awesome-YuE).
+Check out other YuE-based projects in [awesome-YuE](https://github.com/RevolutionLA/awesome-YuE).
 
 **Provenance and warranty.** This code was written entirely by Claude (Anthropic's
 Fable 5.1 model) working as a coding agent, directed by a human who set the goals,
