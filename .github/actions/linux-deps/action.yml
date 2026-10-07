@@ -1,0 +1,57 @@
+name: Linux build dependencies (Ubuntu 22.04)
+description: >
+  Vulkan SDK from the LunarG jammy repo (headers + glslc; llama.cpp's own release
+  job uses the same route), Ninja, and a static libFLAC built from the pinned
+  upstream tarball so the binary does not need libFLAC on the user's system.
+  Exports PKG_CONFIG_PATH so `pkg_check_modules(FLAC flac)` finds the static one.
+
+inputs:
+  flac-version:
+    description: libFLAC release to build
+    default: "1.5.0"
+  flac-sha256:
+    description: sha256 of flac-<version>.tar.xz
+    default: "f2c1c76592a82ffff8413ba3c4a1299b6c7ab06c734dee03fd88630485c2b920"
+
+runs:
+  using: composite
+  steps:
+    - name: Vulkan SDK, Ninja
+      shell: bash
+      run: |
+        set -euo pipefail
+        wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc > /dev/null
+        sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends build-essential ninja-build vulkan-sdk
+        glslc --version | head -n 1
+
+    - name: Static libFLAC ${{ inputs.flac-version }}
+      shell: bash
+      env:
+        FLAC_VERSION: ${{ inputs.flac-version }}
+        FLAC_SHA256: ${{ inputs.flac-sha256 }}
+      run: |
+        set -euo pipefail
+        cd "$RUNNER_TEMP"
+        curl -sSfLO "https://github.com/xiph/flac/releases/download/${FLAC_VERSION}/flac-${FLAC_VERSION}.tar.xz"
+        echo "${FLAC_SHA256}  flac-${FLAC_VERSION}.tar.xz" | sha256sum -c -
+        tar -xJf "flac-${FLAC_VERSION}.tar.xz"
+        cmake -S "flac-${FLAC_VERSION}" -B flac-build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/flac-static" \
+          -DCMAKE_INSTALL_LIBDIR=lib \
+          -DBUILD_SHARED_LIBS=OFF \
+          -DWITH_OGG=OFF \
+          -DBUILD_CXXLIBS=OFF \
+          -DBUILD_PROGRAMS=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_TESTING=OFF \
+          -DBUILD_DOCS=OFF \
+          -DINSTALL_MANPAGES=OFF
+        cmake --build flac-build
+        cmake --install flac-build
+        # The licence travels with a statically linked copy (release archives).
+        cp "flac-${FLAC_VERSION}/COPYING.Xiph" "$RUNNER_TEMP/flac-static/COPYING.Xiph"
+        echo "PKG_CONFIG_PATH=$RUNNER_TEMP/flac-static/lib/pkgconfig" >> "$GITHUB_ENV"
+        echo "FLAC_LICENSE_FILE=$RUNNER_TEMP/flac-static/COPYING.Xiph" >> "$GITHUB_ENV"

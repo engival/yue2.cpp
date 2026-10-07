@@ -1,0 +1,76 @@
+name: Windows build dependencies (MSVC x64)
+description: >
+  Vulkan SDK (LunarG installer, as llama.cpp's own Windows Vulkan jobs do),
+  the MSVC developer environment (so CMake can use Ninja + cl.exe), Ninja, and
+  libFLAC + pkgconf from the runner's vcpkg (x64-windows, DLL linkage).
+  Exports VULKAN_SDK, YUE2_VCPKG_TOOLCHAIN, YUE2_PKGCONF and YUE2_VCPKG_BIN.
+
+inputs:
+  vulkan-version:
+    description: LunarG Vulkan SDK version
+    default: "1.4.357.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Vulkan SDK ${{ inputs.vulkan-version }}
+      shell: pwsh
+      env:
+        VULKAN_VERSION: ${{ inputs.vulkan-version }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+        curl.exe -sSfL -o "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+        & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+        if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer exited $LASTEXITCODE" }
+        Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+        Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+
+    - name: MSVC developer environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Ninja
+      shell: pwsh
+      run: |
+        if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja --no-progress -y }
+        ninja --version
+
+    - name: vcpkg binary cache
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.temp }}/vcpkg-bincache
+        key: vcpkg-x64-windows-flac-${{ github.run_id }}
+        restore-keys: vcpkg-x64-windows-flac-
+
+    - name: libFLAC + pkgconf (vcpkg)
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $root = $env:VCPKG_INSTALLATION_ROOT
+        if (-not $root -or -not (Test-Path "$root\vcpkg.exe"))
+        {
+          $root = "$env:RUNNER_TEMP\vcpkg"
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git $root
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+        }
+        $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:RUNNER_TEMP\vcpkg-bincache"
+        New-Item -ItemType Directory -Force $env:VCPKG_DEFAULT_BINARY_CACHE | Out-Null
+        & "$root\vcpkg.exe" install flac pkgconf --triplet x64-windows --clean-after-build
+        if ($LASTEXITCODE -ne 0) { throw "vcpkg install exited $LASTEXITCODE" }
+
+        $installed = "$root\installed\x64-windows"
+        # Pin pkg-config to vcpkg's pkgconf: the runner's PATH also carries
+        # Strawberry Perl's pkg-config, which knows nothing of vcpkg.
+        $pkgconf = Get-ChildItem -Recurse "$installed\tools" -Filter pkgconf.exe | Select-Object -First 1
+        if (-not $pkgconf) { throw "pkgconf.exe not found under $installed\tools" }
+        & $pkgconf.FullName --version
+        $env:PKG_CONFIG_PATH = "$installed\lib\pkgconfig"
+        & $pkgconf.FullName --modversion flac
+        if ($LASTEXITCODE -ne 0) { throw "pkgconf cannot see flac.pc" }
+
+        Add-Content $env:GITHUB_ENV "YUE2_VCPKG_TOOLCHAIN=$root\scripts\buildsystems\vcpkg.cmake"
+        Add-Content $env:GITHUB_ENV "YUE2_PKGCONF=$($pkgconf.FullName)"
+        Add-Content $env:GITHUB_ENV "YUE2_VCPKG_INSTALLED=$installed"
+        Add-Content $env:GITHUB_ENV "YUE2_VCPKG_BIN=$installed\bin"
+        Add-Content $env:GITHUB_ENV "PKG_CONFIG_PATH=$installed\lib\pkgconfig"

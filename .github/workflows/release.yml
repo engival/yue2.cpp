@@ -1,0 +1,189 @@
+name: Release
+
+# Pushing a tag v* builds the Linux x86_64 and Windows x64 archives and attaches
+# them to a DRAFT GitHub release. Nothing is published until a maintainer
+# reviews the draft and presses Publish (docs/RELEASING.md).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  linux:
+    name: linux x86_64
+    runs-on: ubuntu-22.04   # oldest glibc GitHub still offers; the binary runs on 2.35+
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0   # tags, for `yue2 --version` (git describe)
+
+      - uses: ./.github/actions/linux-deps
+
+      - name: ccache (restore only)
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: linux-2204-eagle3-ON
+          save: false
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DYUE2_OPUS=OFF \
+            -DYUE2_EAGLE3=ON \
+            -DYUE2_BUILD_TESTS=ON \
+            "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Smoke tests
+        run: bash .github/scripts/smoke-test.sh build
+
+      # The archive promises that libvulkan.so.1 is the only non-glibc library.
+      - name: Check runtime dependencies
+        run: |
+          ldd build/yue2
+          extra=$(ldd build/yue2 | awk '{print $1}' \
+            | grep -Ev '^(linux-vdso\.so\.1|/lib64/ld-linux-x86-64\.so\.2|libvulkan\.so\.1|libc\.so\.6|libm\.so\.6|libpthread\.so\.0|libdl\.so\.2|librt\.so\.1)$' || true)
+          if [ -n "$extra" ]
+          then
+            echo "::error::unexpected shared libraries: $extra"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          name="yue2-${TAG}-linux-x86_64"
+          mkdir -p "dist/$name/licenses"
+          cp build/yue2 LICENSE NOTICE.md "dist/$name/"
+          strip "dist/$name/yue2"
+          sed "s/@VERSION@/${TAG}/" .github/release/README-QUICKSTART.txt > "dist/$name/README-QUICKSTART.txt"
+          cp "$FLAC_LICENSE_FILE" "dist/$name/licenses/libFLAC-COPYING.Xiph.txt"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-x86_64
+          path: yue2-${{ github.ref_name }}-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0   # tags, for `yue2 --version` (git describe)
+
+      - uses: ./.github/actions/windows-deps
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:YUE2_VCPKG_TOOLCHAIN" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            "-DPKG_CONFIG_EXECUTABLE=$env:YUE2_PKGCONF" `
+            -DGGML_VULKAN=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DYUE2_OPUS=OFF `
+            -DYUE2_EAGLE3=ON `
+            -DYUE2_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Runtime DLLs
+        shell: pwsh
+        run: ./.github/scripts/collect-dlls.ps1 -Exe build/yue2.exe -SearchDir $env:YUE2_VCPKG_BIN -Dest build
+
+      - name: Smoke tests
+        shell: bash
+        env:
+          NOISE_GOLDEN_SOFT: '1'
+        run: bash .github/scripts/smoke-test.sh build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "yue2-$env:TAG-windows-x64"
+          $dir  = "dist\$name"
+          New-Item -ItemType Directory -Force "$dir\licenses" | Out-Null
+          Copy-Item build\yue2.exe, LICENSE, NOTICE.md $dir
+          ./.github/scripts/collect-dlls.ps1 -Exe "$dir\yue2.exe" -SearchDir $env:YUE2_VCPKG_BIN -Dest $dir
+          # vcpkg keeps each port's licence in share/<port>/copyright.
+          foreach ($port in 'flac', 'libogg')
+          {
+            $lic = "$env:YUE2_VCPKG_INSTALLED\share\$port\copyright"
+            if (Test-Path $lic) { Copy-Item $lic "$dir\licenses\$port-copyright.txt" }
+          }
+          (Get-Content .github\release\README-QUICKSTART.txt) -replace '@VERSION@', $env:TAG |
+            Set-Content -Encoding utf8 "$dir\README-QUICKSTART.txt"
+          Get-ChildItem -Recurse $dir | ForEach-Object { Write-Host $_.FullName }
+          Compress-Archive -Path $dir -DestinationPath "$name.zip"
+          Get-FileHash "$name.zip" -Algorithm SHA256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          path: yue2-${{ github.ref_name }}-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- * | tee SHA256SUMS.txt
+
+      # A re-run of a failed tag finds its draft already there and replaces the files.
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" > /dev/null 2>&1
+          then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            prerelease=()
+            if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+            gh release create "$TAG" dist/* --draft --verify-tag "${prerelease[@]}" \
+              --title "yue2.cpp $TAG" --generate-notes
+          fi
