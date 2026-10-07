@@ -5,6 +5,21 @@
 #include <string>
 #include <vector>
 
+// Speculative semantic decoding with an EAGLE-3 draft head (SPEC_DRAFT.md §5).
+// The same flags on `yue2 ar`, `song` and `batch`; `file` empty = off.
+struct DraftParams
+{
+	std::string file;
+	int         k       = 2;
+	double      lambda  = 1.0;     // 1 = exact, > 1 = lossy (§4.3)
+	bool        q_raw   = false;   // --draft-q raw: q is a plain softmax, not the sampler's shape
+	int         window  = 0;       // draft KV rows kept, 0 = the whole song
+	bool        trace   = false;   // DIR/draft_trace.npy
+	// Hidden, for §6.1 only: the head is loaded and the target's layer inputs are
+	// extracted for the whole job, but nothing is drafted — prices the extraction.
+	bool        extract_only = false;
+};
+
 struct ArParams
 {
 	std::string model;
@@ -26,6 +41,7 @@ struct ArParams
 	bool        verify_sampler    = false;   // run the frozen stage-5 sampler beside the new one
 	bool        prefix_only       = false;   // tokenize request + given abc, write prefix.npy, decode nothing
 	bool        guidance_trace    = false;   // --guidance-trace: DIR/guidance_trace.npy, diagnostics only
+	DraftParams draft;
 };
 
 // One song in a batch: exactly the per-song options `yue2 song` takes, minus
@@ -60,6 +76,7 @@ struct ArBatchParams
 	bool        continue_on_error = false;
 	bool        verify_sampler    = false;   // SPEC_SAMPLER.md §4
 	bool        prefix_only       = false;
+	DraftParams draft;
 };
 
 // protocol.SongResult timing, as plan.json / result.json record it.
@@ -87,6 +104,17 @@ struct GenStats
 	// the score under each entry's own tags cost.
 	int    section_cuts    = 0;
 	double section_prefill_seconds = 0;
+	// SPEC_DRAFT §5: the semantic phase's speculative rounds, all zero without
+	// --draft. tested_per_depth[j] = rounds whose accept walk reached depth
+	// j + 1, accepted_per_depth[j] = of those, the ones that accepted there —
+	// the ratio is the conditional acceptance the trainer reports per depth.
+	int              draft_rounds   = 0;
+	int              draft_proposed = 0;
+	int              draft_accepted = 0;
+	std::vector<int> tested_per_depth;
+	std::vector<int> accepted_per_depth;
+	double           draft_seconds  = 0;   // draft decodes + encoder + feed
+	double           verify_seconds = 0;   // the K+1-row target decodes
 };
 
 // What the abc phase of a score-template job did with its holes. SPEC_TEMPLATE
@@ -126,9 +154,16 @@ struct ArResult
 	int                  parallel  = 1;       // how this song was decoded — see SPEC_BATCH §6
 	int                  slot      = 0;
 	int                  batch_jobs = 1;
+	std::string          draft_type;          // the head's weight type, "" without --draft
 };
 
 ArParams parse_ar_args(const char * argv0, int argc, char ** argv);
+
+// The --draft* flags, shared by the three parsers: true when argv[i] was one of
+// them (i is advanced past its value). check_draft_args settles the values once
+// the whole command line is read.
+bool parse_draft_arg(const std::string & a, int argc, char ** argv, int & i, DraftParams & d);
+void check_draft_args(const DraftParams & d);
 
 // Reads a `--jobs` / `--requests` JSON array into `jobs`. `need_out` picks which
 // per-job path is required: the FLAC for `yue2 batch`, the artifacts directory

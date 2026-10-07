@@ -688,6 +688,49 @@ batches of two or three rows for as long as a branch is live, so the same rule
 applies to it: a seed repeats it only together with the same guidance block. The
 steps before the first entry are single-row and match the unguided song exactly.
 
+## Speculative decoding (optional)
+
+```bash
+build/yue2 song --request song.json --out song.flac --gpu 1 \
+	--draft YuE2-3B-EAGLE3-draft-Q8_0.gguf --draft-k 2
+```
+
+`--draft HEAD.gguf` speeds up the semantic phase with an EAGLE-3 draft head: a
+one-layer model proposes `--draft-k` codec tokens (default 2) and one
+multi-row AR decode verifies them. The head is
+[`engival/YuE2-3B-EAGLE3-draft-GGUF`](https://huggingface.co/engival/YuE2-3B-EAGLE3-draft-GGUF)
+(`YuE2-3B-EAGLE3-draft-Q8_0.gguf`, 154 MB, CC BY-NC 4.0 as a derivative of the
+YuE2 weights). It was trained against yue2.cpp's own Q8_0 AR GGUF — what
+`yue2 convert` makes by default; other AR quants are untested.
+
+- **Exact** (`--draft-lambda 1`, the default) is rejection sampling: the tokens
+  are distributed exactly as without a draft, so only the speed changes. The
+  same seed gives a different (equally valid) song than without `--draft`,
+  because the draws are spent differently; it is repeatable for a given seed,
+  head, K and λ.
+- **Lossy** (`--draft-lambda λ > 1`) accepts drafted tokens more readily inside
+  the sampler's support: faster, and the song then follows the head's taste
+  somewhat. λ 3 could not be told apart from exact by ear in our tests.
+
+Measured, Q8_0 head, K 2: the semantic phase runs 1.15× faster on an Intel Arc
+B70 and 1.11× on a 7900 XTX in exact mode, up to 1.36× at λ 3. The abc phase
+and the NAR are not drafted, so a whole song gets about 5–10 % faster
+(SPEC_DRAFT.md, src/STATUS_DRAFT.md); one 6.1k-token song on the Arc went
+from 122.8 to 143.4 semantic tok/s (1.17×), 121 → 115 s end to end
+(src/STATUS_EAGLE3_MERGE.md). K above 2 loses on both cards.
+
+Scope: unguided songs only — `--draft` refuses guided requests (`guidance`,
+`cfg_scale` ≠ 1, `cfg_score`, `sections` with an `against`; `"cot": "off"` needs
+`"cfg_scale": 1`), `semantic_keep`, `handover`, `--greedy` and `--parallel > 1`. `yue2 ar` and
+`yue2 batch` take the same flags (`batch` at `--parallel 1`); `--draft-trace`
+writes per-round acceptance to `draft_trace.npy`, and `result.json` carries the
+acceptance per depth.
+
+The head runs on llama.cpp's experimental EAGLE-3 API (`src/llama-ext.h`, not
+the public `llama.h`). Configure with `-DYUE2_EAGLE3=OFF` to build without it,
+e.g. after a llama.cpp bump that breaks that API: the `--draft*` flags still
+parse, and `--draft` exits with `built without EAGLE-3 support`.
+
 ## Decode
 
 ```bash

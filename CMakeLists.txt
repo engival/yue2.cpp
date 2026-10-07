@@ -58,12 +58,28 @@ target_link_libraries(yue2-vae PRIVATE ggml PkgConfig::FLAC)
 target_compile_options(yue2-vae PRIVATE ${YUE2_WARN_FLAGS})
 yue2_add_opus(yue2-vae)
 
+# Everything that compiles src/stage_ar.cpp also needs the EAGLE-3 draft head's
+# runtime (SPEC_DRAFT.md), whose API is in llama.cpp's staging header
+# src/llama-ext.h rather than include/llama.h. That header is experimental, so
+# the switch lets a llama.cpp bump that breaks it never block a build: OFF
+# compiles the inline stubs of src/draft_eagle3.hpp and `--draft` is refused.
+option(YUE2_EAGLE3 "EAGLE-3 speculative decoding (--draft); uses llama.cpp's experimental llama-ext.h" ON)
+message(STATUS "yue2: EAGLE-3 speculative decoding (--draft) ${YUE2_EAGLE3}")
+function(yue2_add_draft target)
+	if(YUE2_EAGLE3)
+		target_sources(${target} PRIVATE src/draft_eagle3.cpp)
+		target_include_directories(${target} SYSTEM PRIVATE llama.cpp/src)
+		target_compile_definitions(${target} PRIVATE YUE2_HAVE_EAGLE3)
+	endif()
+endfunction()
+
 # vendor::hash gives us llama.cpp's SHA-256 (hash_sha256_hex) and vendor::nlohmann
 # the JSON header — both are built unconditionally by llama.cpp/vendor.
 add_executable(yue2-ar src/yue2-ar.cpp src/stage_ar.cpp)
 target_include_directories(yue2-ar PRIVATE src)
 target_link_libraries(yue2-ar PRIVATE llama ggml vendor::hash vendor::nlohmann)
 target_compile_options(yue2-ar PRIVATE ${YUE2_WARN_FLAGS})
+yue2_add_draft(yue2-ar)
 
 # Stage 3: the NAR flow-matching half, raw ggml only (SPEC_NAR.md section 4.1).
 # vendor::nlohmann is for nothing but the safetensors header of --nar-lora.
@@ -81,6 +97,7 @@ target_include_directories(yue2 PRIVATE src)
 target_link_libraries(yue2 PRIVATE llama ggml vendor::hash vendor::nlohmann PkgConfig::FLAC)
 target_compile_options(yue2 PRIVATE ${YUE2_WARN_FLAGS})
 yue2_add_opus(yue2)
+yue2_add_draft(yue2)
 
 # `yue2 convert` (SPEC_CONVERT.md) reproduces numpy's float rounding bit for
 # bit, so no multiply may be fused into an add behind its back. Plain if()
@@ -98,12 +115,13 @@ set_source_files_properties(src/convert.cpp PROPERTIES COMPILE_OPTIONS ${YUE2_NO
 # includes src/stage_ar.cpp to reach both samplers in its anonymous namespace,
 # so it tests the shipping code rather than a copy. Tests only — off by default,
 # never installed: cmake -B build_sampler -DYUE2_BUILD_TESTS=ON
-option(YUE2_BUILD_TESTS "Build the tests-only targets (yue2-sampler-diff, yue2-bars)" OFF)
+option(YUE2_BUILD_TESTS "Build the tests-only targets (yue2-sampler-diff, yue2-bars, ...)" OFF)
 if(YUE2_BUILD_TESTS)
 	add_executable(yue2-sampler-diff tests/sampler_diff.cpp)
 	target_include_directories(yue2-sampler-diff PRIVATE src)
 	target_link_libraries(yue2-sampler-diff PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-sampler-diff PRIVATE ${YUE2_WARN_FLAGS})
+	yue2_add_draft(yue2-sampler-diff)
 
 	# Stage 7: the score template's bar counter and parser (SPEC_TEMPLATE.md §4),
 	# included the same way and for the same reason.
@@ -111,6 +129,7 @@ if(YUE2_BUILD_TESTS)
 	target_include_directories(yue2-bars PRIVATE src)
 	target_link_libraries(yue2-bars PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-bars PRIVATE ${YUE2_WARN_FLAGS})
+	yue2_add_draft(yue2-bars)
 
 	# Stage 7 (guidance): the weight curves, the branch lifecycle rule and every
 	# request error of SPEC_GUIDANCE.md §2.3/§2.4 — no model, no device.
@@ -118,6 +137,7 @@ if(YUE2_BUILD_TESTS)
 	target_include_directories(yue2-guidance PRIVATE src)
 	target_link_libraries(yue2-guidance PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-guidance PRIVATE ${YUE2_WARN_FLAGS})
+	yue2_add_draft(yue2-guidance)
 
 	# Stage 9 (handover): the offset measurement of SPEC_HANDOVER.md §4, the
 	# forced history of §5 and every request error of §2 — synthetic streams
@@ -126,6 +146,7 @@ if(YUE2_BUILD_TESTS)
 	target_include_directories(yue2-handover PRIVATE src)
 	target_link_libraries(yue2-handover PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-handover PRIVATE ${YUE2_WARN_FLAGS})
+	yue2_add_draft(yue2-handover)
 
 	# yue2 convert: the numpy float32 exp port against a hash of numpy's own
 	# outputs (tests/numpy_exp_ref.py) - CPU only, no model.
@@ -134,4 +155,11 @@ if(YUE2_BUILD_TESTS)
 	target_link_libraries(yue2-numpy-exp PRIVATE ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-numpy-exp PRIVATE ${YUE2_WARN_FLAGS})
 	set_source_files_properties(tests/numpy_exp.cpp PROPERTIES COMPILE_OPTIONS ${YUE2_NO_FP_CONTRACT})
+
+	# Stage 12 (draft): the speculative accept/residual math of SPEC_DRAFT.md §4.2
+	# — chi-square of the emitted tokens against p over sparse random pairs. A
+	# header-only unit, so this one includes nothing but src/draft_accept.hpp.
+	add_executable(yue2-draft-accept tests/draft_accept.cpp)
+	target_include_directories(yue2-draft-accept PRIVATE src)
+	target_compile_options(yue2-draft-accept PRIVATE ${YUE2_WARN_FLAGS})
 endif()
