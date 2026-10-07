@@ -91,11 +91,22 @@ target_compile_options(yue2-nar PRIVATE ${YUE2_WARN_FLAGS})
 # Stage 4: one binary for the whole song (SPEC_SINGLE.md). `yue2 song` runs the
 # AR and NAR in this process and the VAE as a child of it, because ggml-vulkan's
 # F32-exactness switch is read once per device init (SPEC_SINGLE.md section 2.2).
+# `yue2 --version`: the tag or commit this tree was configured from (a source
+# tarball without .git says "unknown"). Re-run cmake to refresh it.
+execute_process(COMMAND git describe --tags --always --dirty
+	WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+	OUTPUT_VARIABLE YUE2_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+if(NOT YUE2_VERSION)
+	set(YUE2_VERSION unknown)
+endif()
+message(STATUS "yue2: version ${YUE2_VERSION}")
+
 add_executable(yue2 src/yue2.cpp src/stage_song.cpp
 	src/stage_ar.cpp src/stage_nar.cpp src/stage_vae.cpp src/convert.cpp)
 target_include_directories(yue2 PRIVATE src)
 target_link_libraries(yue2 PRIVATE llama ggml vendor::hash vendor::nlohmann PkgConfig::FLAC)
 target_compile_options(yue2 PRIVATE ${YUE2_WARN_FLAGS})
+target_compile_definitions(yue2 PRIVATE YUE2_VERSION="${YUE2_VERSION}")
 yue2_add_opus(yue2)
 yue2_add_draft(yue2)
 

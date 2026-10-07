@@ -6,6 +6,7 @@
 
 #include "common/util.hpp"
 
+#include <cstdlib>
 #include <string>
 
 // ggml-vulkan's mul_mm shader stages BOTH operands as float16_t whenever the
@@ -19,8 +20,17 @@
 // See docs/vulkan_burst_investigation.md.
 inline void vulkan_want_exact_f32()
 {
-	setenv("GGML_VK_DISABLE_F16", "1", 0);
-	setenv("GGML_VK_DISABLE_COOPMAT", "1", 0);
+	for (const char * name : { "GGML_VK_DISABLE_F16", "GGML_VK_DISABLE_COOPMAT" })
+	{
+#ifdef _WIN32
+		if (getenv(name) == nullptr)
+		{
+			_putenv_s(name, "1");
+		}
+#else
+		setenv(name, "1", 0);
+#endif
+	}
 }
 
 inline ggml_backend_dev_t vulkan_device(int gpu)

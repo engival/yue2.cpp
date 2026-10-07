@@ -29,6 +29,8 @@ static void usage()
 	        "       yue2 noise --seed N --frames T -o noise.npy\n"
 	        "       yue2 convert [--src-3b DIR] [--src-vae DIR] [--out DIR] ...\n"
 	        "\n"
+	        "       yue2 --version\n"
+	        "\n"
 	        "`yue2 <stage> --help` prints that stage's own flags.\n");
 }
 
@@ -73,8 +75,13 @@ int main(int argc, char ** argv)
 {
 	// A driver that runs `yue2 batch` through a pipe sees a fully buffered
 	// stdout, i.e. nothing for minutes. Line-buffer it once, here, rather than
-	// scattering fflush() through the stages.
+	// scattering fflush() through the stages. The MSVC runtime has no line
+	// buffering (_IOLBF means full there, and size 0 aborts): unbuffered instead.
+#ifdef _WIN32
+	setvbuf(stdout, nullptr, _IONBF, 0);
+#else
 	setvbuf(stdout, nullptr, _IOLBF, 0);
+#endif
 
 	if (argc < 2)
 	{
@@ -87,6 +94,17 @@ int main(int argc, char ** argv)
 	const std::string cmd  = argv[1];
 	const int         sub  = argc - 1;
 	char ** const     rest = argv + 1;
+
+	if (cmd == "--help" || cmd == "-h" || cmd == "help")
+	{
+		usage();
+		return 0;
+	}
+	if (cmd == "--version" || cmd == "-v")
+	{
+		printf("yue2 %s\n", YUE2_VERSION);
+		return 0;
+	}
 
 	if (cmd == "song")
 	{
