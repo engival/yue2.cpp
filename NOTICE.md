@@ -48,6 +48,15 @@ canonical copy). `convert/requirements.txt` additionally installs
 `modeling_vae.py`'s `PretrainedConfig` base class; it is a dependency, not
 copied code.
 
+## Libraries in the release binaries
+
+The prebuilt archives link these statically (Linux) or ship them as DLLs
+(Windows); their license texts are in the archive's `licenses/` directory.
+
+- **libFLAC** — Copyright (c) Xiph.Org Foundation and contributors, BSD-3-Clause.
+- **libogg** (Windows archive only, a libFLAC dependency there) — Copyright (c)
+  Xiph.Org Foundation, BSD-3-Clause.
+
 ## Model weights (NOT included, NOT covered by this license)
 
 - **m-a-p/YuE2-Vae** and **m-a-p/YuE2-3B** — CC BY-NC 4.0. Non-commercial.
