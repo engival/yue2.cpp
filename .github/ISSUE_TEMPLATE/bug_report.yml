@@ -1,0 +1,88 @@
+name: Bug report
+description: yue2 crashed, refused to run, or produced wrong / broken audio.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. yue2.cpp is developed and tested on one Linux box
+        (AMD RDNA3 + Intel Arc, Mesa RADV/ANV), so reports from other GPUs, drivers
+        and Windows are especially useful. Please paste text, not screenshots.
+
+  - type: input
+    id: version
+    attributes:
+      label: yue2 version
+      description: Release tag (e.g. v0.1.0), or the commit for a source build (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+
+  - type: dropdown
+    id: build
+    attributes:
+      label: How did you get yue2?
+      options:
+        - Release archive (Linux)
+        - Release archive (Windows)
+        - Built from source
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Distribution / Windows version, e.g. "Ubuntu 24.04", "Windows 11 24H2".
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver
+      description: e.g. "RX 7900 XTX, Mesa 25.2 RADV", "RTX 4070, NVIDIA 580.xx", "Arc A770, Intel 32.0.101.xxxx".
+    validations:
+      required: true
+
+  - type: textarea
+    id: vulkaninfo
+    attributes:
+      label: vulkaninfo --summary
+      description: Output of `vulkaninfo --summary` (from the vulkan-tools package / the Vulkan SDK).
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      description: The full command line, and the request JSON if `yue2 song` / `yue2 batch` (trim long lyrics if you like).
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Full log
+      description: Everything yue2 printed, stdout and stderr, from the start (e.g. `yue2 song ... 2>&1 | tee yue2.log`).
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+      description: For audio problems, describe what is wrong (silence, noise, wrong length, glitches at a time stamp...).
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Other GPUs tried, whether `--cpu` or another `--gpu N` behaves differently, recent driver updates.
+    validations:
+      required: false

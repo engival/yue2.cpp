@@ -1,0 +1,150 @@
+name: CI
+
+# Compile + no-weights smoke tests. Runners have no GPU and no model, so this
+# proves the tree builds and the CPU-only tests pass; it renders nothing.
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'docs/**', 'convert/**', 'scripts/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'convert/**', 'scripts/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux:
+    name: linux (ubuntu-22.04, EAGLE3 ${{ matrix.eagle3 }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        eagle3: ['ON', 'OFF']
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/linux-deps
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: linux-2204-eagle3-${{ matrix.eagle3 }}
+          evict-old-files: 7d
+          save: ${{ github.event_name == 'push' }}
+
+      # Same flags as the release job, so a green CI means the release builds.
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DYUE2_OPUS=OFF \
+            -DYUE2_EAGLE3=${{ matrix.eagle3 }} \
+            -DYUE2_BUILD_TESTS=ON \
+            "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Linked libraries
+        run: ldd build/yue2
+
+      - name: Smoke tests
+        run: bash .github/scripts/smoke-test.sh build
+
+  # The distro toolchain path: shared ggml, system libFLAC, Opus on.
+  linux-distro:
+    name: linux (ubuntu-24.04, distro packages, Opus)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential ninja-build \
+            glslc libvulkan-dev spirv-headers libflac-dev libopusenc-dev pkg-config
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.24
+        with:
+          key: linux-2404-distro
+          evict-old-files: 7d
+          save: ${{ github.event_name == 'push' }}
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_VULKAN=ON \
+            -DGGML_NATIVE=OFF \
+            -DYUE2_OPUS=ON \
+            -DYUE2_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Opus linked
+        run: ldd build/yue2 | tee /dev/stderr | grep -q libopusenc
+
+      - name: Smoke tests
+        run: bash .github/scripts/smoke-test.sh build
+
+  windows:
+    name: windows (MSVC x64)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: ./.github/actions/windows-deps
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:YUE2_VCPKG_TOOLCHAIN" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            "-DPKG_CONFIG_EXECUTABLE=$env:YUE2_PKGCONF" `
+            -DGGML_VULKAN=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_OPENMP=OFF `
+            -DBUILD_SHARED_LIBS=OFF `
+            -DYUE2_OPUS=OFF `
+            -DYUE2_EAGLE3=ON `
+            -DYUE2_BUILD_TESTS=ON
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Runtime DLLs
+        shell: pwsh
+        run: ./.github/scripts/collect-dlls.ps1 -Exe build/yue2.exe -SearchDir $env:YUE2_VCPKG_BIN -Dest build
+
+      # mt19937_64 is bit-exact everywhere, but the golden also goes through
+      # libm's sqrt/log/cos/sin, so MSVC's CRT may legitimately differ: warn only.
+      - name: Smoke tests
+        shell: bash
+        env:
+          NOISE_GOLDEN_SOFT: '1'
+        run: bash .github/scripts/smoke-test.sh build
