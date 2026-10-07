@@ -27,9 +27,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <string>
-#include <sys/stat.h>
 #include <vector>
 
 // Private to this translation unit: stage_ar/stage_nar/stage_vae each have
@@ -1008,7 +1008,8 @@ int run_nar(const NarParams & p)
 
 	if (!p.dump_dir.empty())
 	{
-		mkdir(p.dump_dir.c_str(), 0755);
+		std::error_code ec;
+		std::filesystem::create_directories(p.dump_dir, ec);
 	}
 
 	// chunking (protocol.py:142-145) ----------------------------------------
