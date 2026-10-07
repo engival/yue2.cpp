@@ -64,3 +64,7 @@ BatchParams parse_batch_args(const char * argv0, int argc, char ** argv);
 
 int run_song (const SongParams & p);
 int run_batch(const BatchParams & p, std::vector<ArJob> jobs);
+
+// Where the default GGUFs live and `yue2 convert` writes them: the directory
+// of this executable.
+std::string gguf_home_dir();

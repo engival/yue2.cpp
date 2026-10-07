@@ -18,7 +18,18 @@ converter reads weights the user has obtained from Hugging Face themselves.
   llama.cpp contributors, MIT. Copied nearly verbatim into
   `convert/convert_ar.py` (see the comment above those functions there) to
   turn the raw `qwen.tiktoken` ranks into the gpt2-style vocab + merges GGUF
-  expects, since there is no HF `tokenizer.json` to convert from.
+  expects, since there is no HF `tokenizer.json` to convert from. The same
+  two functions now also live in C++ in `src/convert.cpp` (`bpe()`,
+  `build_vocab()`), the converter inside `yue2 convert`; its byte → code point
+  table is GPT-2's `bytes_to_unicode()` (OpenAI `encoder.py`, MIT), rewritten.
+- **SHA-256** — `yue2 convert` hashes the checkpoint with the implementation
+  llama.cpp already vendors (`llama.cpp/vendor/hash/sha256`, Igor Pavlov,
+  public domain); nothing new is vendored.
+- **NumPy** — Copyright (c) 2005-2025 NumPy Developers, BSD-3-Clause.
+  `src/convert.cpp` reimplements two of its float routines so the C++
+  converter reproduces the Python one bit for bit: the pairwise summation
+  behind `np.linalg.norm` and the AVX2/AVX512F float32 `exp`
+  (`loops_exponent_log`: Cody-Waite reduction, rational minimax coefficients).
 - **stable-diffusion.cpp** — Copyright (c) 2023 leejet, MIT. The Conv1D /
   ConvTranspose1D / SnakeBeta block structure in `src/` follows the pattern of
   its `ltx_audio_vae.hpp`.
@@ -28,7 +39,7 @@ converter reads weights the user has obtained from Hugging Face themselves.
 - **YuE2 reference inference** (`yue2_infer`, m-a-p) — the exact-boundary
   tiled decoding scheme is reimplemented from its documented math, not copied.
 
-All of the above are MIT; their full license texts are included with the
+All of the above are MIT (NumPy BSD-3-Clause, the SHA-256 public domain); their full license texts are included with the
 respective upstream projects (`llama.cpp/LICENSE`, and the same permissive
 text for the smaller snippets — see each project's repository for the
 canonical copy). `convert/requirements.txt` additionally installs

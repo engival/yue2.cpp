@@ -76,11 +76,23 @@ target_compile_options(yue2-nar PRIVATE ${YUE2_WARN_FLAGS})
 # AR and NAR in this process and the VAE as a child of it, because ggml-vulkan's
 # F32-exactness switch is read once per device init (SPEC_SINGLE.md section 2.2).
 add_executable(yue2 src/yue2.cpp src/stage_song.cpp
-	src/stage_ar.cpp src/stage_nar.cpp src/stage_vae.cpp)
+	src/stage_ar.cpp src/stage_nar.cpp src/stage_vae.cpp src/convert.cpp)
 target_include_directories(yue2 PRIVATE src)
 target_link_libraries(yue2 PRIVATE llama ggml vendor::hash vendor::nlohmann PkgConfig::FLAC)
 target_compile_options(yue2 PRIVATE ${YUE2_WARN_FLAGS})
 yue2_add_opus(yue2)
+
+# `yue2 convert` (SPEC_CONVERT.md) reproduces numpy's float rounding bit for
+# bit, so no multiply may be fused into an add behind its back. Plain if()
+# rather than $<CXX_COMPILER_FRONTEND_VARIANT:...>, which needs CMake 3.30.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+	set(YUE2_NO_FP_CONTRACT /clang:-ffp-contract=off)   # clang-cl
+elseif(MSVC)
+	set(YUE2_NO_FP_CONTRACT /fp:strict)
+else()
+	set(YUE2_NO_FP_CONTRACT -ffp-contract=off)          # GCC, Clang, AppleClang
+endif()
+set_source_files_properties(src/convert.cpp PROPERTIES COMPILE_OPTIONS ${YUE2_NO_FP_CONTRACT})
 
 # Stage 6: the sparse sampler's differential test (SPEC_SAMPLER.md §4.2). It
 # includes src/stage_ar.cpp to reach both samplers in its anonymous namespace,
@@ -114,4 +126,12 @@ if(YUE2_BUILD_TESTS)
 	target_include_directories(yue2-handover PRIVATE src)
 	target_link_libraries(yue2-handover PRIVATE llama ggml vendor::hash vendor::nlohmann)
 	target_compile_options(yue2-handover PRIVATE ${YUE2_WARN_FLAGS})
+
+	# yue2 convert: the numpy float32 exp port against a hash of numpy's own
+	# outputs (tests/numpy_exp_ref.py) - CPU only, no model.
+	add_executable(yue2-numpy-exp tests/numpy_exp.cpp)
+	target_include_directories(yue2-numpy-exp PRIVATE src)
+	target_link_libraries(yue2-numpy-exp PRIVATE ggml vendor::hash vendor::nlohmann)
+	target_compile_options(yue2-numpy-exp PRIVATE ${YUE2_WARN_FLAGS})
+	set_source_files_properties(tests/numpy_exp.cpp PROPERTIES COMPILE_OPTIONS ${YUE2_NO_FP_CONTRACT})
 endif()

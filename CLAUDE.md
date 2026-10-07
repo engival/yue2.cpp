@@ -21,6 +21,8 @@ manual; this file is where things are and the rules that were learned the hard w
   keep it that way.
 - `convert/` — safetensors → GGUF (`convert_vae.py`, `convert_ar.py`,
   `convert_nar.py`) and the torch-CPU reference scripts that make goldens.
+  `yue2 convert` (`src/convert.cpp`, SPEC_CONVERT.md) is their C++ port and
+  must stay byte-identical to them (`tests/gguf_compare.py`, `cmp`).
 - `tests/golden/` — golden inputs/outputs (`*.npy` gitignored, `*_meta.json`
   committed with SHA-256s). `tests/out/` — scratch, gitignored.
 

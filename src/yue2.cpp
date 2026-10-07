@@ -2,6 +2,7 @@
 // audio in a single process; `yue2 ar|nar|vae` are the individual stages with
 // the flags yue2-ar / yue2-nar / yue2-vae take. See SPEC_SINGLE.md.
 
+#include "convert.hpp"
 #include "stage_ar.hpp"
 #include "stage_nar.hpp"
 #include "stage_song.hpp"
@@ -26,6 +27,7 @@ static void usage()
 	        "       yue2 nar   --ar AR.gguf -m NAR.gguf --artifacts DIR -o latent.npy ...\n"
 	        "       yue2 vae   -m VAE.gguf -i latent.npy -o out.flac|out.opus ...\n"
 	        "       yue2 noise --seed N --frames T -o noise.npy\n"
+	        "       yue2 convert [--src-3b DIR] [--src-vae DIR] [--out DIR] ...\n"
 	        "\n"
 	        "`yue2 <stage> --help` prints that stage's own flags.\n");
 }
@@ -116,6 +118,15 @@ int main(int argc, char ** argv)
 	if (cmd == "noise")
 	{
 		return run_noise(sub, rest);
+	}
+	if (cmd == "convert")
+	{
+		ConvertParams p = parse_convert_args("yue2 convert", sub, rest);
+		if (p.out.empty())
+		{
+			p.out = gguf_home_dir();
+		}
+		return run_convert(p);
 	}
 
 	usage();
