@@ -138,7 +138,7 @@ jobs:
           Copy-Item build\yue2.exe, LICENSE, NOTICE.md $dir
           ./.github/scripts/collect-dlls.ps1 -Exe "$dir\yue2.exe" -SearchDir $env:YUE2_VCPKG_BIN -Dest $dir
           # vcpkg keeps each port's licence in share/<port>/copyright.
-          foreach ($port in 'flac', 'libogg')
+          foreach ($port in 'libflac', 'libogg')
           {
             $lic = "$env:YUE2_VCPKG_INSTALLED\share\$port\copyright"
             if (Test-Path $lic) { Copy-Item $lic "$dir\licenses\$port-copyright.txt" }
