@@ -23,6 +23,10 @@ manual; this file is where things are and the rules that were learned the hard w
   `convert_nar.py`) and the torch-CPU reference scripts that make goldens.
   `yue2 convert` (`src/convert.cpp`, SPEC_CONVERT.md) is their C++ port and
   must stay byte-identical to them (`tests/gguf_compare.py`, `cmp`).
+- `SPEC_DRAFT.md` — EAGLE-3 speculative decoding (`--draft`). Behind CMake
+  `YUE2_EAGLE3` (default ON) because it uses llama.cpp's experimental
+  `src/llama-ext.h`: only `src/draft_eagle3.cpp` may include it; OFF builds the
+  stubs in `draft_eagle3.hpp`. Keep `stage_ar.cpp` / `stage_song.cpp` `#ifdef`-free.
 - `tests/golden/` — golden inputs/outputs (`*.npy` gitignored, `*_meta.json`
   committed with SHA-256s). `tests/out/` — scratch, gitignored.
 
