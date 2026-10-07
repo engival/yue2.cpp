@@ -25,16 +25,17 @@ Status:
 
 Notes and measurements in [docs/](docs/); per-stage status in `src/STATUS*.md`.
 
-Weights are not included. The converters in `convert/` build the three GGUFs
-from your own copies of [`m-a-p/YuE2-3B`](https://huggingface.co/m-a-p/YuE2-3B)
-(AR + NAR, one checkpoint) and [`m-a-p/YuE2-Vae`](https://huggingface.co/m-a-p/YuE2-Vae)
+Weights are not included. `yue2 convert` builds the three GGUFs from your own
+copies of [`m-a-p/YuE2-3B`](https://huggingface.co/m-a-p/YuE2-3B) (AR + NAR,
+one checkpoint) and [`m-a-p/YuE2-Vae`](https://huggingface.co/m-a-p/YuE2-Vae)
 (the decoder), both CC BY-NC 4.0 — see the Quick start. Code is MIT; NOTICE.md
 has the lineage.
 
 ## Quick start
 
 From a fresh clone to a FLAC. Needs libFLAC 1.5 (`pkg-config flac`), a Vulkan
-driver + `glslc`, and python3; libopusenc is optional and adds `.opus` output.
+driver + `glslc`; libopusenc is optional and adds `.opus` output. No Python is
+needed to build, convert or render.
 All paths below are relative to the repo root.
 
 **Tested on** one box only: Slackware64-current (Linux), an AMD Radeon RX 7900
@@ -55,8 +56,6 @@ cmake --build build -j8
 
 Binaries land in `build/`: `yue2` (everything) plus `yue2-ar`, `yue2-nar`,
 `yue2-vae`, one-line mains over the same `src/stage_*.cpp` as `yue2 ar|nar|vae`.
-`llama-quantize` is **not** one of them (`LLAMA_BUILD_TOOLS OFF`) — step 4 needs
-it from an ordinary llama.cpp build; see [the `yue2-ar` section](#generate-the-symbolic-plan--semantic-tokens-yue2-ar).
 
 **2. Get the weights** (CC BY-NC 4.0, **non-commercial**, per NOTICE.md; the
 GGUFs you make inherit that licence). One checkpoint holds both the AR and NAR
@@ -67,34 +66,32 @@ hf download m-a-p/YuE2-3B      # AR + NAR, model.safetensors + config.json + qwe
 hf download m-a-p/YuE2-Vae     # VAE, model.safetensors + config.json
 ```
 
-They go to `~/.cache/huggingface/hub`. The converters find them there on their
-own — `convert/common.py:resolve_snapshot()` calls `snapshot_download(repo_id,
-local_files_only=True)` — so `--src` is only needed for a snapshot dir
-elsewhere.
+They go to `~/.cache/huggingface/hub` (or wherever `$HF_HUB_CACHE`, `$HF_HOME`
+or `$XDG_CACHE_HOME` point it, as huggingface_hub resolves them), where `yue2`
+finds them on its own.
 
-**3. Converter environment** (CPU torch only; no GPU is used):
-
-```bash
-python3 -m venv venv && venv/bin/pip install -r convert/requirements.txt
-```
-
-**4. Convert, once.** `yue2 song` looks for `yue2-ar-q8_0.gguf`,
-`yue2-nar-f16.gguf` and `yue2-vae-f32.gguf` next to the executable and then one
-directory up, so write them to the repo root:
+**3. Convert, once** — or skip this: the first `yue2 song` / `yue2 batch` that
+finds a default GGUF missing converts it first (one line of notice, then the
+render). Either way the files land next to the binary, where `song` looks:
 
 ```bash
-venv/bin/python convert/convert_ar.py  --out yue2-ar-f16.gguf    # 4,338,917,568 B
-venv/bin/python convert/convert_nar.py --out yue2-nar-f16.gguf \
-    --ar-gguf yue2-ar-f16.gguf                                   # 2,939,691,584 B
-venv/bin/python convert/convert_vae.py --out yue2-vae-f32.gguf   #   265,437,856 B
-llama-quantize yue2-ar-f16.gguf yue2-ar-q8_0.gguf Q8_0           # 2,308,448,480 B
+build/yue2 convert     # yue2-ar-q8_0.gguf 2,308,448,480 B, yue2-nar-f16.gguf
+                       # 2,939,691,584 B, yue2-vae-f32.gguf 265,437,856 B; ~35 s
 ```
 
-The F16 AR half is only an intermediate for `song`; keep it if you want the
-exact-F32 NAR path. Tensor tables and the full invocations are in
-`convert/STATUS.md`, `convert/STATUS_AR.md`, `convert/STATUS_NAR.md`.
+`--src-3b DIR` / `--src-vae DIR` read a snapshot from elsewhere, `--out DIR`
+writes elsewhere (`song` also looks one directory up from the binary and in the
+working directory), `--ar-type f16|bf16`, `--nar-type f32` and `--vae-type f16`
+make the other variants, `--only ar|nar|vae` one file, and `--force` redoes an
+existing one. Conversion is CPU-only and streams tensor by tensor (~0.3 GB RSS).
 
-**5. Write a request.** `style` and `lyrics` are required strings; `cot`
+The Python converters in `convert/` (`convert_ar.py`, `convert_nar.py`,
+`convert_vae.py`; torch CPU, `convert/requirements.txt`) are the **reference**
+`yue2 convert` was ported from and is tested against: the default GGUFs are
+byte-identical to theirs (the Q8_0 AR to `convert_ar.py` + `llama-quantize`).
+They are optional; `convert_nar.py --lora` (baking a LoRA in) exists only there.
+
+**4. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
 `abc`, `abc_template`, `cfg_scale`, `negative_style`, `negative_lyrics`, `cfg_score`, `score_tempo`, `guidance`,
 `sections`, `semantic_keep`, `handover` and `base_take` are optional.
@@ -110,7 +107,7 @@ their own lines:
 }
 ```
 
-**6. Render.**
+**5. Render.**
 
 ```bash
 build/yue2 song --request song.json --out song.flac --gpu 0
@@ -717,13 +714,13 @@ Measured, 164 s song: Vulkan 7900 XTX 7.5 s, Intel Arc B70 15 s, CPU (i9-11900K)
 ## Generate the symbolic plan + semantic tokens (`yue2-ar`)
 
 ```bash
-convert/convert_ar.py --src ~/.cache/huggingface/hub/models--m-a-p--YuE2-3B/snapshots/<hash> --out yue2-ar-f16.gguf
-llama-quantize yue2-ar-f16.gguf yue2-ar-q8_0.gguf Q8_0
+build/yue2 convert --only ar --out .    # yue2-ar-q8_0.gguf (--ar-type f16 for the F16 one)
 build/yue2-ar -m yue2-ar-q8_0.gguf --request song.json --artifacts out/song --device vulkan --gpu 0
 ```
 
-`--src` can be omitted if `m-a-p/YuE2-3B` is already in your huggingface_hub
-cache. `llama-quantize` (and `llama-tokenize`, used by
+`--src-3b DIR` reads a snapshot outside the huggingface_hub cache. The reference
+path is `convert/convert_ar.py` then `llama-quantize … Q8_0` (same bytes).
+`llama-quantize` (and `llama-tokenize`, used by
 `convert/check_tokenizer.py`) are **not** built by this repo's own CMake —
 `CMakeLists.txt` sets `LLAMA_BUILD_TOOLS OFF` on purpose, to keep `yue2-ar`
 and `yue2-vae` small single-binary builds instead of pulling in `common` and
@@ -750,7 +747,7 @@ RADV pipelines; later runs start in under a second.
 ## Flow-match the semantic tokens into a latent (`yue2-nar`)
 
 ```bash
-convert/convert_nar.py --src ~/.cache/huggingface/hub/models--m-a-p--YuE2-3B/snapshots/<hash> --out yue2-nar-f16.gguf
+build/yue2 convert --only nar --out .   # yue2-nar-f16.gguf (reference: convert/convert_nar.py)
 build/yue2-nar --ar yue2-ar-f16.gguf -m yue2-nar-f16.gguf \
     --artifacts out/song --noise noise.npy --steps 32 --device vulkan --gpu 0
 ```

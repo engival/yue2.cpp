@@ -4,6 +4,7 @@
 
 #include "stage_song.hpp"
 
+#include "convert.hpp"
 #include "stage_ar.hpp"
 #include "stage_nar.hpp"
 #include "stage_vae.hpp"
@@ -162,6 +163,22 @@ std::string exe_path()
 	return buf;
 }
 
+// A default GGUF's path, or "" when it is in none of the places resolve_gguf()
+// looks: next to the executable, one level up, the working directory.
+std::string find_default_gguf(const char * name)
+{
+	const std::filesystem::path here = std::filesystem::path(exe_path()).parent_path();
+	const std::string tried[] = { (here / name).string(), (here / ".." / name).string(), name };
+	for (const std::string & candidate : tried)
+	{
+		if (std::filesystem::exists(candidate))
+		{
+			return std::filesystem::weakly_canonical(candidate).string();
+		}
+	}
+	return "";
+}
+
 // The GGUF defaults: next to the executable, then one level up (a build
 // directory's parent is the repo root, where the hardlinks live), then the
 // working directory. An explicitly given path is checked here too: a typo in
@@ -177,17 +194,14 @@ std::string resolve_gguf(const std::string & given, const char * name)
 		}
 		return given;
 	}
-	const std::filesystem::path here = std::filesystem::path(exe_path()).parent_path();
-	const std::string tried[] = { (here / name).string(), (here / ".." / name).string(), name };
-	for (const std::string & candidate : tried)
+	const std::string found = find_default_gguf(name);
+	if (found.empty())
 	{
-		if (std::filesystem::exists(candidate))
-		{
-			return std::filesystem::weakly_canonical(candidate).string();
-		}
+		const std::filesystem::path here = std::filesystem::path(exe_path()).parent_path();
+		die("cannot find %s — looked in %s, %s and the working directory",
+		    name, here.c_str(), (here / "..").c_str());
 	}
-	die("cannot find %s — looked in %s, %s and the working directory",
-	    name, here.c_str(), (here / "..").c_str());
+	return found;
 }
 
 // SPEC_SINGLE.md §2.7 / STATUS_NAR_PERF.md §8: the fast NAR flags differ per
@@ -395,6 +409,11 @@ void write_result(const std::string & dir, const ArResult & ar, const std::strin
 
 } // namespace
 
+std::string gguf_home_dir()
+{
+	return std::filesystem::path(exe_path()).parent_path().string();
+}
+
 SongParams parse_song_args(const char * argv0, int argc, char ** argv)
 {
 	SongParams p;
@@ -576,6 +595,17 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 	if (given.nar_f32 && given.device == "vulkan")
 	{
 		vulkan_want_exact_f32();
+	}
+
+	// SPEC_CONVERT §1: a default GGUF that is nowhere to be found is made from
+	// the Hugging Face download, once, next to the binary — but never one the
+	// command line named.
+	const bool convert_ar  = given.ar_model.empty()  && find_default_gguf("yue2-ar-q8_0.gguf").empty();
+	const bool convert_nar = given.nar_model.empty() && find_default_gguf("yue2-nar-f16.gguf").empty();
+	const bool convert_vae = given.vae_model.empty() && find_default_gguf("yue2-vae-f32.gguf").empty();
+	if (convert_ar || convert_nar || convert_vae)
+	{
+		convert_missing_defaults(gguf_home_dir(), convert_ar, convert_nar, convert_vae);
 	}
 
 	BatchParams p = given;
