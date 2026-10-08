@@ -3115,7 +3115,7 @@ static std::string parse_request_json(const json & root, const std::string & whe
 	{
 		req.lyrics = root["lyrics"].get<std::string>();
 	} else {
-		return strf("%s: needs a \"lyrics\" string", path);
+		return strf("%s: needs a \"lyrics\" string (or a \"lyrics_file\")", path);
 	}
 	if (root.contains("cot") && !root["cot"].is_null())
 	{
@@ -3261,7 +3261,8 @@ static std::string parse_request_json(const json & root, const std::string & whe
 // Returns "" or the reason the file is not a usable request. A batch validates
 // every job before the model loads (SPEC_BATCH §3.1), so this reports rather
 // than exits; the single-request paths turn a non-empty return into die().
-static std::string parse_request(const std::string & path, Request & req)
+static std::string parse_request(const std::string & path, const std::string & base_dir,
+	Request & req)
 {
 	std::string text;
 	const std::string err = read_file(path, text);
@@ -3278,6 +3279,11 @@ static std::string parse_request(const std::string & path, Request & req)
 	catch (const std::exception & e)
 	{
 		return strf("%s: %s", path.c_str(), e.what());
+	}
+	const std::string files = resolve_request_files(root, base_dir);
+	if (!files.empty())
+	{
+		return strf("%s: %s", path.c_str(), files.c_str());
 	}
 	return parse_request_json(root, path, req);
 }
@@ -3695,10 +3701,10 @@ static std::string validate_request(const Request & r)
 // scalar the artifacts record — 1.0 whenever the request drives the branches
 // through its own "guidance" block, which guidance.json then carries
 // (SPEC_GUIDANCE §3).
-static std::string prepare_request(const std::string & path, const std::string & cot_override,
-	bool has_seed, uint64_t seed, Request & req, double & guidance)
+static std::string prepare_request(const std::string & path, const std::string & base_dir,
+	const std::string & cot_override, bool has_seed, uint64_t seed, Request & req, double & guidance)
 {
-	std::string err = parse_request(path, req);
+	std::string err = parse_request(path, base_dir, req);
 	if (!err.empty())
 	{
 		return err;
@@ -6581,8 +6587,8 @@ static int run_ar_dump(const ArParams & p)
 	Request req;
 	double  guidance = 1.0;
 	{
-		const std::string err = prepare_request(p.request_path, p.cot, p.has_seed, p.seed,
-		                                        req, guidance);
+		const std::string err = prepare_request(p.request_path, dir_of(p.request_path), p.cot,
+		                                        p.has_seed, p.seed, req, guidance);
 		if (!err.empty())
 		{
 			die("%s", err.c_str());
@@ -8144,7 +8150,7 @@ int run_ar_batch(const ArBatchParams & p, const std::vector<ArJob> & jobs,
 			js.tag = strf("[%zu/%zu %s] ", i + 1, jobs.size(),
 			              slash == std::string::npos ? shown.c_str() : shown.c_str() + slash + 1);
 		}
-		const std::string err = prepare_request(jobs[i].request_path, p.cot,
+		const std::string err = prepare_request(jobs[i].request_path, jobs[i].base_dir, p.cot,
 			jobs[i].has_seed, jobs[i].has_seed ? jobs[i].seed : 0, js.req, js.guidance);
 		if (!err.empty())
 		{

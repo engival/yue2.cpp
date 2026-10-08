@@ -80,18 +80,20 @@ std::string temp_artifacts_dir(size_t job)
 }
 
 // The FLAC's Vorbis comments for one request: its "tags" block as given, the
-// words that are sung, the encoder. Nothing else of the request reaches the file
-// unless it is named in "tags". A request the AR stage will refuse anyway
-// (unreadable, not JSON) yields no tags and no error here.
-std::string request_tags(const std::string & request_path, flac::Tags & tags)
+// words that are sung (a "lyrics_file" read as the AR stage reads it), the
+// encoder. Nothing else of the request reaches the file unless it is named in
+// "tags". A request the AR stage will refuse anyway (unreadable, not JSON, a
+// missing lyrics file) yields no tags and no error here.
+std::string request_tags(const std::string & request_path, const std::string & base_dir,
+	flac::Tags & tags)
 {
 	std::string body;
 	if (!read_file(request_path, body).empty())
 	{
 		return "";
 	}
-	const json root = json::parse(body, nullptr, false);
-	if (!root.is_object())
+	json root = json::parse(body, nullptr, false);
+	if (!root.is_object() || !resolve_request_files(root, base_dir).empty())
 	{
 		return "";
 	}
@@ -730,7 +732,7 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 	std::vector<flac::Tags> tags(jobs.size());
 	for (size_t k = 0; k < jobs.size() && !p.no_tags; k++)
 	{
-		const std::string err = request_tags(jobs[k].request_path, tags[k]);
+		const std::string err = request_tags(jobs[k].request_path, jobs[k].base_dir, tags[k]);
 		if (!err.empty())
 		{
 			die("%s: %s", jobs[k].request_path.c_str(), err.c_str());
@@ -746,6 +748,14 @@ int run_batch(const BatchParams & given, std::vector<ArJob> jobs)
 		if (!err.empty())
 		{
 			die("%s", err.c_str());
+		}
+		// Text named by "lyrics_file" & co. is kept as read, so the artifacts
+		// never point back at a file that may have changed since.
+		json root = json::parse(as_given[k], nullptr, false);
+		int  baked = 0;
+		if (resolve_request_files(root, jobs[k].base_dir, &baked).empty() && baked > 0)
+		{
+			as_given[k] = dump_py(root);
 		}
 	}
 

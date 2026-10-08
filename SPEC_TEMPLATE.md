@@ -193,7 +193,9 @@ Put the counter in its own small function with a table of cases in the test (§6
   `"abc_template"`. They are written after the abc phase, and record the emitted
   score as `"abc"`: the artifacts directory is then a plain request that reproduces
   the song. The template as given is a side file, `template.abc`; `ar_request.json`
-  is the request echo and carries `"abc_template"` because it is a byte copy.
+  is the request echo and carries `"abc_template"` because it is a byte copy (or,
+  when the request names `"abc_template_file"` & co., the request re-serialised
+  with that text read in — never a file name; README "Lyrics and scores from files").
 - `result.json` and the `yue2 batch --summary` entry gain, for template jobs only:
   `template: { holes, retries, rest_filled, primer_tokens, given_tokens,
   sampled_tokens, offlength_bars, continued_tokens, chord_lines }`. `yue2 ar` writes no result JSON and prints the

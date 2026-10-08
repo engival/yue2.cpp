@@ -22,8 +22,8 @@ Status:
   libllama with a standard `qwen3` GGUF): done. [SPEC_AR.md](SPEC_AR.md)
 - **stage 3 — NAR flow matching** (`yue2-nar`, tokens → `[T, 64]` latent, raw
   ggml): done. [SPEC_NAR.md](SPEC_NAR.md)
-- **stage 4 — one `yue2` binary end to end** (request → FLAC, no python at
-  runtime): done. [SPEC_SINGLE.md](SPEC_SINGLE.md)
+- **stage 4 — one `yue2` binary end to end** (request → FLAC, no PyTorch
+  at runtime): done. [SPEC_SINGLE.md](SPEC_SINGLE.md)
 
 Notes and measurements in [docs/](docs/); per-stage status in `src/STATUS*.md`.
 
@@ -36,8 +36,9 @@ has the lineage.
 ## Quick start
 
 From a fresh clone to a FLAC. Needs libFLAC 1.5 (`pkg-config flac`), a Vulkan
-driver + `glslc`; libopusenc is optional and adds `.opus` output. No Python is
-needed to build, convert or render.
+driver + `glslc`; libopusenc is optional and adds `.opus` output. No PyTorch (or
+any Python) is needed to build, convert or render; the few optional helper
+scripts that are Python need only numpy.
 All paths below are relative to the repo root.
 
 **Tested on** one box only: Slackware64-current (Linux), an AMD Radeon RX 7900
@@ -95,7 +96,7 @@ They are optional; `convert_nar.py --lora` (baking a LoRA in) exists only there.
 
 **4. Write a request.** `style` and `lyrics` are required strings; `cot`
 (`off|melody|full`, default `full`), `seed` (integer in `[0, 2**63)`), `id`,
-`abc`, `abc_template`, `cfg_scale`, `negative_style`, `negative_lyrics`, `cfg_score`, `score_tempo`, `guidance`,
+`abc`, `abc_template` (or `lyrics_file` / `abc_file` / `abc_template_file`, below), `cfg_scale`, `negative_style`, `negative_lyrics`, `cfg_score`, `score_tempo`, `guidance`,
 `sections`, `semantic_keep`, `handover` and `base_take` are optional.
 Lyrics carry `[Section]` tags on
 their own lines:
@@ -107,6 +108,21 @@ their own lines:
   "cot": "full",
   "seed": 1
 }
+```
+
+**Lyrics and scores from files.** `"lyrics_file"`, `"abc_file"` and
+`"abc_template_file"` name a plain UTF-8 text file to read in place of
+`"lyrics"`, `"abc"` and `"abc_template"` — no `\n` escapes, edit it in any text
+editor. A relative path resolves against the request file (in a `--jobs` /
+`--requests` batch, against the batch file, as `semantic_keep` does); CRLF line
+ends and a UTF-8 BOM are dropped. Giving both the text and its file is an error.
+The text is read once, when the request loads: `request.json` and
+`ar_request.json` in the artifacts directory hold the text as read and no file
+name, so editing or deleting the file later never changes what an artifacts
+directory reproduces.
+
+```json
+{ "style": "slow dream pop, reverb guitar, brushed drums, breathy female vocal", "lyrics_file": "my-song.txt", "seed": 1 }
 ```
 
 **5. Render.**
@@ -122,11 +138,12 @@ VAE 6.8 s); a 7900 XTX is roughly 1.7× as fast (VAE of a 191 s song: 1.9 s vs 3
 under a second.
 
 **Re-skin a song you like.** With `--artifacts DIR` a render leaves its score in
-`DIR/score.abc`. Put that text in a new request's `"abc"` and the AR skips
-writing a score and sings the given one (ignored with `cot: "off"`):
+`DIR/score.abc`. Point a new request's `"abc_file"` at it (or put the text in
+`"abc"`) and the AR skips writing a score and sings the given one (ignored with
+`cot: "off"`):
 
 ```json
-{ "style": "orchestral rock, distorted guitars, gravelly male vocal", "lyrics": "…same lyrics…", "abc": "…score.abc…" }
+{ "style": "orchestral rock, distorted guitars, gravelly male vocal", "lyrics_file": "my-song.txt", "abc_file": "DIR/score.abc" }
 ```
 
 The score carries the tune, the timing and much of the vocal delivery; the

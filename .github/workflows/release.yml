@@ -71,8 +71,9 @@ jobs:
       - name: Package
         run: |
           name="yue2-${TAG}-linux-x86_64"
-          mkdir -p "dist/$name/licenses"
+          mkdir -p "dist/$name/licenses" "dist/$name/examples"
           cp build/yue2 LICENSE NOTICE.md "dist/$name/"
+          cp examples/make-song.sh "dist/$name/examples/"
           strip "dist/$name/yue2"
           sed "s/@VERSION@/${TAG}/" .github/release/README-QUICKSTART.txt > "dist/$name/README-QUICKSTART.txt"
           cp "$FLAC_LICENSE_FILE" "dist/$name/licenses/libFLAC-COPYING.Xiph.txt"
@@ -134,8 +135,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $name = "yue2-$env:TAG-windows-x64"
           $dir  = "dist\$name"
-          New-Item -ItemType Directory -Force "$dir\licenses" | Out-Null
+          New-Item -ItemType Directory -Force "$dir\licenses", "$dir\examples" | Out-Null
           Copy-Item build\yue2.exe, LICENSE, NOTICE.md $dir
+          Copy-Item examples\make-song.ps1, examples\make-song.bat "$dir\examples"
           ./.github/scripts/collect-dlls.ps1 -Exe "$dir\yue2.exe" -SearchDir $env:YUE2_VCPKG_BIN -Dest $dir
           # vcpkg keeps each port's licence in share/<port>/copyright.
           foreach ($port in 'libflac', 'libogg')

@@ -6,7 +6,7 @@ of audio; `yue2 song` on the AMD 7900 XTX renders a 196 s song in 120.8 s).
 
 ## Done
 
-- Stage 1–4: VAE, AR (libllama), NAR (raw ggml), single `yue2` binary. No Python
+- Stage 1–4: VAE, AR (libllama), NAR (raw ggml), single `yue2` binary. No PyTorch
   at runtime, no ROCm anywhere. Per-card NAR flags chosen automatically.
 - Stage 5: `yue2 batch` / `yue2 ar --requests` decode several songs' AR phases in
   one context, one `llama_decode` per step per slot (`kv_unified = false`, one KV

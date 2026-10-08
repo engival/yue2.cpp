@@ -1,0 +1,6 @@
+*
+!.gitignore
+!make-song.sh
+!make-song.ps1
+!make-song.bat
+!README.md

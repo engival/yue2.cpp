@@ -2,7 +2,8 @@ yue2.cpp @VERSION@ - quick start
 ================================
 
 yue2 turns lyrics + a style prompt into a full song (48 kHz stereo FLAC) with
-YuE2-3B, on any GPU with a Vulkan driver. No Python is needed.
+YuE2-3B, on any GPU with a Vulkan driver. No PyTorch, no CUDA/ROCm:
+the whole model runs inside the yue2 binary.
 
 Full manual: https://github.com/engival/yue2.cpp#readme
 Bug reports: https://github.com/engival/yue2.cpp/issues
@@ -41,7 +42,20 @@ binary (~35 s, CPU only). You can skip this: the first `yue2 song` converts
 whatever is missing before it renders.
 
 
-4. Write a request, e.g. song.json
+4. The easy way: examples\make-song
+-----------------------------------
+Windows: open the examples folder, open make-song.ps1 in Notepad, change the
+name, style and lyrics at the top, save, then double-click make-song.bat.
+Linux: edit examples/make-song.sh the same way, then run ./make-song.sh.
+
+The song lands in examples/<name>/<name>.flac. The settings also include a
+few extras to try: a fixed tempo, a style that changes at the second chorus,
+and the same tune sung in another style.
+
+Steps 5 and 6 do the same by hand.
+
+
+5. Write a request, e.g. song.json
 ----------------------------------
     {
       "style": "slow dream pop, reverb guitar, brushed drums, breathy female vocal",
@@ -50,7 +64,7 @@ whatever is missing before it renders.
     }
 
 
-5. Render
+6. Render
 ---------
     yue2 song --request song.json --out song.flac --gpu 0
 
