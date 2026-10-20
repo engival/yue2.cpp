@@ -70,3 +70,24 @@ inline uint64_t parse_seed_arg(const char * what, const char * text)
 	}
 	return value;
 }
+
+// fseek/ftell take a `long`, which is 32-bit on Windows (LLP64): a tensor past
+// 2 GiB in a GGUF failed to load there (issue #4, the AR GGUF the NAR reuses).
+inline bool file_seek64(FILE * f, uint64_t offset)
+{
+#ifdef _WIN32
+	return _fseeki64(f, (__int64) offset, SEEK_SET) == 0;
+#else
+	return fseeko(f, (off_t) offset, SEEK_SET) == 0;
+#endif
+}
+
+// Size of an open file; the position is left at the end. -1 on failure.
+inline int64_t file_size64(FILE * f)
+{
+#ifdef _WIN32
+	return _fseeki64(f, 0, SEEK_END) == 0 ? (int64_t) _ftelli64(f) : -1;
+#else
+	return fseeko(f, 0, SEEK_END) == 0 ? (int64_t) ftello(f) : -1;
+#endif
+}

@@ -195,7 +195,7 @@ static void load_model(const char * path, ggml_backend_t backend, Model & model)
 		const int64_t nelem = ggml_nelements(t);
 
 		raw.resize(nbytes);
-		if (fseek(f, (long) (data_offset + gguf_get_tensor_offset(gc, i)), SEEK_SET) != 0 ||
+		if (!file_seek64(f, data_offset + gguf_get_tensor_offset(gc, i)) ||
 		    fread(raw.data(), 1, nbytes, f) != nbytes)
 		{
 			die("truncated tensor data for '%s'", name.c_str());

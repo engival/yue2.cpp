@@ -333,11 +333,12 @@ private:
 		{
 			die("--nar-lora: cannot open '%s'", f.path.c_str());
 		}
-		if (fseek(f.fp, 0, SEEK_END) != 0)
+		const int64_t size64 = file_size64(f.fp);
+		if (size64 < 0)
 		{
 			die("--nar-lora: cannot seek in '%s'", f.path.c_str());
 		}
-		const uint64_t size = (uint64_t) ftell(f.fp);
+		const uint64_t size = (uint64_t) size64;
 		rewind(f.fp);
 
 		uint64_t header_len = 0;
@@ -540,7 +541,7 @@ private:
 		out.resize((size_t) n);
 		const size_t         nbytes = (size_t) (e.end - e.begin);
 		std::vector<uint8_t> raw(nbytes);
-		if (fseek(f.fp, (long) (f.data_start + e.begin), SEEK_SET) != 0 ||
+		if (!file_seek64(f.fp, f.data_start + e.begin) ||
 		    fread(raw.data(), 1, nbytes, f.fp) != nbytes)
 		{
 			die("--nar-lora: cannot read tensor data from '%s'", f.path.c_str());

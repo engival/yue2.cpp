@@ -173,7 +173,7 @@ static ggml_backend_buffer_t load_gguf(const char * path, const char * arch, ggm
 			die("tensor '%s' size mismatch (%zu vs %zu)", name, ggml_nbytes(t), nbytes);
 		}
 		raw.resize(nbytes);
-		if (fseek(f, (long) (data_offset + gguf_get_tensor_offset(gc, i)), SEEK_SET) != 0 ||
+		if (!file_seek64(f, data_offset + gguf_get_tensor_offset(gc, i)) ||
 		    fread(raw.data(), 1, nbytes, f) != nbytes)
 		{
 			die("truncated tensor data for '%s' in '%s'", name, path);
