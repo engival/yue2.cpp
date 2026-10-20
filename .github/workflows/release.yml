@@ -165,6 +165,11 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github/release/NOTES.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -174,7 +179,9 @@ jobs:
         working-directory: dist
         run: sha256sum -- * | tee SHA256SUMS.txt
 
-      # A re-run of a failed tag finds its draft already there and replaces the files.
+      # The notes are .github/release/NOTES.md, edited for each release before
+      # tagging; @VERSION@ becomes the tag. A re-run of a failed tag finds its
+      # draft already there and replaces the files.
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -184,8 +191,9 @@ jobs:
           then
             gh release upload "$TAG" dist/* --clobber
           else
+            sed "s/@VERSION@/${TAG}/g" .github/release/NOTES.md > notes.md
             prerelease=()
             if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
             gh release create "$TAG" dist/* --draft --verify-tag "${prerelease[@]}" \
-              --title "yue2.cpp $TAG" --generate-notes
+              --title "yue2.cpp $TAG" --notes-file notes.md
           fi

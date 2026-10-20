@@ -6,7 +6,9 @@ Releases are built by GitHub Actions from a tag; nothing is uploaded by hand.
 
 1. Make sure `master` is green in the **CI** workflow (`.github/workflows/build.yml`)
    and the `llama.cpp` submodule points at a commit that is public on the fork.
-2. Tag and push the tag:
+2. Rewrite `.github/release/NOTES.md` for this release (`@VERSION@` becomes the
+   tag) and commit it.
+3. Tag and push the tag:
 
    ```bash
    git tag -a v0.1.0 -m "yue2.cpp v0.1.0"
@@ -14,14 +16,14 @@ Releases are built by GitHub Actions from a tag; nothing is uploaded by hand.
    ```
 
    A tag with a `-` in it (`v0.2.0-rc1`) becomes a pre-release.
-3. The **Release** workflow (`.github/workflows/release.yml`) builds
+4. The **Release** workflow (`.github/workflows/release.yml`) builds
    `yue2-<tag>-linux-x86_64.tar.gz` (Ubuntu 22.04, glibc 2.35+) and
    `yue2-<tag>-windows-x64.zip` (MSVC), runs the smoke tests on both, and creates a
-   **draft** release with the two archives and `SHA256SUMS.txt`, plus
-   auto-generated notes.
-4. Open the draft under *Releases*, download and try the Linux archive on a real
-   GPU (`yue2 song` end to end), edit the notes, then **Publish**.
-5. A failed run can be re-run from the Actions tab; it replaces the draft's files.
+   **draft** release with the two archives and `SHA256SUMS.txt`, and the
+   notes from `NOTES.md`.
+5. Open the draft under *Releases*, download and try the Linux archive on a real
+   GPU (`yue2 song` end to end), then **Publish**.
+6. A failed run can be re-run from the Actions tab; it replaces the draft's files.
    To redo a tag from scratch, delete the draft and the tag
    (`git push origin :refs/tags/v0.1.0`) and push it again.
 
